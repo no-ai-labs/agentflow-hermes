@@ -5,12 +5,38 @@ import json
 from typing import Sequence
 
 from .ack import AckError, parse_ack_block, validate_ack
-from .cron_bridge import ingest_cron_output
+from .bridges.cron import ingest_cron_output, scan_cron_output
 from .store import AgentFlowStore, render_dispatch_prompt
 
 
 def _dump(data: dict, **kwargs) -> str:
     return json.dumps(data, ensure_ascii=False, **kwargs)
+
+
+def _add_cron_ingest_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--ref", required=True)
+    parser.add_argument("--hash", required=True)
+    parser.add_argument("--marker-text", default="")
+    parser.add_argument("--source", default="cron")
+    parser.add_argument("--correlation-id", default="")
+    parser.add_argument("--job-id", default="")
+    parser.add_argument("--run-id", default="")
+    parser.add_argument("--target", default="")
+    parser.add_argument("--origin-return", default="")
+    parser.add_argument("--title", default="")
+
+
+def _add_cron_scan_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--dry-run", action="store_true", default=True)
+    parser.add_argument("--output-file", required=True)
+    parser.add_argument("--ref", default="")
+    parser.add_argument("--hash", default="")
+    parser.add_argument("--source", default="cron")
+    parser.add_argument("--job-id", default="")
+    parser.add_argument("--run-id", default="")
+    parser.add_argument("--target", default="")
+    parser.add_argument("--origin-return", default="")
+    parser.add_argument("--title", default="")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -45,17 +71,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     ingest = ack_sub.add_parser("ingest")
     ingest.add_argument("--text", required=True)
 
+    # Backward-compatible command: agentflow-hermes cron ingest ...
     cron = sub.add_parser("cron")
     cron_sub = cron.add_subparsers(dest="cron_cmd", required=True)
-    cron_ingest = cron_sub.add_parser("ingest")
-    cron_ingest.add_argument("--ref", required=True)
-    cron_ingest.add_argument("--hash", required=True)
-    cron_ingest.add_argument("--marker-text", default="")
-    cron_ingest.add_argument("--source", default="cron")
-    cron_ingest.add_argument("--correlation-id", default="")
-    cron_ingest.add_argument("--target", default="")
-    cron_ingest.add_argument("--origin-return", default="")
-    cron_ingest.add_argument("--title", default="")
+    _add_cron_ingest_args(cron_sub.add_parser("ingest"))
+
+    # M2 bridge namespace: agentflow-hermes bridge cron scan/ingest ...
+    bridge = sub.add_parser("bridge")
+    bridge_sub = bridge.add_subparsers(dest="bridge_cmd", required=True)
+    bridge_cron = bridge_sub.add_parser("cron")
+    bridge_cron_sub = bridge_cron.add_subparsers(dest="bridge_cron_cmd", required=True)
+    _add_cron_scan_args(bridge_cron_sub.add_parser("scan"))
+    _add_cron_ingest_args(bridge_cron_sub.add_parser("ingest"))
 
     args = parser.parse_args(argv)
     store = AgentFlowStore.default()
@@ -71,21 +98,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(_dump({"success": True, "db": str(store.path), "mode": "dry-run-first", "schema_version": version}))
         return 0
     if args.cmd == "enqueue":
-        print(_dump(
-            store.enqueue(
-                title=args.title,
-                body=args.body,
-                target=args.target,
-                origin_return=args.origin_return,
-                dedupe_key=args.dedupe_key,
-                correlation_id=args.correlation_id,
-                causation_id=args.causation_id,
-                source_kind=args.source_kind,
-                source_id=args.source_id,
-                source_ref=args.source_ref,
-                source_hash=args.source_hash,
-            )
-        ))
+        print(_dump(store.enqueue(
+            title=args.title,
+            body=args.body,
+            target=args.target,
+            origin_return=args.origin_return,
+            dedupe_key=args.dedupe_key,
+            correlation_id=args.correlation_id,
+            causation_id=args.causation_id,
+            source_kind=args.source_kind,
+            source_id=args.source_id,
+            source_ref=args.source_ref,
+            source_hash=args.source_hash,
+        )))
         return 0
     if args.cmd == "status":
         jobs = store.list_jobs(limit=args.limit)
@@ -115,12 +140,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 store.deadletter(reason=exc.reason, job_id=job_id, payload=payload)
             print(_dump({"success": False, "error": exc.reason}))
             return 2
-        result = store.ack(
-            job_id=ack_payload.job_id,
-            status=ack_payload.status,
-            summary=ack_payload.summary,
-            payload=ack_payload.raw_fields,
-        )
+        result = store.ack(job_id=ack_payload.job_id, status=ack_payload.status, summary=ack_payload.summary, payload=ack_payload.raw_fields)
         if not result.get("success"):
             print(_dump(result))
             return 2
@@ -137,7 +157,42 @@ def main(argv: Sequence[str] | None = None) -> int:
             target=args.target,
             origin_return=args.origin_return,
             title=args.title,
+            job_id=args.job_id,
+            run_id=args.run_id,
         )
+        print(_dump(result))
+        return 0
+    if args.cmd == "bridge" and args.bridge_cmd == "cron":
+        if args.bridge_cron_cmd == "scan":
+            result = scan_cron_output(
+                store,
+                output_file=args.output_file,
+                source_ref=args.ref,
+                source_hash=args.hash,
+                source=args.source,
+                job_id=args.job_id,
+                run_id=args.run_id,
+                target=args.target,
+                origin_return=args.origin_return,
+                title=args.title,
+                dry_run=args.dry_run,
+            )
+        elif args.bridge_cron_cmd == "ingest":
+            result = ingest_cron_output(
+                store,
+                source_ref=args.ref,
+                source_hash=args.hash,
+                marker_text=args.marker_text,
+                source=args.source,
+                correlation_id=args.correlation_id,
+                target=args.target,
+                origin_return=args.origin_return,
+                title=args.title,
+                job_id=args.job_id,
+                run_id=args.run_id,
+            )
+        else:
+            raise AssertionError(args.bridge_cron_cmd)
         print(_dump(result))
         return 0
     raise AssertionError(args.cmd)

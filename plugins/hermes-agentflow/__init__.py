@@ -82,6 +82,28 @@ AGENTFLOW_DOCTOR_SCHEMA = {
     },
 }
 
+AGENTFLOW_BRIDGE_CRON_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "agentflow_bridge_cron",
+        "description": "Dry-run ingest a cron material-event ref/hash/marker into AgentFlow. No live active wake or send side effects.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "ref": {"type": "string"},
+                "hash": {"type": "string"},
+                "marker_text": {"type": "string"},
+                "job_id": {"type": "string"},
+                "run_id": {"type": "string"},
+                "target": {"type": "string"},
+                "origin_return": {"type": "string"},
+                "title": {"type": "string"},
+            },
+            "required": ["ref", "hash"],
+        },
+    },
+}
+
 
 def _handle_enqueue(args: dict) -> str:
     result = _run_cli([
@@ -115,9 +137,25 @@ def _handle_doctor(args: dict) -> str:
     return json.dumps(result, ensure_ascii=False)
 
 
+def _handle_bridge_cron(args: dict) -> str:
+    result = _run_cli([
+        "bridge", "cron", "ingest",
+        "--ref", str(args.get("ref") or ""),
+        "--hash", str(args.get("hash") or ""),
+        "--marker-text", str(args.get("marker_text") or ""),
+        "--job-id", str(args.get("job_id") or ""),
+        "--run-id", str(args.get("run_id") or ""),
+        "--target", str(args.get("target") or ""),
+        "--origin-return", str(args.get("origin_return") or ""),
+        "--title", str(args.get("title") or ""),
+    ])
+    return json.dumps(result, ensure_ascii=False)
+
+
 def register(ctx) -> None:
     ctx.register_tool("agentflow_enqueue", "agentflow", AGENTFLOW_ENQUEUE_SCHEMA, _handle_enqueue, emoji="🧭")
     ctx.register_tool("agentflow_status", "agentflow", AGENTFLOW_STATUS_SCHEMA, _handle_status, emoji="📋")
     ctx.register_tool("agentflow_dispatch_dry_run", "agentflow", AGENTFLOW_DISPATCH_DRY_RUN_SCHEMA, _handle_dispatch_dry_run, emoji="🧪")
     ctx.register_tool("agentflow_ack_ingest", "agentflow", AGENTFLOW_ACK_INGEST_SCHEMA, _handle_ack_ingest, emoji="✅")
     ctx.register_tool("agentflow_doctor", "agentflow", AGENTFLOW_DOCTOR_SCHEMA, _handle_doctor, emoji="🩺")
+    ctx.register_tool("agentflow_bridge_cron", "agentflow", AGENTFLOW_BRIDGE_CRON_SCHEMA, _handle_bridge_cron, emoji="⏱️")
