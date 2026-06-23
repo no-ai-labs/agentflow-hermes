@@ -18,6 +18,51 @@ blockers: none
     assert fields["summary"] == "done"
 
 
+def test_parse_ack_block_preserves_multiline_prompt_artifacts_and_blockers():
+    text = """Worker output before ack.
+
+[JOB ACK]
+job_id: job_abc
+status: succeeded
+summary: M1 store/ACK implementation complete; pytest passed.
+artifacts:
+- src/agentflow_hermes/ack.py
+- tests/test_ack.py
+- uv run pytest -q -> 27 passed
+blockers:
+- none
+"""
+    fields = parse_ack_block(text)
+    payload = validate_ack(fields)
+
+    assert payload.job_id == "job_abc"
+    assert payload.status == JobStatus.SUCCEEDED
+    assert payload.summary == "M1 store/ACK implementation complete; pytest passed."
+    assert payload.artifacts == "\n".join(
+        [
+            "- src/agentflow_hermes/ack.py",
+            "- tests/test_ack.py",
+            "- uv run pytest -q -> 27 passed",
+        ]
+    )
+    assert payload.blockers == "- none"
+    assert payload.raw_fields["artifacts"] == payload.artifacts
+    assert payload.raw_fields["blockers"] == payload.blockers
+
+
+def test_parse_ack_block_ignores_unmarked_trailing_prose():
+    text = """[JOB ACK]
+job_id: job_abc
+status: succeeded
+summary: done
+blockers: none
+This sentence is outside the structured ACK payload.
+"""
+    fields = parse_ack_block(text)
+
+    assert fields["blockers"] == "none"
+
+
 def test_parse_ack_block_missing_block():
     with pytest.raises(AckError) as exc:
         parse_ack_block("no block here")
