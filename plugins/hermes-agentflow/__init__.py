@@ -1,30 +1,9 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import json
-import subprocess
-import sys
-from pathlib import Path
-
-
-def _run_cli(args: list[str]) -> dict:
-    repo_root = Path(__file__).resolve().parents[2]
-    src = repo_root / "src"
-    code = "import sys; from agentflow_hermes.cli import main; raise SystemExit(main(sys.argv[1:]))"
-    proc = subprocess.run(
-        [sys.executable, "-c", code, *args],
-        cwd=str(repo_root),
-        env={**__import__("os").environ, "PYTHONPATH": str(src)},
-        text=True,
-        capture_output=True,
-        timeout=30,
-    )
-    out = (proc.stdout or "").strip()
-    if proc.returncode != 0:
-        return {"success": False, "error": (proc.stderr or out or f"exit {proc.returncode}").strip()}
-    try:
-        return json.loads(out)
-    except Exception:
-        return {"success": True, "output": out}
+from typing import Any, Callable
 
 
 AGENTFLOW_ENQUEUE_SCHEMA = {
@@ -77,7 +56,7 @@ AGENTFLOW_DOCTOR_SCHEMA = {
     "type": "function",
     "function": {
         "name": "agentflow_doctor",
-        "description": "Check the local AgentFlow store and dry-run mode.",
+        "description": "Check the local AgentFlow store, dry-run mode, and engine package health.",
         "parameters": {"type": "object", "properties": {}},
     },
 }
@@ -105,7 +84,52 @@ AGENTFLOW_BRIDGE_CRON_SCHEMA = {
 }
 
 
+# Lazily load engine state so a missing/uninstalled package can degrade gracefully.
+_engine_error: str | None = None
+_run_cli: Callable[[list[str]], dict[str, Any]] | None = None
+
+
+def _load_engine() -> None:
+    global _engine_error, _run_cli
+    if _run_cli is not None or _engine_error is not None:
+        return
+    try:
+        from agentflow_hermes.cli import main as engine_main
+    except Exception as exc:  # pragma: no cover - degraded path covered by import failure tests
+        _engine_error = f"agentflow_hermes engine not importable: {exc}"
+        return
+
+    def run(args: list[str]) -> dict[str, Any]:
+        out = io.StringIO()
+        err = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                rc = engine_main(args)
+        except SystemExit as exc:
+            rc = exc.code if isinstance(exc.code, int) else (0 if exc.code in (None, True) else 1)
+        out_text = out.getvalue().strip()
+        err_text = err.getvalue().strip()
+        if rc != 0:
+            return {"success": False, "error": err_text or out_text or f"exit {rc}"}
+        try:
+            return json.loads(out_text)
+        except Exception:
+            return {"success": True, "output": out_text}
+
+    _run_cli = run
+
+
+def _ensure_engine() -> dict[str, Any] | None:
+    _load_engine()
+    if _engine_error is not None:
+        return {"success": False, "error": _engine_error}
+    return None
+
+
 def _handle_enqueue(args: dict) -> str:
+    bad = _ensure_engine()
+    if bad is not None:
+        return json.dumps(bad, ensure_ascii=False)
     result = _run_cli([
         "enqueue",
         "--title", str(args.get("title") or ""),
@@ -118,26 +142,49 @@ def _handle_enqueue(args: dict) -> str:
 
 
 def _handle_status(args: dict) -> str:
+    bad = _ensure_engine()
+    if bad is not None:
+        return json.dumps(bad, ensure_ascii=False)
     result = _run_cli(["status", "--json", "--limit", str(args.get("limit") or 20)])
     return json.dumps(result, ensure_ascii=False)
 
 
 def _handle_dispatch_dry_run(args: dict) -> str:
+    bad = _ensure_engine()
+    if bad is not None:
+        return json.dumps(bad, ensure_ascii=False)
     result = _run_cli(["dispatch-dry-run", str(args.get("job_id") or "")])
     return json.dumps(result, ensure_ascii=False)
 
 
 def _handle_ack_ingest(args: dict) -> str:
+    bad = _ensure_engine()
+    if bad is not None:
+        return json.dumps(bad, ensure_ascii=False)
     result = _run_cli(["ack", "ingest", "--text", str(args.get("text") or "")])
     return json.dumps(result, ensure_ascii=False)
 
 
 def _handle_doctor(args: dict) -> str:
+    bad = _ensure_engine()
+    if bad is not None:
+        return json.dumps({
+            "success": False,
+            "engine_importable": False,
+            "mode": "dry-run-first",
+            "error": bad["error"],
+            "installation": "Install the agentflow-hermes engine package in the Hermes environment, enable the plugin, and restart Hermes.",
+        }, ensure_ascii=False)
     result = _run_cli(["doctor"])
+    result.setdefault("engine_importable", True)
+    result.setdefault("mode", "dry-run-first")
     return json.dumps(result, ensure_ascii=False)
 
 
 def _handle_bridge_cron(args: dict) -> str:
+    bad = _ensure_engine()
+    if bad is not None:
+        return json.dumps(bad, ensure_ascii=False)
     result = _run_cli([
         "bridge", "cron", "ingest",
         "--ref", str(args.get("ref") or ""),

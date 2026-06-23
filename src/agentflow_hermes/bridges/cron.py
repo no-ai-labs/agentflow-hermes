@@ -18,6 +18,17 @@ _AF_CRON_RE = re.compile(
     re.IGNORECASE,
 )
 _ACTIVE_WAKE_PREFIX = "HERMES_ACTIVE_WAKE "
+_PRIVATE_PATH_RE = re.compile(r"(?:file://)?/(?:home|Users|var/folders|tmp|private|mnt|media)/\S+", re.IGNORECASE)
+_WINDOWS_PRIVATE_PATH_RE = re.compile(r"\b[A-Za-z]:\\\\(?:Users|Documents and Settings)\\\\\S+", re.IGNORECASE)
+_SECRET_RE = re.compile(
+    r"(?:"
+    r"\b(?:TOKEN|API[_-]?KEY|SECRET|PASSWORD|PASSWD|AUTHORIZATION|BEARER|SESSION|COOKIE)\b\s*[:=]\s*\S+"
+    r"|\bBearer\s+\S+"
+    r"|\b(?:sk|ghp|gho|github_pat|xox[baprs])-[-_A-Za-z0-9]{12,}"
+    r")",
+    re.IGNORECASE,
+)
+_SAFE_REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/#@+=-]{0,239}$")
 
 
 @dataclass(frozen=True)
@@ -35,10 +46,47 @@ def _short_text(value: Any, *, max_len: int = 240) -> str:
     return text[:max_len]
 
 
+def _contains_sensitive_text(value: Any) -> bool:
+    text = "" if value is None else str(value)
+    return bool(_SECRET_RE.search(text) or _PRIVATE_PATH_RE.search(text) or _WINDOWS_PRIVATE_PATH_RE.search(text))
+
+
+def _sanitize_summary(value: Any, *, fallback: str = "cron material event") -> tuple[str, bool]:
+    text = _short_text(value)
+    if not text:
+        return fallback, False
+    if _contains_sensitive_text(text):
+        return fallback, True
+    return text, False
+
+
+def _safe_source_ref(value: Any, *, source_hash: str = "") -> tuple[str, bool]:
+    ref = _short_text(value, max_len=240)
+    if not ref:
+        return "", False
+    if _contains_sensitive_text(ref) or not _SAFE_REF_RE.fullmatch(ref):
+        digest = output_hash(ref)[:16]
+        return f"ref:sha256:{digest}", True
+    return ref, False
+
+
 def _safe_active_wake_metadata(raw: dict[str, Any]) -> dict[str, str]:
     """Return compact material-event metadata safe for durable storage."""
-    allowed = ("event_key", "status", "summary", "target", "job_id", "run_id")
-    return {key: _short_text(raw.get(key)) for key in allowed if raw.get(key) not in (None, "")}
+    metadata: dict[str, str] = {}
+    for key in ("event_key", "status", "target", "job_id", "run_id"):
+        if raw.get(key) not in (None, ""):
+            value = _short_text(raw.get(key))
+            if _contains_sensitive_text(value):
+                metadata[key] = f"{key}:redacted"
+                metadata[f"{key}_redacted"] = "true"
+            else:
+                metadata[key] = value
+    if raw.get("summary") not in (None, ""):
+        summary, redacted = _sanitize_summary(raw.get("summary"))
+        metadata["summary"] = summary
+        if redacted:
+            metadata["summary_redacted"] = "true"
+    return metadata
 
 
 def output_hash(text: str) -> str:
@@ -99,9 +147,9 @@ def classify_markers(text: str, *, default_ref: str = "", default_hash: str = ""
             markers.append(
                 CronMarker(
                     kind=match.group("kind").lower(),
-                    ref=match.group("ref").strip(),
+                    ref=_safe_source_ref(match.group("ref").strip(), source_hash=match.group("hash").strip())[0],
                     hash=match.group("hash").strip(),
-                    summary=_short_text(match.group("summary")),
+                    summary=_sanitize_summary(match.group("summary"))[0],
                     metadata={"marker": "af_cron"},
                 )
             )
@@ -163,7 +211,9 @@ def ingest_cron_output(
     small marker excerpt needed to classify material/no-change output.
     """
     source_hash = source_hash or output_hash(marker_text)
-    markers = classify_markers(marker_text, default_ref=source_ref, default_hash=source_hash)
+    safe_source_ref, source_ref_redacted = _safe_source_ref(source_ref, source_hash=source_hash)
+    safe_title, title_redacted = _sanitize_summary(title, fallback="")
+    markers = classify_markers(marker_text, default_ref=safe_source_ref, default_hash=source_hash)
     material = [m for m in markers if m.kind == "material"]
     noise = [m for m in markers if m.kind == "noise"]
 
@@ -173,18 +223,19 @@ def ingest_cron_output(
             "cron_noise",
             payload={
                 "source": source,
-                "source_ref": source_ref,
+                "source_ref": safe_source_ref,
                 "source_hash": source_hash,
                 "markers": len(noise),
                 "raw_output_stored": False,
+                "source_ref_redacted": source_ref_redacted,
             },
         )
         return {"success": True, "applied": False, "duplicate": False, "reason": "no_material_marker", "job_id": None}
 
     marker = material[0]
-    effective_ref = marker.ref or source_ref
+    effective_ref, marker_ref_redacted = _safe_source_ref(marker.ref or safe_source_ref, source_hash=source_hash)
     effective_hash = marker.hash or source_hash
-    effective_job_id = job_id or marker.metadata.get("job_id") or correlation_id or source_ref or "cron"
+    effective_job_id = job_id or marker.metadata.get("job_id") or correlation_id or safe_source_ref or "cron"
     effective_run_id = run_id or marker.metadata.get("run_id") or effective_hash
     dedupe_key = make_dedupe_key(source, correlation_id, effective_hash, job_id=effective_job_id, run_id=effective_run_id, target=target)
 
@@ -196,6 +247,7 @@ def ingest_cron_output(
         "dedupe_key": dedupe_key,
         "marker": marker.metadata.get("marker", ""),
         "raw_output_stored": False,
+        "source_ref_redacted": source_ref_redacted or marker_ref_redacted,
     }
     if existing:
         _record_duplicate(store, existing, duplicate_payload)
@@ -209,7 +261,7 @@ def ingest_cron_output(
         "live_wake_dispatch: disabled"
     )
     result = store.enqueue(
-        title=title or marker.summary or f"cron:{effective_ref}",
+        title=safe_title or marker.summary or f"cron:{effective_ref}",
         body=body,
         target=target or marker.metadata.get("target", ""),
         origin_return=origin_return,
@@ -230,6 +282,8 @@ def ingest_cron_output(
             "material_event": marker.metadata,
             "raw_output_stored": False,
             "live_wake_disabled": True,
+            "source_ref_redacted": source_ref_redacted or marker_ref_redacted,
+            "title_redacted": title_redacted,
         }
         store.record_event(result["job_id"], "cron_ingested", payload=event_payload)
         return {"success": True, "applied": True, "duplicate": False, "job_id": result["job_id"], "dedupe_key": dedupe_key}

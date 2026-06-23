@@ -6,11 +6,19 @@ This repository packages AgentFlow as a Hermes add-on: a small Python CLI plus a
 
 ## Install concept
 
+The Hermes plugin is a thin adapter. Install the `agentflow-hermes` engine package into the same Python environment that runs Hermes/gateway first, then install/enable the plugin:
+
 ```bash
+# Inside the Hermes runtime environment, not an isolated uv tool env:
+uv pip install 'agentflow-hermes @ git+https://github.com/no-ai-labs/agentflow-hermes.git'
 hermes plugins install no-ai-labs/agentflow-hermes#plugins/hermes-agentflow
 hermes plugins enable agentflow
+agentflow-hermes init
+agentflow-hermes doctor
 hermes gateway restart
 ```
+
+`uv tool install` is useful for isolated CLI commands, but it does not make `agentflow_hermes` importable by the Hermes plugin interpreter. If the engine package is missing, the plugin degrades to `agentflow_doctor` guidance instead of owning business logic itself.
 
 For local CLI development:
 

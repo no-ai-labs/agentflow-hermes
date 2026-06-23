@@ -98,6 +98,72 @@ def test_ingest_active_wake_enqueues_without_raw_output_or_secret(tmp_path):
     assert "secret" not in event_payload["material_event"]
 
 
+def test_active_wake_secret_and_private_path_summary_do_not_persist(tmp_path):
+    store = AgentFlowStore(tmp_path / "agentflow.db")
+    marker = (
+        'HERMES_ACTIVE_WAKE {"event_key":"evt-secret","status":"changed",'
+        '"summary":"TOKEN=super-secret from /home/duckran/private/cron.out"}'
+    )
+    result = ingest_cron_output(
+        store,
+        source_ref="ref://cron/run-secret",
+        source_hash="hash-secret",
+        marker_text=marker,
+        job_id="cron-job",
+        run_id="run-secret",
+        target="discord:#alerts",
+    )
+    assert result["applied"] is True
+    job = store.get_job(result["job_id"])
+    events = _events(store, result["job_id"])
+    durable = json.dumps({"job": job, "events": events, "status": store.list_jobs()}, ensure_ascii=False)
+    assert "TOKEN=super-secret" not in durable
+    assert "super-secret" not in durable
+    assert "/home/duckran" not in durable
+    assert "cron material event" in durable
+    event_payload = json.loads(_events(store, result["job_id"], "cron_ingested")[0]["payload_json"])
+    assert event_payload["material_event"]["summary_redacted"] == "true"
+
+
+def test_absolute_source_ref_is_replaced_before_job_events_and_status(tmp_path):
+    store = AgentFlowStore(tmp_path / "agentflow.db")
+    marker = 'HERMES_ACTIVE_WAKE {"event_key":"evt-path","status":"changed","summary":"safe change"}'
+    result = ingest_cron_output(
+        store,
+        source_ref="/home/duckran/private/cron-output.txt",
+        source_hash="hash-path",
+        marker_text=marker,
+        target="discord:#alerts",
+    )
+    assert result["applied"] is True
+    job = store.get_job(result["job_id"])
+    assert job is not None
+    assert job["source_ref"].startswith("ref:sha256:")
+    events = _events(store, result["job_id"])
+    durable = json.dumps({"job": job, "events": events, "status": store.list_jobs()}, ensure_ascii=False)
+    assert "/home/duckran" not in durable
+    assert "cron-output.txt" not in durable
+    assert "source_ref_redacted" in durable
+
+
+def test_scan_cron_output_replaces_absolute_source_ref(tmp_path):
+    store = AgentFlowStore(tmp_path / "agentflow.db")
+    fixture = tmp_path / "cron.out"
+    fixture.write_text('HERMES_ACTIVE_WAKE {"event_key":"evt-abs","status":"ready","summary":"Ready"}', encoding="utf-8")
+    result = scan_cron_output(
+        store,
+        output_file=fixture,
+        source_ref="/home/duckran/private/cron.out",
+        job_id="cron-job",
+        run_id="run-abs",
+        target="discord:#ops",
+    )
+    assert result["applied"] is True
+    durable = json.dumps({"job": store.get_job(result["job_id"]), "events": _events(store, result["job_id"]), "status": store.list_jobs()}, ensure_ascii=False)
+    assert "/home/duckran" not in durable
+    assert "ref:sha256:" in durable
+
+
 def test_ingest_same_dedupe_key_is_duplicate(tmp_path):
     store = AgentFlowStore(tmp_path / "agentflow.db")
     marker = "[AF-CRON] kind=material ref=build/123 hash=abc123 summary=Deploy app"

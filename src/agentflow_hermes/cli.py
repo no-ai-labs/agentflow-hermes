@@ -6,6 +6,7 @@ from typing import Sequence
 
 from .ack import AckError, parse_ack_block, validate_ack
 from .bridges.cron import ingest_cron_output, scan_cron_output
+from .bridges.kanban import load_fixture, resolve_blocked_remediation
 from .store import AgentFlowStore, render_dispatch_prompt
 
 
@@ -83,6 +84,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     bridge_cron_sub = bridge_cron.add_subparsers(dest="bridge_cron_cmd", required=True)
     _add_cron_scan_args(bridge_cron_sub.add_parser("scan"))
     _add_cron_ingest_args(bridge_cron_sub.add_parser("ingest"))
+
+    bridge_kanban = bridge_sub.add_parser("kanban")
+    bridge_kanban_sub = bridge_kanban.add_subparsers(dest="bridge_kanban_cmd", required=True)
+    resolve_blocked = bridge_kanban_sub.add_parser("resolve-blocked")
+    resolve_blocked.add_argument("--blocked-card", required=True)
+    resolve_blocked.add_argument("--remediation-review", required=True)
+    resolve_blocked.add_argument("--dry-run", action="store_true", default=True)
+    resolve_blocked.add_argument("--input-file", required=True)
 
     args = parser.parse_args(argv)
     store = AgentFlowStore.default()
@@ -195,6 +204,22 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise AssertionError(args.bridge_cron_cmd)
         print(_dump(result))
         return 0
+    if args.cmd == "bridge" and args.bridge_cmd == "kanban":
+        if args.bridge_kanban_cmd == "resolve-blocked":
+            fixture = load_fixture(args.input_file)
+            cards = fixture.get("cards") or []
+            blocked_card = next((c for c in cards if str(c.get("id") or "") == args.blocked_card), None)
+            remediation_review = next(
+                (c for c in cards if str(c.get("id") or "") == args.remediation_review), None
+            )
+            result = resolve_blocked_remediation(
+                blocked_card,
+                remediation_review,
+                dry_run=args.dry_run,
+            )
+            print(_dump(result, indent=2))
+            return 0 if result.get("success") else 2
+        raise AssertionError(args.bridge_kanban_cmd)
     raise AssertionError(args.cmd)
 
 
