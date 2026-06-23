@@ -2,29 +2,15 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 from typing import Sequence
 
+from .ack import AckError, parse_ack_block, validate_ack
+from .cron_bridge import ingest_cron_output
 from .store import AgentFlowStore, render_dispatch_prompt
 
-_ACK_RE = re.compile(r"\[JOB ACK\](?P<body>.*)", re.IGNORECASE | re.DOTALL)
-_FIELD_RE = re.compile(r"^(?P<key>[a-zA-Z_][\w-]*):\s*(?P<value>.*)$")
 
-
-def parse_ack_block(text: str) -> dict[str, str]:
-    match = _ACK_RE.search(text or "")
-    if not match:
-        raise ValueError("missing [JOB ACK] block")
-    fields: dict[str, str] = {}
-    for raw in match.group("body").splitlines():
-        m = _FIELD_RE.match(raw.strip())
-        if m:
-            fields[m.group("key").replace("-", "_").lower()] = m.group("value").strip()
-    if not fields.get("job_id"):
-        raise ValueError("ACK missing job_id")
-    if not fields.get("status"):
-        raise ValueError("ACK missing status")
-    return fields
+def _dump(data: dict, **kwargs) -> str:
+    return json.dumps(data, ensure_ascii=False, **kwargs)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -40,6 +26,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     enqueue.add_argument("--target", default="")
     enqueue.add_argument("--origin-return", default="")
     enqueue.add_argument("--dedupe-key", default="")
+    enqueue.add_argument("--correlation-id", default="")
+    enqueue.add_argument("--causation-id", default="")
+    enqueue.add_argument("--source-kind", default="manual")
+    enqueue.add_argument("--source-id", default="")
+    enqueue.add_argument("--source-ref", default="")
+    enqueue.add_argument("--source-hash", default="")
 
     status = sub.add_parser("status")
     status.add_argument("--limit", type=int, default=20)
@@ -53,24 +45,52 @@ def main(argv: Sequence[str] | None = None) -> int:
     ingest = ack_sub.add_parser("ingest")
     ingest.add_argument("--text", required=True)
 
+    cron = sub.add_parser("cron")
+    cron_sub = cron.add_subparsers(dest="cron_cmd", required=True)
+    cron_ingest = cron_sub.add_parser("ingest")
+    cron_ingest.add_argument("--ref", required=True)
+    cron_ingest.add_argument("--hash", required=True)
+    cron_ingest.add_argument("--marker-text", default="")
+    cron_ingest.add_argument("--source", default="cron")
+    cron_ingest.add_argument("--correlation-id", default="")
+    cron_ingest.add_argument("--target", default="")
+    cron_ingest.add_argument("--origin-return", default="")
+    cron_ingest.add_argument("--title", default="")
+
     args = parser.parse_args(argv)
     store = AgentFlowStore.default()
 
     if args.cmd == "init":
         store.init()
-        print(json.dumps({"success": True, "db": str(store.path)}, ensure_ascii=False))
+        print(_dump({"success": True, "db": str(store.path), "schema_version": 2}))
         return 0
     if args.cmd == "doctor":
         store.init()
-        print(json.dumps({"success": True, "db": str(store.path), "mode": "dry-run-first"}, ensure_ascii=False))
+        with store.connect() as con:
+            version = store._schema_version(con)
+        print(_dump({"success": True, "db": str(store.path), "mode": "dry-run-first", "schema_version": version}))
         return 0
     if args.cmd == "enqueue":
-        print(json.dumps(store.enqueue(title=args.title, body=args.body, target=args.target, origin_return=args.origin_return, dedupe_key=args.dedupe_key), ensure_ascii=False))
+        print(_dump(
+            store.enqueue(
+                title=args.title,
+                body=args.body,
+                target=args.target,
+                origin_return=args.origin_return,
+                dedupe_key=args.dedupe_key,
+                correlation_id=args.correlation_id,
+                causation_id=args.causation_id,
+                source_kind=args.source_kind,
+                source_id=args.source_id,
+                source_ref=args.source_ref,
+                source_hash=args.source_hash,
+            )
+        ))
         return 0
     if args.cmd == "status":
         jobs = store.list_jobs(limit=args.limit)
         if args.json:
-            print(json.dumps({"success": True, "jobs": jobs}, ensure_ascii=False, indent=2))
+            print(_dump({"success": True, "jobs": jobs}, indent=2))
         else:
             for job in jobs:
                 print(f"{job['id']} {job['status']} {job['title']} -> {job['target']}")
@@ -78,17 +98,47 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.cmd == "dispatch-dry-run":
         job = store.get_job(args.job_id)
         if not job:
-            print(json.dumps({"success": False, "error": f"unknown job_id: {args.job_id}"}, ensure_ascii=False))
+            print(_dump({"success": False, "error": f"unknown job_id: {args.job_id}"}))
             return 2
+        store.dispatch_dry_run(args.job_id)
+        job = store.get_job(args.job_id) or job
         print(render_dispatch_prompt(job))
         return 0
     if args.cmd == "ack" and args.ack_cmd == "ingest":
         try:
             fields = parse_ack_block(args.text)
-        except ValueError as exc:
-            print(json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False))
+            ack_payload = validate_ack(fields)
+        except AckError as exc:
+            if exc.deadletter:
+                payload = dict(exc.payload or {})
+                job_id = str(payload.get("job_id") or "")
+                store.deadletter(reason=exc.reason, job_id=job_id, payload=payload)
+            print(_dump({"success": False, "error": exc.reason}))
             return 2
-        print(json.dumps(store.ack(job_id=fields["job_id"], status=fields["status"], summary=fields.get("summary", ""), payload=fields), ensure_ascii=False))
+        result = store.ack(
+            job_id=ack_payload.job_id,
+            status=ack_payload.status,
+            summary=ack_payload.summary,
+            payload=ack_payload.raw_fields,
+        )
+        if not result.get("success"):
+            print(_dump(result))
+            return 2
+        print(_dump(result))
+        return 0
+    if args.cmd == "cron" and args.cron_cmd == "ingest":
+        result = ingest_cron_output(
+            store,
+            source_ref=args.ref,
+            source_hash=args.hash,
+            marker_text=args.marker_text,
+            source=args.source,
+            correlation_id=args.correlation_id,
+            target=args.target,
+            origin_return=args.origin_return,
+            title=args.title,
+        )
+        print(_dump(result))
         return 0
     raise AssertionError(args.cmd)
 
