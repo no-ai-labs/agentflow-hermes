@@ -1,0 +1,20 @@
+[project]
+name = "agentflow-hermes"
+version = "0.1.0"
+description = "AgentFlow add-on for Hermes Agent: durable handoffs, ACK receipts, and supervisor queues."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "no-ai-labs" }]
+dependencies = []
+
+[project.scripts]
+agentflow-hermes = "agentflow_hermes.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
