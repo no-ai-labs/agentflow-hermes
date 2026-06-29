@@ -83,6 +83,31 @@ AGENTFLOW_BRIDGE_CRON_SCHEMA = {
     },
 }
 
+AGENTFLOW_DISPATCH_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "agentflow_dispatch",
+        "description": "Render or live-dispatch a queued AgentFlow job. Live requires explicit live=true and server-side policy enablement; default is dry-run.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "job_id": {"type": "string"},
+                "live": {"type": "boolean", "default": False},
+            },
+            "required": ["job_id"],
+        },
+    },
+}
+
+AGENTFLOW_LIVE_STATUS_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "agentflow_live_status",
+        "description": "Read-only view of the effective AgentFlow live policy, kill-switch, and degraded state. No mutations.",
+        "parameters": {"type": "object", "properties": {}},
+    },
+}
+
 
 # Lazily load engine state so a missing/uninstalled package can degrade gracefully.
 _engine_error: str | None = None
@@ -199,10 +224,32 @@ def _handle_bridge_cron(args: dict) -> str:
     return json.dumps(result, ensure_ascii=False)
 
 
+def _handle_dispatch(args: dict) -> str:
+    bad = _ensure_engine()
+    if bad is not None:
+        return json.dumps(bad, ensure_ascii=False)
+    live = bool(args.get("live", False))
+    cmd = ["dispatch", "--job-id", str(args.get("job_id") or "")]
+    if live:
+        cmd.append("--live")
+    result = _run_cli(cmd)
+    return json.dumps(result, ensure_ascii=False)
+
+
+def _handle_live_status(args: dict) -> str:
+    bad = _ensure_engine()
+    if bad is not None:
+        return json.dumps(bad, ensure_ascii=False)
+    result = _run_cli(["live", "status"])
+    return json.dumps(result, ensure_ascii=False)
+
+
 def register(ctx) -> None:
     ctx.register_tool("agentflow_enqueue", "agentflow", AGENTFLOW_ENQUEUE_SCHEMA, _handle_enqueue, emoji="🧭")
     ctx.register_tool("agentflow_status", "agentflow", AGENTFLOW_STATUS_SCHEMA, _handle_status, emoji="📋")
     ctx.register_tool("agentflow_dispatch_dry_run", "agentflow", AGENTFLOW_DISPATCH_DRY_RUN_SCHEMA, _handle_dispatch_dry_run, emoji="🧪")
+    ctx.register_tool("agentflow_dispatch", "agentflow", AGENTFLOW_DISPATCH_SCHEMA, _handle_dispatch, emoji="🚀")
     ctx.register_tool("agentflow_ack_ingest", "agentflow", AGENTFLOW_ACK_INGEST_SCHEMA, _handle_ack_ingest, emoji="✅")
     ctx.register_tool("agentflow_doctor", "agentflow", AGENTFLOW_DOCTOR_SCHEMA, _handle_doctor, emoji="🩺")
     ctx.register_tool("agentflow_bridge_cron", "agentflow", AGENTFLOW_BRIDGE_CRON_SCHEMA, _handle_bridge_cron, emoji="⏱️")
+    ctx.register_tool("agentflow_live_status", "agentflow", AGENTFLOW_LIVE_STATUS_SCHEMA, _handle_live_status, emoji="🛡️")

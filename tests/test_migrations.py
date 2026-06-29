@@ -2,6 +2,8 @@ from agentflow_hermes.migrations import SCHEMA_VERSION
 from agentflow_hermes.store import AgentFlowStore
 
 
+
+
 V1_SCHEMA = """
 create table if not exists jobs (
     id text primary key,
@@ -27,12 +29,12 @@ create index if not exists idx_events_job_id on job_events(job_id, id);
 """
 
 
-def test_fresh_db_initializes_at_v2(tmp_path):
+def test_fresh_db_initializes_at_schema_version(tmp_path):
     store = AgentFlowStore(tmp_path / "agentflow.db")
     store.init()
     with store.connect() as con:
         version = con.execute("pragma user_version").fetchone()[0]
-    assert version == SCHEMA_VERSION == 2
+    assert version == SCHEMA_VERSION == 3
 
 
 def test_v1_db_upgrades_without_data_loss(tmp_path):
@@ -52,17 +54,21 @@ def test_v1_db_upgrades_without_data_loss(tmp_path):
         version = con.execute("pragma user_version").fetchone()[0]
         cols = {r[1] for r in con.execute("pragma table_info(jobs)").fetchall()}
         dead_cols = {r[1] for r in con.execute("pragma table_info(deadletter)").fetchall()}
+        receipt_cols = {r[1] for r in con.execute("pragma table_info(operator_receipts)").fetchall()}
         job = con.execute("select * from jobs where id='j1'").fetchone()
 
-    assert version == 2
+    assert version == SCHEMA_VERSION == 3
     assert "correlation_id" in cols
     assert "causation_id" in cols
     assert "source_id" in cols
     assert "source_hash" in cols
     assert "attempt" in cols
     assert "final_at" in cols
+    assert "live_delivered_at" in cols
+    assert "live_delivery_ref" in cols
     assert "seq" in {r[1] for r in con.execute("pragma table_info(job_events)").fetchall()}
     assert dead_cols
+    assert receipt_cols
     assert job["title"] == "Old"
     assert job["status"] == "queued"
 
@@ -77,3 +83,5 @@ def test_indexes_exist(tmp_path):
     assert "idx_deadletter_job" in indexes
     assert "uniq_events_job_seq" in indexes
     assert "uniq_jobs_source_hash" in indexes
+    assert "idx_receipts_job" in indexes
+    assert "idx_receipts_channel" in indexes

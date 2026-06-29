@@ -5,9 +5,14 @@ import os
 import sqlite3
 import time
 from dataclasses import dataclass
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
+from .live.gateway import DeliveryResult, FakeGateway, GatewayUnavailable, HermesGateway
+from .live.policy import LivePolicy, load_policy
+from .live.sanitize import policy_snapshot, safe_body_for_delivery
+from .live.throttle import check_throttle, consecutive_failures, record_failure, set_degraded
 from .migrations import migrate
 from .states import ALLOWED_TRANSITIONS, FINAL_STATES, JobStatus, normalize_status
 
@@ -371,6 +376,304 @@ class AgentFlowStore:
                 new_status=current.value,
             )
             return {"success": True, "applied": False, "job_id": job_id, "status": current.value}
+
+    def record_receipt(
+        self,
+        *,
+        job_id: str = "",
+        channel: str,
+        phase: str,
+        target: str = "",
+        idempotency_key: str = "",
+        policy: LivePolicy | None = None,
+        delivery_ref: str = "",
+        reason: str = "",
+        con: sqlite3.Connection | None = None,
+    ) -> dict[str, Any]:
+        """Write an operator receipt inside the current or a new transaction."""
+        snapshot = policy_snapshot(policy) if policy else "{}"
+        now = time.time()
+
+        def _run(c: sqlite3.Connection) -> dict[str, Any]:
+            c.execute(
+                """
+                insert into operator_receipts(
+                    job_id, channel, phase, target, idempotency_key,
+                    policy_snapshot_json, delivery_ref, reason, created_at
+                ) values(?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (job_id, channel, phase, target, idempotency_key, snapshot, delivery_ref, reason, now),
+            )
+            return {
+                "success": True,
+                "job_id": job_id,
+                "channel": channel,
+                "phase": phase,
+                "target": target,
+                "reason": reason,
+                "created_at": now,
+            }
+
+        if con is not None:
+            return _run(con)
+        self.init()
+        with self.connect() as con:
+            return _run(con)
+
+    def _make_idempotency_key(self, *, channel: str, job_id: str, target: str, correlation_id: str) -> str:
+        payload = f"{channel}:{job_id}:{target}:{correlation_id}".encode("utf-8")
+        return sha256(payload).hexdigest()[:24]
+
+    def dispatch_live(
+        self,
+        job_id: str,
+        *,
+        gateway: HermesGateway | None = None,
+        policy: LivePolicy | None = None,
+        live: bool = False,
+    ) -> dict[str, Any]:
+        """Gated live dispatch. Fail-closed, canary-only, receipt-first.
+
+        Requires both a policy/config enablement and per-call ``live=True``.
+        The gateway is injected; if ``None``, it is resolved from the plugin
+        context (which is not available in tests/CLI, so those callers must
+        supply one).
+        """
+        self.init()
+        now = time.time()
+        policy = policy if policy is not None else load_policy()
+
+        with self.connect() as con:
+            row = con.execute("select * from jobs where id=?", (job_id,)).fetchone()
+            if row is None:
+                return {"success": False, "error": "unknown_job", "job_id": job_id, "mode": "dry-run"}
+            job = dict(row)
+            target = job.get("target") or ""
+            correlation_id = job.get("correlation_id") or job_id
+
+            idempotency_key = self._make_idempotency_key(
+                channel="live_dispatch", job_id=job_id, target=target, correlation_id=correlation_id
+            )
+
+            # If no live opt-in, behave exactly like dispatch_dry_run.
+            if not live:
+                result = self.dispatch_dry_run(job_id)
+                result["mode"] = "dry-run"
+                return result
+
+            # Kill switch is evaluated first, before any receipt.
+            if policy.kill_switch:
+                self.record_receipt(
+                    job_id=job_id,
+                    channel="live_dispatch",
+                    phase="refused",
+                    target=target,
+                    idempotency_key=idempotency_key,
+                    policy=policy,
+                    reason="kill_switch",
+                    con=con,
+                )
+                return {"success": False, "error": "kill_switch", "job_id": job_id, "mode": "dry-run"}
+
+            # Gate check.
+            if not policy.live_dispatch_enabled:
+                self.record_receipt(
+                    job_id=job_id,
+                    channel="live_dispatch",
+                    phase="refused",
+                    target=target,
+                    idempotency_key=idempotency_key,
+                    policy=policy,
+                    reason="live_dispatch_disabled",
+                    con=con,
+                )
+                return {"success": False, "error": "live_dispatch_disabled", "job_id": job_id, "mode": "dry-run"}
+
+            # M6 canary-only: target must be in both allowed and canary lists.
+            if target not in policy.allowed_targets or target not in policy.canary_targets:
+                self.record_receipt(
+                    job_id=job_id,
+                    channel="live_dispatch",
+                    phase="refused",
+                    target=target,
+                    idempotency_key=idempotency_key,
+                    policy=policy,
+                    reason="target_not_allowed",
+                    con=con,
+                )
+                return {"success": False, "error": "target_not_allowed", "job_id": job_id, "mode": "dry-run"}
+
+            # Idempotency / duplicate check.
+            existing_key = con.execute(
+                "select delivery_ref from idempotency_keys where key=?", (idempotency_key,)
+            ).fetchone()
+            if existing_key is not None:
+                self.record_receipt(
+                    job_id=job_id,
+                    channel="live_dispatch",
+                    phase="refused",
+                    target=target,
+                    idempotency_key=idempotency_key,
+                    policy=policy,
+                    delivery_ref=existing_key["delivery_ref"],
+                    reason="duplicate",
+                    con=con,
+                )
+                return {
+                    "success": True,
+                    "applied": False,
+                    "duplicate": True,
+                    "job_id": job_id,
+                    "delivery_ref": existing_key["delivery_ref"],
+                    "mode": "dry-run",
+                }
+
+            # Job-level guard.
+            if job.get("live_delivered_at") is not None or job.get("live_delivery_ref"):
+                self.record_receipt(
+                    job_id=job_id,
+                    channel="live_dispatch",
+                    phase="refused",
+                    target=target,
+                    idempotency_key=idempotency_key,
+                    policy=policy,
+                    reason="duplicate",
+                    con=con,
+                )
+                return {
+                    "success": True,
+                    "applied": False,
+                    "duplicate": True,
+                    "job_id": job_id,
+                    "mode": "dry-run",
+                }
+
+            # Throttle / circuit breaker.
+            allowed, throttle_reason, _state = check_throttle(con, policy, target, now=now)
+            if not allowed:
+                self.record_receipt(
+                    job_id=job_id,
+                    channel="live_dispatch",
+                    phase="refused",
+                    target=target,
+                    idempotency_key=idempotency_key,
+                    policy=policy,
+                    reason=throttle_reason,
+                    con=con,
+                )
+                return {"success": False, "error": throttle_reason, "job_id": job_id, "mode": "dry-run"}
+
+            # Gateway resolution.
+            try:
+                if gateway is None:
+                    # CLI/test path: no injected gateway means unavailable.
+                    raise GatewayUnavailable("no gateway injected")
+            except GatewayUnavailable as exc:
+                self.record_receipt(
+                    job_id=job_id,
+                    channel="live_dispatch",
+                    phase="refused",
+                    target=target,
+                    idempotency_key=idempotency_key,
+                    policy=policy,
+                    reason="gateway_unavailable",
+                    con=con,
+                )
+                return {"success": False, "error": "gateway_unavailable", "detail": str(exc), "job_id": job_id, "mode": "dry-run"}
+
+            # Write attempt receipt before external effect.
+            self.record_receipt(
+                job_id=job_id,
+                channel="live_dispatch",
+                phase="attempt",
+                target=target,
+                idempotency_key=idempotency_key,
+                policy=policy,
+                con=con,
+            )
+
+            body = safe_body_for_delivery(
+                job.get("body") or "",
+                job_id=job_id,
+                source_ref=job.get("source_ref") or "",
+                source_hash=job.get("source_hash") or "",
+            )
+
+            try:
+                delivery = gateway.send_message(target=target, body=body, idempotency_key=idempotency_key)
+            except Exception as exc:
+                record_failure(con, target=target, now=now)
+                if consecutive_failures(con, now=now) >= 3:
+                    set_degraded(con, True)
+                self.record_receipt(
+                    job_id=job_id,
+                    channel="live_dispatch",
+                    phase="failed",
+                    target=target,
+                    idempotency_key=idempotency_key,
+                    policy=policy,
+                    reason="gateway_failure",
+                    con=con,
+                )
+                return {"success": False, "error": "gateway_failure", "detail": str(exc), "job_id": job_id, "mode": "dry-run"}
+
+            if not delivery.success:
+                record_failure(con, target=target, now=now)
+                if consecutive_failures(con, now=now) >= 3:
+                    set_degraded(con, True)
+                self.record_receipt(
+                    job_id=job_id,
+                    channel="live_dispatch",
+                    phase="failed",
+                    target=target,
+                    idempotency_key=idempotency_key,
+                    policy=policy,
+                    delivery_ref=delivery.receipt_ref,
+                    reason="delivery_failed",
+                    con=con,
+                )
+                return {"success": False, "error": "delivery_failed", "delivery_ref": delivery.receipt_ref, "job_id": job_id, "mode": "dry-run"}
+
+            # Success path: claim idempotency, update job, write applied receipt, emit passive_delivery event.
+            con.execute(
+                "insert into idempotency_keys(key, job_id, channel, target, delivery_ref, created_at) values(?, ?, ?, ?, ?, ?)",
+                (idempotency_key, job_id, "live_dispatch", target, delivery.receipt_ref, now),
+            )
+            con.execute(
+                "update jobs set status=?, updated_at=?, live_delivered_at=?, live_delivery_ref=? where id=?",
+                (JobStatus.DISPATCHED.value, now, now, delivery.receipt_ref, job_id),
+            )
+            self.record_receipt(
+                job_id=job_id,
+                channel="live_dispatch",
+                phase="applied",
+                target=target,
+                idempotency_key=idempotency_key,
+                policy=policy,
+                delivery_ref=delivery.receipt_ref,
+                reason="delivered",
+                con=con,
+            )
+            self.record_event(
+                job_id,
+                "passive_delivery",
+                payload={
+                    "channel": "live_dispatch",
+                    "delivery_ref": delivery.receipt_ref,
+                    "target": target,
+                    "mode": "live",
+                },
+                con=con,
+                prev_status=job.get("status") or JobStatus.QUEUED.value,
+                new_status=JobStatus.DISPATCHED.value,
+            )
+            return {
+                "success": True,
+                "applied": True,
+                "job_id": job_id,
+                "delivery_ref": delivery.receipt_ref,
+                "mode": "live",
+            }
 
 
 def render_dispatch_prompt(job: dict[str, Any]) -> str:

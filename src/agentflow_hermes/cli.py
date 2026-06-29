@@ -7,6 +7,9 @@ from typing import Sequence
 from .ack import AckError, parse_ack_block, validate_ack
 from .bridges.cron import ingest_cron_output, scan_cron_output
 from .bridges.kanban import load_fixture, resolve_blocked_remediation
+from .live.gateway import FakeGateway
+from .live.policy import LivePolicy, load_policy, policy_path, save_policy
+from .live.sanitize import short_text
 from .store import AgentFlowStore, render_dispatch_prompt
 
 
@@ -67,6 +70,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     dispatch = sub.add_parser("dispatch-dry-run")
     dispatch.add_argument("job_id")
 
+    live = sub.add_parser("live")
+    live_sub = live.add_subparsers(dest="live_cmd", required=True)
+    live_status = live_sub.add_parser("status")
+    live_enable = live_sub.add_parser("enable")
+    live_enable.add_argument("--dispatch", action="store_true", help="enable live dispatch (operator-only)")
+    live_disable = live_sub.add_parser("disable")
+    live_disable.add_argument("--dispatch", action="store_true", help="disable live dispatch and set kill switch")
+    live_canary = live_sub.add_parser("canary")
+    live_canary.add_argument("--target", required=True)
+    live_canary.add_argument("--live", action="store_true", default=False)
+    live_canary.add_argument("--gateway", default="fake", choices=["fake"])
+
+    dispatch_live = sub.add_parser("dispatch")
+    dispatch_live.add_argument("--job-id", required=True)
+    dispatch_live.add_argument("--live", action="store_true", default=False)
+
     ack = sub.add_parser("ack")
     ack_sub = ack.add_subparsers(dest="ack_cmd", required=True)
     ingest = ack_sub.add_parser("ingest")
@@ -98,13 +117,23 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.cmd == "init":
         store.init()
-        print(_dump({"success": True, "db": str(store.path), "schema_version": 2}))
+        with store.connect() as con:
+            version = store._schema_version(con)
+        print(_dump({"success": True, "db": str(store.path), "schema_version": version}))
         return 0
     if args.cmd == "doctor":
         store.init()
         with store.connect() as con:
             version = store._schema_version(con)
-        print(_dump({"success": True, "db": str(store.path), "mode": "dry-run-first", "schema_version": version}))
+        policy = load_policy()
+        print(_dump({
+            "success": True,
+            "db": str(store.path),
+            "mode": "dry-run-first",
+            "schema_version": version,
+            "policy": policy.as_dict(),
+            "policy_path": str(policy_path()),
+        }))
         return 0
     if args.cmd == "enqueue":
         print(_dump(store.enqueue(
@@ -138,6 +167,98 @@ def main(argv: Sequence[str] | None = None) -> int:
         job = store.get_job(args.job_id) or job
         print(render_dispatch_prompt(job))
         return 0
+    if args.cmd == "dispatch":
+        job = store.get_job(args.job_id)
+        if not job:
+            print(_dump({"success": False, "error": f"unknown job_id: {args.job_id}"}))
+            return 2
+        if not args.live:
+            result = store.dispatch_dry_run(args.job_id)
+            job = store.get_job(args.job_id) or job
+            print(_dump({**result, "prompt": render_dispatch_prompt(job), "mode": "dry-run"}))
+            return 0
+        # Live dispatch requires an injected public gateway. The sidecar CLI has
+        # no real gateway in M6, so it must fail closed instead of pretending a
+        # fake delivery happened. The fake gateway is reserved for canary smoke.
+        result = store.dispatch_live(args.job_id, gateway=None, live=True)
+        print(_dump(result))
+        return 0 if result.get("success") else 2
+    if args.cmd == "live":
+        if args.live_cmd == "status":
+            policy = load_policy()
+            store.init()
+            with store.connect() as con:
+                degraded_row = con.execute("select value from agentflow_meta where key='degraded'").fetchone()
+            degraded = degraded_row is not None and degraded_row["value"] == "1"
+            print(_dump({
+                "success": True,
+                "policy": policy.as_dict(),
+                "policy_path": str(policy_path()),
+                "degraded": degraded,
+            }))
+            return 0
+        if args.live_cmd == "enable":
+            policy = load_policy()
+            if args.dispatch:
+                policy = LivePolicy(
+                    live_dispatch_enabled=True,
+                    active_wake_enabled=policy.active_wake_enabled,
+                    kanban_apply_enabled=policy.kanban_apply_enabled,
+                    allowed_targets=policy.allowed_targets,
+                    canary_targets=policy.canary_targets,
+                    max_sends_per_min=policy.max_sends_per_min,
+                    max_sends_per_target_per_hour=policy.max_sends_per_target_per_hour,
+                    kill_switch=False,
+                )
+            save_policy(policy)
+            print(_dump({"success": True, "policy": policy.as_dict(), "policy_path": str(policy_path())}))
+            return 0
+        if args.live_cmd == "disable":
+            policy = load_policy()
+            new_policy = LivePolicy(
+                live_dispatch_enabled=False if args.dispatch else policy.live_dispatch_enabled,
+                active_wake_enabled=policy.active_wake_enabled,
+                kanban_apply_enabled=policy.kanban_apply_enabled,
+                allowed_targets=policy.allowed_targets,
+                canary_targets=policy.canary_targets,
+                max_sends_per_min=policy.max_sends_per_min,
+                max_sends_per_target_per_hour=policy.max_sends_per_target_per_hour,
+                kill_switch=True,
+            )
+            save_policy(new_policy)
+            print(_dump({"success": True, "policy": new_policy.as_dict(), "policy_path": str(policy_path())}))
+            return 0
+        if args.live_cmd == "canary":
+            policy = load_policy()
+            store.init()
+            target = short_text(args.target)
+            # Canary requires an explicit allowlist entry. To run a canary the
+            # operator must have configured the target in policy.json. The
+            # default fake gateway lets tests/smokes exercise the path without
+            # reaching Hermes core.
+            gateway = FakeGateway()
+            if args.live:
+                if not policy.live_dispatch_enabled:
+                    print(_dump({"success": False, "error": "live_dispatch_disabled", "target": target}))
+                    return 2
+                if target not in policy.allowed_targets or target not in policy.canary_targets:
+                    print(_dump({"success": False, "error": "target_not_allowed", "target": target}))
+                    return 2
+            # Enqueue a synthetic canary job so dispatch_live has a job row.
+            created = store.enqueue(
+                title=f"live canary to {target}",
+                body="Synthetic canary message.",
+                target=target,
+                source_kind="canary",
+            )
+            result = store.dispatch_live(
+                created["job_id"],
+                gateway=gateway,
+                live=args.live,
+            )
+            print(_dump({**result, "target": target, "gateway_calls": len(gateway.calls)}))
+            return 0 if result.get("success") else 2
+        raise AssertionError(args.live_cmd)
     if args.cmd == "ack" and args.ack_cmd == "ingest":
         try:
             fields = parse_ack_block(args.text)

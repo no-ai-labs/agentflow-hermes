@@ -58,9 +58,11 @@ def test_register_loads_tools_without_crashing(hermes_ctx):
         "agentflow_enqueue",
         "agentflow_status",
         "agentflow_dispatch_dry_run",
+        "agentflow_dispatch",
         "agentflow_ack_ingest",
         "agentflow_doctor",
         "agentflow_bridge_cron",
+        "agentflow_live_status",
     }
 
 

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SQL_V1 = """
 create table if not exists jobs (
@@ -74,7 +74,52 @@ create unique index if not exists uniq_events_job_seq on job_events(job_id, seq)
 create unique index if not exists uniq_jobs_source_hash on jobs(source_hash) where source_hash != '';
 """
 
-STEPS = [(1, SQL_V1), (2, SQL_V2)]
+SQL_V3 = """
+-- operator receipt ledger: audit of proposed/refused/applied operator actions
+-- No message bodies, transcripts, or secrets are stored here.
+create table if not exists operator_receipts (
+    id integer primary key autoincrement,
+    job_id text not null default '',
+    channel text not null,
+    phase text not null,
+    target text not null default '',
+    idempotency_key text not null default '',
+    policy_snapshot_json text not null default '{}',
+    delivery_ref text not null default '',
+    reason text not null default '',
+    created_at real not null
+);
+
+-- idempotency guard for live sends
+-- UNIQUE collision => already delivered, no second gateway call.
+create table if not exists idempotency_keys (
+    key text primary key,
+    job_id text not null default '',
+    channel text not null default '',
+    target text not null default '',
+    delivery_ref text not null default '',
+    created_at real not null
+);
+
+-- job-level live delivery tracking
+alter table jobs add column live_delivered_at real null;
+alter table jobs add column live_delivery_ref text not null default '';
+
+-- tiny key-value store for circuit breaker / degraded state
+create table if not exists agentflow_meta (
+    key text primary key,
+    value text not null default '',
+    updated_at real not null
+);
+
+-- indexes
+create index if not exists idx_receipts_job on operator_receipts(job_id, id);
+create index if not exists idx_receipts_channel on operator_receipts(channel, created_at);
+create index if not exists idx_receipts_idempotency on operator_receipts(idempotency_key);
+create index if not exists idx_idempotency_keys on idempotency_keys(key);
+"""
+
+STEPS = [(1, SQL_V1), (2, SQL_V2), (3, SQL_V3)]
 
 
 def migrate(con) -> int:
