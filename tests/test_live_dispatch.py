@@ -62,6 +62,57 @@ def test_save_and_load_policy(tmp_path, monkeypatch):
     assert loaded.allowed_targets == (CANARY_TARGET,)
 
 
+MALFORMED_TRUTHY_VALUES = [
+    "false",  # non-empty string is truthy under bool()
+    "true",
+    "0",
+    1,
+    -1,
+    [0],
+    {"enabled": False},
+]
+
+BOOLEAN_FLAGS = [
+    "live_dispatch_enabled",
+    "active_wake_enabled",
+    "kanban_apply_enabled",
+    "kill_switch",
+]
+
+
+def _write_policy_json(tmp_path, payload):
+    path = tmp_path / "policy.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+@pytest.mark.parametrize("flag", BOOLEAN_FLAGS)
+@pytest.mark.parametrize("value", MALFORMED_TRUTHY_VALUES)
+def test_policy_flags_fail_closed_on_malformed_types(tmp_path, monkeypatch, flag, value):
+    monkeypatch.setenv("AGENTFLOW_HOME", str(tmp_path))
+    _write_policy_json(tmp_path, {flag: value})
+    policy = load_policy()
+    # Malformed (non-boolean) values must never enable operator/live behavior.
+    assert getattr(policy, flag) is False
+
+
+@pytest.mark.parametrize("flag", BOOLEAN_FLAGS)
+def test_policy_flags_accept_literal_booleans(tmp_path, monkeypatch, flag):
+    monkeypatch.setenv("AGENTFLOW_HOME", str(tmp_path))
+    _write_policy_json(tmp_path, {flag: True})
+    assert getattr(load_policy(), flag) is True
+    _write_policy_json(tmp_path, {flag: False})
+    assert getattr(load_policy(), flag) is False
+
+
+def test_policy_missing_flags_default_safe(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENTFLOW_HOME", str(tmp_path))
+    _write_policy_json(tmp_path, {"allowed_targets": [CANARY_TARGET]})
+    policy = load_policy()
+    for flag in BOOLEAN_FLAGS:
+        assert getattr(policy, flag) is False
+    assert policy.allowed_targets == (CANARY_TARGET,)
+
+
 def test_dispatch_without_live_flag_is_dry_run(tmp_path):
     store = AgentFlowStore(tmp_path / "agentflow.db")
     created = store.enqueue(title="dry job", target=CANARY_TARGET)
