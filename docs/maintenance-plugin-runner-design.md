@@ -578,8 +578,10 @@ real gateway in CI.
   subscription edge; dirty/carried/non-ff is flagged, never auto-moved; zero
   privileged/git-mutating calls; no raw secrets/paths in any row; malformed policy
   fails closed; existing suites green.
-- **M10:** with mode=`guarded_cycle` + trust grant + reviewed GO + gates passing +
-  fake canary green, the fake executor performs the cycle, post-smoke passes, a
+- **M10:** with a single atomic, unit-scoped trust grant in effect (one grant
+  writing mode=`guarded_cycle` + exact service allowlist + host-bound binding
+  together) plus reviewed GO + gates passing + fake canary green, the fake executor
+  performs the cycle, post-smoke passes, a
   terminal `applied` receipt + Kanban ACK are written, idempotent on re-run; with
   any gate failing, a `refused` receipt is written and zero OS effects occur; the
   gateway-cannot-return path sets degraded, writes deadletter+journal, and does not
@@ -595,9 +597,11 @@ real gateway in CI.
 ## 14. Risks and mitigations
 
 - **Accidental auto-update daemon.** Mitigated by the observe/act split, watcher
-  read-only invariant, request_only default, double opt-in (mode + trust grant),
-  ff-only-and-only-under-GO checkout moves, and a fake canary before every real
-  cycle.
+  read-only invariant, request_only default, the fact that `guarded_cycle` is not
+  independently settable but is reached only by one atomic, unit-scoped trust grant
+  that writes mode=`guarded_cycle` + the exact service allowlist + the host-bound
+  binding together, ff-only-and-only-under-GO checkout moves, and a fake canary
+  before every real cycle.
 - **Runner killed by the restart it triggers.** Mitigated by running the runner as a
   oneshot in `agentflow-maintenance.slice`, outside the gateway cgroup.
 - **Restart of the wrong/too many services.** Mitigated by the exact-match service
@@ -654,8 +658,10 @@ fan-in t_m_fanin  waits on: M9 reviews + M10 reviews + M11 reviews
   (OS); watcher uses `git` CLI on a configured path; plugin uses the existing
   in-process engine adapter. ✔
 - **Additive, gated, fail-closed, dry-run/request-only default.** request_only is the
-  install default; guarded_cycle needs mode + trust grant + GO + gates + canary;
-  malformed policy/mode fails closed; kill switch first. ✔
+  install default; `guarded_cycle` is not independently settable — it is reached only
+  by one atomic, unit-scoped trust grant that writes mode=`guarded_cycle` + the exact
+  service allowlist + the host-bound binding together, and still requires GO + gates +
+  canary to act; malformed policy/mode fails closed; kill switch first. ✔
 - **No raw secrets / private absolute paths / raw transcripts** in any persistent
   ledger (cards, receipts, cycle rows, deadletter, journal refs). Absolute paths →
   `repo_id` hash; refs/short facts only; reuse proven sanitizers. ✔
@@ -671,7 +677,9 @@ fan-in t_m_fanin  waits on: M9 reviews + M10 reviews + M11 reviews
 a *staged, additive, fail-closed* extension of the existing live-migration/ACK graph,
 sequenced as M9 (watcher) → M10 (external runner) → M11 (installer UX) — **conditional
 on external supervisor verification of the native Claude Code `--model opus` route**
-recorded in §Route evidence. The watcher is read-only and the runner is doubly opt-in,
-out-of-cgroup, exact-allowlisted, canary-gated, and receipt-first, so "install only and
-it works" is delivered as *proposals on install* while every privileged restart remains
-behind explicit, one-time, scoped trust.
+recorded in §Route evidence. The watcher is read-only and the runner reaches
+`guarded_cycle` only via a single atomic, unit-scoped trust grant (mode + exact
+service allowlist + host-bound binding written together), out-of-cgroup,
+canary-gated, and receipt-first, so "install only and it works" is delivered as
+*proposals on install* while every privileged restart remains behind explicit,
+one-time, scoped trust.
