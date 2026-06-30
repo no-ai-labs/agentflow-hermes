@@ -266,7 +266,11 @@ def test_real_kanban_adapter_defaults_to_noop_without_adapter_apply_enable():
     adapter = KanbanGraphAdapter()
     result = apply_remediation_graph(
         intent,
-        policy=RemediationGraphPolicy(apply_enabled=True),
+        policy=RemediationGraphPolicy(
+            apply_enabled=True,
+            active_mode="apply",
+            allowlisted_blockers=("stale_inline_route",),
+        ),
         adapter=adapter,
     )
     assert result["success"] is False
@@ -355,8 +359,12 @@ def test_default_policy_prevents_real_apply_fake_adapter_sees_no_mutations_unles
     assert result_default["mutations"] == []
     assert len(adapter.create_calls) == 0
 
-    # Explicit test-only policy with apply_enabled=True → fake adapter records call, no real mutations.
-    test_policy = RemediationGraphPolicy(apply_enabled=True)
+    # Explicit test-only policy with every apply gate open → fake adapter records call, no real mutations.
+    test_policy = RemediationGraphPolicy(
+        apply_enabled=True,
+        active_mode="apply",
+        allowlisted_blockers=("stale_final_fanin",),
+    )
     result_enabled = apply_remediation_graph(intent, policy=test_policy, adapter=adapter)
     assert result_enabled["success"] is True
     assert result_enabled["mutations"] == []
@@ -441,4 +449,327 @@ def test_no_raw_private_path_or_secret_in_graph_intent_candidates():
     assert "TOKEN=abc123" not in blob
     assert "private/TOKEN" not in blob
     # The stale route name must not leak into candidates.
+    assert "claude-openrouter-opus" not in blob
+
+
+# ---------------------------------------------------------------------------
+# MP3: gated auto-create tests
+# ---------------------------------------------------------------------------
+
+def _mp3_apply_policy(**kwargs) -> RemediationGraphPolicy:
+    """Convenience: create a minimal valid apply-mode policy for tests."""
+    defaults = {
+        "apply_enabled": True,
+        "active_mode": "apply",
+        "kill_switch": False,
+    }
+    defaults.update(kwargs)
+    return RemediationGraphPolicy(**defaults)
+
+
+def test_mp3_default_policy_no_auto_creates():
+    """Default policy must never trigger adapter auto-create."""
+    adapter = FakeKanbanGraphAdapter()
+    summary = "Verdict: BLOCK — stale_inline_route: old claude-openrouter-opus route conflicts."
+    result = propose_remediation_graph(
+        summary,
+        source_ref="test_mp3_default",
+        origin="discord:#hermes",
+        adapter=adapter,
+    )
+    assert result["success"] is True
+    assert result["mutations"] == []
+    assert len(adapter.create_calls) == 0
+    assert len(adapter.tasks) == 0
+
+
+def test_mp3_apply_enabled_stale_inline_route_creates_intents():
+    """apply_enabled + active_mode=apply + allowlisted stale_inline_route => adapter creates fix/review/final-vN."""
+    adapter = FakeKanbanGraphAdapter()
+    policy = _mp3_apply_policy(
+        allowlisted_blockers=("stale_inline_route",),
+        max_proposals_per_blocker_class=3,
+    )
+    summary = "Verdict: BLOCK — stale_inline_route: old claude-openrouter-opus route conflicts."
+    result = propose_remediation_graph(
+        summary,
+        source_ref="test_mp3_inline",
+        origin="discord:#hermes",
+        return_to="discord:#hermes",
+        policy=policy,
+        adapter=adapter,
+    )
+    assert result["success"] is True
+    assert result["mutations"] == []
+    kinds = {c.kind for c in adapter.create_calls}
+    assert "fix" in kinds
+    assert "review" in kinds
+    assert "final-vN" in kinds
+    # No legacy route values in created intent payloads.
+    blob = json.dumps([c.as_dict() for c in adapter.create_calls])
+    assert "claude-openrouter-opus" not in blob
+    assert "anthropic-native" not in blob
+    # Policy refs are symbolic keys only (no route attribute values).
+    for call in adapter.create_calls:
+        assert call.policy_refs
+        for ref in call.policy_refs:
+            assert "claude-opus" not in ref
+            assert "openrouter" not in ref
+    # origin/return_to and subscription_required set on every created intent.
+    for call in adapter.create_calls:
+        assert "hermes" in call.origin
+        assert call.subscription_required is True
+    # Parent links: review -> fix, final-vN -> review, fix -> none.
+    by_kind = {c.kind: c for c in adapter.create_calls}
+    assert by_kind["fix"].parent_key == ""
+    assert by_kind["review"].parent_key == by_kind["fix"].idempotency_key
+    assert by_kind["final-vN"].parent_key == by_kind["review"].idempotency_key
+    # FakeAdapter tracks tasks and links.
+    assert len(adapter.tasks) == 3
+    assert len(adapter.links) == 2  # review->fix, final-vN->review
+
+
+def test_mp3_missing_subscription_creates_subscription_intents():
+    """missing_subscription creates intents with subscription_required and return_to metadata."""
+    adapter = FakeKanbanGraphAdapter()
+    policy = _mp3_apply_policy(allowlisted_blockers=("missing_subscription",))
+    summary = "Verdict: BLOCK — missing_subscription: subscription edge missing for this task."
+    result = propose_remediation_graph(
+        summary,
+        source_ref="test_mp3_sub",
+        origin="discord:#hermes",
+        return_to="discord:#hermes",
+        policy=policy,
+        adapter=adapter,
+    )
+    assert result["success"] is True
+    assert result["mutations"] == []
+    assert len(adapter.create_calls) > 0
+    for call in adapter.create_calls:
+        assert call.subscription_required is True
+        assert call.return_to != ""
+    # FakeAdapter subscription records created for each intent.
+    assert len(adapter.subscriptions) == len(adapter.create_calls)
+    for sub in adapter.subscriptions:
+        assert sub["return_to"] != ""
+        assert sub["task_key"] != ""
+        assert sub["requirement"] == "notify-subscribe"
+    for task in adapter.tasks:
+        assert task["notify_subscribe_required"] is True
+
+
+def test_mp3_stale_final_fanin_propose_creates_intents_via_adapter():
+    """propose_remediation_graph with stale_final_fanin allowlisted creates fix/review/final-vN."""
+    adapter = FakeKanbanGraphAdapter()
+    policy = _mp3_apply_policy(
+        allowlisted_blockers=("stale_final_fanin",),
+        max_proposals_per_blocker_class=3,
+    )
+    summary = "Verdict: BLOCK — stale final fanin: old final task t_64cf3160 needs supersession."
+    result = propose_remediation_graph(
+        summary,
+        source_ref="t_64cf3160",
+        origin="discord:#hermes",
+        return_to="discord:#hermes",
+        policy=policy,
+        adapter=adapter,
+    )
+    assert result["success"] is True
+    assert result["mutations"] == []
+    kinds = {c.kind for c in adapter.create_calls}
+    assert "fix" in kinds
+    assert "review" in kinds
+    assert "final-vN" in kinds
+
+
+def test_mp3_stale_final_fanin_resolve_creates_final_v2_with_supersedes():
+    """resolve_stale_final_candidate with apply enabled creates final-v2 with supersedes metadata."""
+    adapter = FakeKanbanGraphAdapter()
+    policy = _mp3_apply_policy(allowlisted_blockers=("stale_final_fanin",))
+    old_final = {"id": "t_old_v1", "status": "blocked"}
+    review = {"id": "t_review_go", "body": "Verdict: GO — supersession confirmed, fix ready."}
+    result = resolve_stale_final_candidate(
+        old_final, review,
+        origin="discord:#hermes",
+        return_to="discord:#hermes",
+        policy=policy,
+        adapter=adapter,
+    )
+    assert result["success"] is True
+    assert result["mutations"] == []
+    assert len(adapter.create_calls) == 1
+    intent = adapter.create_calls[0]
+    assert intent.kind == "final-v2"
+    assert intent.blocker == "stale_final_fanin"
+    assert intent.supersedes != ""
+    assert intent.return_to != ""
+    assert intent.subscription_required is True
+
+
+def test_mp3_unknown_blocker_not_allowlisted_no_mutation():
+    """Non-allowlisted blocker must not trigger adapter auto-create."""
+    adapter = FakeKanbanGraphAdapter()
+    # missing_subscription NOT in allowlist — only stale_inline_route is.
+    policy = _mp3_apply_policy(allowlisted_blockers=("stale_inline_route",))
+    summary = "Verdict: BLOCK — missing_subscription: subscription edge missing."
+    result = propose_remediation_graph(
+        summary,
+        source_ref="test_mp3_not_allowed",
+        origin="discord:#hermes",
+        policy=policy,
+        adapter=adapter,
+    )
+    assert result["success"] is True
+    assert result["mutations"] == []
+    assert len(adapter.create_calls) == 0
+
+
+def test_mp3_max_auto_creates_per_run_cap():
+    """max_auto_creates_per_run caps the number of adapter calls in a single request."""
+    adapter = FakeKanbanGraphAdapter()
+    # stale_inline_route yields fix/review/final-vN = 3 intents; cap at 2.
+    policy = _mp3_apply_policy(
+        allowlisted_blockers=("stale_inline_route",),
+        max_auto_creates_per_run=2,
+    )
+    summary = "Verdict: BLOCK — stale_inline_route: old claude-openrouter-opus route."
+    result = propose_remediation_graph(
+        summary,
+        source_ref="test_mp3_cap",
+        origin="discord:#hermes",
+        policy=policy,
+        adapter=adapter,
+    )
+    assert result["success"] is True
+    assert len(adapter.create_calls) <= 2
+
+
+def test_mp3_dedupe_prevents_repeated_auto_create():
+    """Second call with same source_ref skips auto-create via adapter dedupe."""
+    adapter = FakeKanbanGraphAdapter()
+    policy = _mp3_apply_policy(allowlisted_blockers=("stale_trust_grant_wording",))
+    summary = "Verdict: BLOCK — stale_trust_grant_wording remains in docs."
+    result1 = propose_remediation_graph(
+        summary,
+        source_ref="test_mp3_dedupe",
+        policy=policy,
+        adapter=adapter,
+    )
+    assert result1["success"] is True
+    first_count = len(adapter.create_calls)
+    assert first_count > 0
+    # Second call: adapter already recorded those proposals => dedupe triggers.
+    result2 = propose_remediation_graph(
+        summary,
+        source_ref="test_mp3_dedupe",
+        policy=policy,
+        adapter=adapter,
+    )
+    assert result2["success"] is True
+    assert len(adapter.create_calls) == first_count
+    assert all(c.get("action") == "noop" for c in result2["candidates"])
+
+
+def test_mp3_kill_switch_prevents_apply():
+    """kill_switch=True must prevent all auto-creates even when apply_enabled=True."""
+    adapter = FakeKanbanGraphAdapter()
+    policy = _mp3_apply_policy(
+        kill_switch=True,
+        allowlisted_blockers=("stale_inline_route",),
+    )
+    summary = "Verdict: BLOCK — stale_inline_route: old claude-openrouter-opus route."
+    result = propose_remediation_graph(
+        summary,
+        source_ref="test_mp3_kill",
+        origin="discord:#hermes",
+        policy=policy,
+        adapter=adapter,
+    )
+    assert result["success"] is True
+    assert result["mutations"] == []
+    assert len(adapter.create_calls) == 0
+
+
+def test_mp3_malformed_apply_policy_fails_closed():
+    """Malformed or inconsistent apply policy must fail closed — no exception, no mutation."""
+    adapter = FakeKanbanGraphAdapter()
+    summary = "Verdict: BLOCK — stale_inline_route: old claude-openrouter-opus route."
+    # Non-policy objects can appear from malformed JSON/YAML config; they must
+    # fail closed without raising before any adapter call.
+    result_malformed_object = propose_remediation_graph(
+        summary,
+        source_ref="test_mp3_malformed_object",
+        policy={"apply_enabled": True, "active_mode": "apply", "allowlisted_blockers": ["stale_inline_route"]},  # type: ignore[arg-type]
+        adapter=adapter,
+    )
+    assert result_malformed_object["success"] is True
+    assert result_malformed_object["mutations"] == []
+    assert len(adapter.create_calls) == 0
+
+    # Malformed allowlist/cap fields also fail closed.
+    malformed_policy = RemediationGraphPolicy(
+        apply_enabled=True,
+        active_mode="apply",
+        allowlisted_blockers=["stale_inline_route"],  # type: ignore[arg-type]
+    )
+    result_bad_allowlist = propose_remediation_graph(
+        summary,
+        source_ref="test_mp3_bad_allowlist",
+        policy=malformed_policy,
+        adapter=adapter,
+    )
+    assert result_bad_allowlist["success"] is True
+    assert len(adapter.create_calls) == 0
+
+    # apply_enabled=True but active_mode is not "apply" => gates closed.
+    for mode in ("request_only", "observe_only", "invalid_mode", ""):
+        a = FakeKanbanGraphAdapter()
+        policy = RemediationGraphPolicy(
+            apply_enabled=True,
+            active_mode=mode,
+            allowlisted_blockers=("stale_inline_route",),
+        )
+        result = propose_remediation_graph(
+            summary,
+            source_ref=f"test_mp3_malformed_{mode}",
+            policy=policy,
+            adapter=a,
+        )
+        assert result["success"] is True, f"mode={mode!r} should still succeed"
+        assert result["mutations"] == [], f"mode={mode!r} should produce no mutations"
+        assert len(a.create_calls) == 0, f"mode={mode!r} should produce no adapter calls"
+    # apply_enabled=False despite other gates set => closed.
+    policy_disabled = RemediationGraphPolicy(
+        apply_enabled=False,
+        active_mode="apply",
+        allowlisted_blockers=("stale_inline_route",),
+    )
+    result_disabled = propose_remediation_graph(
+        summary,
+        source_ref="test_mp3_disabled",
+        policy=policy_disabled,
+        adapter=adapter,
+    )
+    assert result_disabled["success"] is True
+    assert len(adapter.create_calls) == 0
+
+
+def test_mp3_no_raw_private_path_or_secret_in_auto_created_intents():
+    """Auto-created intent payloads must not contain private paths or secrets."""
+    adapter = FakeKanbanGraphAdapter()
+    policy = _mp3_apply_policy(allowlisted_blockers=("stale_inline_route",))
+    summary = "Verdict: BLOCK — stale_inline_route: /home/alice/private TOKEN=abc123 claude-openrouter-opus"
+    result = propose_remediation_graph(
+        summary,
+        source_ref="/home/alice/private/TOKEN=abc123",
+        origin="discord:#hermes",
+        return_to="discord:#hermes",
+        policy=policy,
+        adapter=adapter,
+    )
+    assert result["success"] is True
+    blob = json.dumps([c.as_dict() for c in adapter.create_calls])
+    assert "/home/alice" not in blob
+    assert "TOKEN=abc123" not in blob
+    assert "private/TOKEN" not in blob
     assert "claude-openrouter-opus" not in blob

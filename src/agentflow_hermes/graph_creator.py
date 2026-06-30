@@ -22,8 +22,15 @@ _BLOCKER_POLICY_REFS: dict[str, tuple[str, ...]] = {
 @dataclass(frozen=True)
 class RemediationGraphPolicy:
     apply_enabled: bool = False
+    active_mode: str = "request_only"  # "request_only" | "observe_only" | "apply"
+    kill_switch: bool = False
+    allowlisted_blockers: tuple[str, ...] = ()
     max_proposals_per_source: int = 3
     max_proposals_per_blocker_class: int = 2
+    max_auto_creates_per_run: int = 5
+
+
+_FAIL_CLOSED_POLICY = RemediationGraphPolicy(kill_switch=True)
 
 
 @dataclass(frozen=True)
@@ -39,6 +46,7 @@ class GraphIntentCandidate:
     supersedes: str
     metadata: dict[str, Any]
     body: str = ""
+    parent_key: str = ""  # idempotency key of the preceding task in the sequence
 
     def as_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -51,6 +59,7 @@ class GraphIntentCandidate:
             "policy_refs": list(self.policy_refs),
             "subscription_required": self.subscription_required,
             "supersedes": self.supersedes,
+            "parent_key": self.parent_key,
             "body": self.body,
             "metadata": {**self.metadata, "dry_run_only": True, "request_only": True},
             "mutations": [],
@@ -96,15 +105,37 @@ class FakeKanbanGraphAdapter:
 
     def __init__(self) -> None:
         self.create_calls: list[GraphIntentCandidate] = []
+        self.tasks: list[dict[str, Any]] = []
+        self.links: list[dict[str, str]] = []
+        self.subscriptions: list[dict[str, str]] = []
         self._proposals: list[dict[str, Any]] = []
 
     def create_graph(self, intent: GraphIntentCandidate) -> dict[str, Any]:
         self.create_calls.append(intent)
+        task: dict[str, Any] = {
+            "idempotency_key": intent.idempotency_key,
+            "blocker": intent.blocker,
+            "kind": intent.kind,
+            "origin": intent.origin,
+            "return_to": intent.return_to,
+            "subscription_required": intent.subscription_required,
+            "notify_subscribe_required": intent.subscription_required,
+            "supersedes": intent.supersedes,
+        }
+        self.tasks.append(task)
         self._proposals.append({
             "idempotency_key": intent.idempotency_key,
             "blocker": intent.blocker,
             "kind": intent.kind,
         })
+        if intent.parent_key:
+            self.links.append({"from": intent.parent_key, "to": intent.idempotency_key})
+        if intent.subscription_required:
+            self.subscriptions.append({
+                "task_key": intent.idempotency_key,
+                "return_to": intent.return_to,
+                "requirement": "notify-subscribe",
+            })
         return {
             "success": True,
             "action": "fake_noop",
@@ -118,6 +149,43 @@ class FakeKanbanGraphAdapter:
             if p.get("idempotency_key") == idempotency_key
             or str(p.get("idempotency_key") or "").startswith(f"{idempotency_key}:")
         ]
+
+
+def _coerce_policy(policy: RemediationGraphPolicy | None) -> RemediationGraphPolicy:
+    """Return a policy object, failing closed for malformed caller input."""
+    if policy is None:
+        return RemediationGraphPolicy()
+    if not isinstance(policy, RemediationGraphPolicy):
+        return _FAIL_CLOSED_POLICY
+    if policy.active_mode not in {"request_only", "observe_only", "apply"}:
+        return _FAIL_CLOSED_POLICY
+    if not isinstance(policy.allowlisted_blockers, tuple):
+        return _FAIL_CLOSED_POLICY
+    if not all(isinstance(b, str) for b in policy.allowlisted_blockers):
+        return _FAIL_CLOSED_POLICY
+    for cap in (
+        policy.max_proposals_per_source,
+        policy.max_proposals_per_blocker_class,
+        policy.max_auto_creates_per_run,
+    ):
+        if not isinstance(cap, int) or cap < 0:
+            return _FAIL_CLOSED_POLICY
+    return policy
+
+
+def _is_apply_gated(policy: RemediationGraphPolicy, blocker: str) -> bool:
+    """Return True only when all safety gates pass for a gated auto-create."""
+    try:
+        return (
+            policy.apply_enabled is True
+            and policy.active_mode == "apply"
+            and not policy.kill_switch
+            and bool(blocker)
+            and blocker in policy.allowlisted_blockers
+            and policy.max_auto_creates_per_run > 0
+        )
+    except Exception:
+        return False
 
 
 def propose_remediation_graph(
@@ -135,7 +203,7 @@ def propose_remediation_graph(
     Never mutates a real Kanban board. apply_remediation_graph must be called
     separately and requires explicit policy.apply_enabled=True.
     """
-    effective_policy = policy or RemediationGraphPolicy()
+    effective_policy = _coerce_policy(policy)
     prior = prior_proposals or []
     safe_src = _safe_src_ref(source_ref)
 
@@ -150,6 +218,7 @@ def propose_remediation_graph(
 
     plan_proposals = plan.get("proposals") or []
     candidates: list[dict[str, Any]] = []
+    auto_create_count = 0
 
     # Storm-guard running counts seeded from prior proposals, then incremented as
     # real candidates are generated in THIS request so caps bound the combined
@@ -183,6 +252,7 @@ def propose_remediation_graph(
         action: str = prop.get("action") or ""
         body = _policy_ref_body(policy_refs)
 
+        prev_idem: str = ""
         for kind in sequence:
             idem = f"{base_key}:{kind}"
 
@@ -206,6 +276,7 @@ def propose_remediation_graph(
                 policy_refs=policy_refs,
                 subscription_required=True,
                 supersedes="",
+                parent_key=prev_idem,
                 metadata={
                     "base_idempotency_key": base_key,
                     "source_ref_safe": safe_src,
@@ -218,6 +289,17 @@ def propose_remediation_graph(
             blocker_counts[blocker] = blocker_counts.get(blocker, 0) + 1
             if safe_src:
                 src_count += 1
+            prev_idem = idem
+
+            # Gated auto-create: all safety gates must pass.
+            if (
+                adapter is not None
+                and _is_apply_gated(effective_policy, blocker)
+                and auto_create_count < effective_policy.max_auto_creates_per_run
+            ):
+                create_result = adapter.create_graph(intent)
+                if create_result.get("success"):
+                    auto_create_count += 1
 
     return {
         "success": True,
@@ -234,9 +316,9 @@ def apply_remediation_graph(
     policy: RemediationGraphPolicy | None = None,
     adapter: FakeKanbanGraphAdapter | KanbanGraphAdapter | None = None,
 ) -> dict[str, Any]:
-    """Apply a graph intent via the adapter. Fails closed unless policy.apply_enabled."""
-    effective_policy = policy or RemediationGraphPolicy()
-    if not effective_policy.apply_enabled:
+    """Apply a graph intent via the adapter. Fails closed unless every apply gate passes."""
+    effective_policy = _coerce_policy(policy)
+    if not _is_apply_gated(effective_policy, intent.blocker):
         return {"success": False, "error": "apply_disabled_by_policy", "mutations": []}
     if adapter is None:
         return {"success": False, "error": "no_adapter_provided", "mutations": []}
@@ -250,11 +332,13 @@ def resolve_stale_final_candidate(
     origin: str = "",
     return_to: str = "",
     policy: RemediationGraphPolicy | None = None,
+    adapter: "FakeKanbanGraphAdapter | KanbanGraphAdapter | None" = None,
 ) -> dict[str, Any]:
     """Generate a final-v2 candidate if old final is done/BLOCK and review has GO verdict.
 
     Never re-runs a completed final. Returns a request-only candidate only.
     """
+    effective_policy = _coerce_policy(policy)
     old_status = str(old_final_card.get("status") or "").lower()
     old_id = str(old_final_card.get("id") or "")
 
@@ -302,13 +386,19 @@ def resolve_stale_final_candidate(
         body=_policy_ref_body(policy_refs),
     )
 
-    return {
+    result: dict[str, Any] = {
         "success": True,
         "dry_run": True,
         "request_only": True,
         "candidate": intent.as_dict(),
         "mutations": [],
     }
+
+    # Gated auto-create for the final-v2 supersession intent.
+    if adapter is not None and _is_apply_gated(effective_policy, "stale_final_fanin"):
+        adapter.create_graph(intent)
+
+    return result
 
 
 def _safe_src_ref(source_ref: str) -> str:
