@@ -171,7 +171,7 @@ def preflight_task_body(
     *,
     policy: PolicyDocument | None = None,
     policy_path: str | Path | None = None,
-    refs: tuple[str, ...] = ("design_opus", "implementation_default"),
+    refs: tuple[str | PolicyRef, ...] = ("design_opus", "implementation_default"),
 ) -> dict[str, Any]:
     """Resolve binding PolicyRef values and scan stale inline route snippets.
 
@@ -182,11 +182,33 @@ def preflight_task_body(
         doc = policy or load_policy_document(policy_path)
     except PolicyRefError as exc:
         return {"success": False, "error": "malformed_policy", "conflict_class": "unverifiable", "resolutions": []}
-    resolutions = [resolve_policy_ref(ref, doc).as_dict() for ref in refs if _normalize_key(ref) in doc.routes]
+    resolutions: list[dict[str, Any]] = []
     findings = [finding.as_dict() for finding in detect_stale_inline_policy(body, policy=doc)]
+    # Every requested required ref must resolve or produce an explicit fail-closed
+    # finding. Never silently drop an unknown/missing ref from the resolution set.
+    for ref in refs:
+        key, required = _ref_key_required(ref)
+        if key in doc.routes:
+            resolutions.append(resolve_policy_ref(ref, doc).as_dict())
+        elif required:
+            findings.append(InlinePolicyFinding(
+                blocker="unknown_policy_ref",
+                snippet=short_text(key, max_len=80),
+                policy_ref=key,
+                conflict_class="unverifiable",
+                pattern="unknown_policy_ref",
+            ).as_dict())
+    has_unknown = any(f["blocker"] == "unknown_policy_ref" for f in findings)
+    has_contradicted = any(f["conflict_class"] == "contradicted" for f in findings)
+    if any(f["blocker"] == "stale_inline_route" for f in findings):
+        error = "stale_inline_route"
+    elif has_unknown:
+        error = "unknown_policy_ref"
+    else:
+        error = ""
     return {
-        "success": not any(f["conflict_class"] == "contradicted" for f in findings),
-        "error": "stale_inline_route" if any(f["blocker"] == "stale_inline_route" for f in findings) else "",
+        "success": not has_contradicted and not has_unknown,
+        "error": error,
         "resolutions": resolutions,
         "findings": findings,
         "policy_version": doc.version,
@@ -232,6 +254,12 @@ def parse_policy_refs(body: str) -> list[PolicyRef]:
     for match in re.finditer(r"policy:(?:model\.)?([A-Za-z0-9_.-]+)", body or ""):
         refs.append(PolicyRef(_normalize_key(match.group(1))))
     return refs
+
+
+def _ref_key_required(ref: str | PolicyRef) -> tuple[str, bool]:
+    if isinstance(ref, PolicyRef):
+        return _normalize_key(ref.key), ref.required
+    return _normalize_key(str(ref)), True
 
 
 def _normalize_key(value: str) -> str:

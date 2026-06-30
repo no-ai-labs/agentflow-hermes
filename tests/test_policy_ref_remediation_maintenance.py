@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 
 from agentflow_hermes.maintenance.gitprobe import GitProbeResult
+from agentflow_hermes.maintenance.policy import load_maintenance_policy
 from agentflow_hermes.maintenance.watcher import propose_sync_graph, sync_dedupe_key
 from agentflow_hermes.policy_ref import (
+    PolicyRef,
     default_policy_document,
     load_policy_document,
     preflight_task_body,
@@ -67,6 +69,61 @@ def test_malformed_policy_fails_closed(tmp_path):
         assert "malformed_policy" in str(exc)
     else:
         raise AssertionError("malformed policy unexpectedly loaded")
+
+
+def test_unknown_required_policy_ref_fails_closed_with_redacted_evidence(tmp_path):
+    # Negative smoke: caller asks to resolve a required ref that is not in the
+    # central policy. Must fail closed instead of silently succeeding with an
+    # empty/partial resolutions list.
+    policy = load_policy_document(_policy_file(tmp_path))
+    result = preflight_task_body(
+        "Resolve policy refs for this task.",
+        policy=policy,
+        refs=("design_opus", "ghost_ref_not_in_policy"),
+    )
+    assert result["success"] is False
+    # The known ref still resolves; the unknown one does not leak into resolutions.
+    resolved_keys = {r["key"] for r in result["resolutions"]}
+    assert "design_opus" in resolved_keys
+    assert "ghost_ref_not_in_policy" not in resolved_keys
+    unknown = [f for f in result["findings"] if f["blocker"] == "unknown_policy_ref"]
+    assert unknown, "expected an unknown_policy_ref blocker"
+    assert unknown[0]["policy_ref"] == "ghost_ref_not_in_policy"
+    # Evidence stays redacted/safe: no raw private paths or secrets.
+    blob = json.dumps(result)
+    assert str(tmp_path) not in blob
+    assert "TOKEN" not in blob
+
+
+def test_unknown_optional_policy_ref_does_not_block(tmp_path):
+    policy = load_policy_document(_policy_file(tmp_path))
+    result = preflight_task_body(
+        "Optional route discovery should not block.",
+        policy=policy,
+        refs=("design_opus", PolicyRef("missing_optional_ref", required=False)),
+    )
+    assert result["success"] is True
+    assert result["error"] == ""
+    assert {r["key"] for r in result["resolutions"]} == {"design_opus"}
+    assert not [f for f in result["findings"] if f["blocker"] == "unknown_policy_ref"]
+
+
+def test_maintenance_policy_malformed_numeric_fields_fail_closed(tmp_path):
+    # Negative smoke: malformed integer fields must not raise; loader fails closed.
+    path = tmp_path / "maintenance.json"
+    path.write_text(json.dumps({
+        "mode": "guarded_cycle",
+        "maintenance_kill_switch": False,
+        "allowed_services": ["live-bridge", 123, "cron", None],
+        "max_cycles_per_day": "not-int",
+        "min_seconds_between_cycles": "bad",
+    }), encoding="utf-8")
+    policy = load_maintenance_policy(path)
+    assert policy.maintenance_kill_switch is True
+    assert policy.mode in {"request_only", "disabled"}
+    assert policy.error == "malformed_numeric_field"
+    # Allowlist safety preserved: filtered to strings only.
+    assert policy.allowed_services == ("live-bridge", "cron")
 
 
 def test_stale_trust_grant_wording_block_yields_narrow_doc_fix_proposal():
