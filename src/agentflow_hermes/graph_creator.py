@@ -218,7 +218,7 @@ def propose_remediation_graph(
 
     plan_proposals = plan.get("proposals") or []
     candidates: list[dict[str, Any]] = []
-    auto_create_count = 0
+    auto_create_attempts = 0
 
     # Storm-guard running counts seeded from prior proposals, then incremented as
     # real candidates are generated in THIS request so caps bound the combined
@@ -266,6 +266,11 @@ def propose_remediation_graph(
                 candidates.append(_noop(idem, blocker, "max_proposals_per_source"))
                 continue
 
+            auto_create_gated = adapter is not None and _is_apply_gated(effective_policy, blocker)
+            if auto_create_gated and auto_create_attempts >= effective_policy.max_auto_creates_per_run:
+                candidates.append(_noop(idem, blocker, "max_auto_creates_per_run"))
+                continue
+
             intent = GraphIntentCandidate(
                 kind=kind,
                 blocker=blocker,
@@ -291,15 +296,11 @@ def propose_remediation_graph(
                 src_count += 1
             prev_idem = idem
 
-            # Gated auto-create: all safety gates must pass.
-            if (
-                adapter is not None
-                and _is_apply_gated(effective_policy, blocker)
-                and auto_create_count < effective_policy.max_auto_creates_per_run
-            ):
-                create_result = adapter.create_graph(intent)
-                if create_result.get("success"):
-                    auto_create_count += 1
+            # Gated auto-create: all safety gates must pass. The cap is an
+            # attempt budget, so failed/transient adapter calls consume it too.
+            if auto_create_gated and adapter is not None:
+                auto_create_attempts += 1
+                adapter.create_graph(intent)
 
     return {
         "success": True,

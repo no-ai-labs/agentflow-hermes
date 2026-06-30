@@ -630,6 +630,7 @@ def test_mp3_max_auto_creates_per_run_cap():
     # stale_inline_route yields fix/review/final-vN = 3 intents; cap at 2.
     policy = _mp3_apply_policy(
         allowlisted_blockers=("stale_inline_route",),
+        max_proposals_per_blocker_class=3,
         max_auto_creates_per_run=2,
     )
     summary = "Verdict: BLOCK — stale_inline_route: old claude-openrouter-opus route."
@@ -642,6 +643,36 @@ def test_mp3_max_auto_creates_per_run_cap():
     )
     assert result["success"] is True
     assert len(adapter.create_calls) <= 2
+    capped = [c for c in result["candidates"] if c.get("reason") == "max_auto_creates_per_run"]
+    assert capped
+
+
+def test_mp3_max_auto_creates_per_run_counts_failed_adapter_attempts():
+    """A failing adapter still consumes the auto-create attempt budget."""
+    class FailingAdapter(FakeKanbanGraphAdapter):
+        def create_graph(self, intent):
+            self.create_calls.append(intent)
+            return {"success": False, "error": "transient_adapter_failure", "mutations": []}
+
+    adapter = FailingAdapter()
+    policy = _mp3_apply_policy(
+        allowlisted_blockers=("stale_inline_route",),
+        max_proposals_per_blocker_class=3,
+        max_auto_creates_per_run=1,
+    )
+    summary = "Verdict: BLOCK — stale_inline_route: old claude-openrouter-opus route."
+    result = propose_remediation_graph(
+        summary,
+        source_ref="test_mp3_failing_adapter_cap",
+        origin="discord:#hermes",
+        policy=policy,
+        adapter=adapter,
+    )
+    assert result["success"] is True
+    assert len(adapter.create_calls) == 1
+    capped = [c for c in result["candidates"] if c.get("reason") == "max_auto_creates_per_run"]
+    assert len(capped) == 2
+    assert all(c.get("action") == "noop" for c in capped)
 
 
 def test_mp3_dedupe_prevents_repeated_auto_create():
