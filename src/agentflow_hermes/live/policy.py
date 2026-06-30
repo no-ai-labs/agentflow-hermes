@@ -39,16 +39,23 @@ class LivePolicy:
         }
 
 
-def _strict_bool(value: Any, default: bool) -> bool:
+_MISSING = object()
+
+
+def _strict_bool(value: Any, default: bool, *, malformed_default: bool | None = None) -> bool:
     """Accept literal JSON booleans only; fail closed on malformed types.
 
     ``bool()`` coerces truthy strings/ints/lists/dicts (e.g. ``bool("false")``
-    is ``True``), which could silently enable operator/live behavior. A value
-    that is not a real boolean must never flip a flag on, so it falls back to
-    the safe default.
+    is ``True``), which could silently enable operator/live behavior. Missing
+    values fall back to the safe default. Malformed values fall back to
+    ``malformed_default`` when provided, otherwise to ``default``.
     """
+    if value is _MISSING:
+        return default
     if isinstance(value, bool):
         return value
+    if malformed_default is not None:
+        return malformed_default
     return default
 
 
@@ -78,14 +85,18 @@ def load_policy() -> LivePolicy:
             raw = {}
         if isinstance(raw, dict):
             policy = LivePolicy(
-                live_dispatch_enabled=_strict_bool(raw.get("live_dispatch_enabled"), policy.live_dispatch_enabled),
-                active_wake_enabled=_strict_bool(raw.get("active_wake_enabled"), policy.active_wake_enabled),
-                kanban_apply_enabled=_strict_bool(raw.get("kanban_apply_enabled"), policy.kanban_apply_enabled),
+                live_dispatch_enabled=_strict_bool(
+                    raw.get("live_dispatch_enabled", _MISSING), policy.live_dispatch_enabled
+                ),
+                active_wake_enabled=_strict_bool(raw.get("active_wake_enabled", _MISSING), policy.active_wake_enabled),
+                kanban_apply_enabled=_strict_bool(raw.get("kanban_apply_enabled", _MISSING), policy.kanban_apply_enabled),
                 allowed_targets=tuple(raw.get("allowed_targets") or []),
                 canary_targets=tuple(raw.get("canary_targets") or []),
                 max_sends_per_min=int(raw.get("max_sends_per_min", policy.max_sends_per_min)),
                 max_sends_per_target_per_hour=int(raw.get("max_sends_per_target_per_hour", policy.max_sends_per_target_per_hour)),
-                kill_switch=_strict_bool(raw.get("kill_switch"), policy.kill_switch),
+                kill_switch=_strict_bool(
+                    raw.get("kill_switch", _MISSING), policy.kill_switch, malformed_default=True
+                ),
             )
 
     # Environment overrides.

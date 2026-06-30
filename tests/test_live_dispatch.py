@@ -62,13 +62,16 @@ def test_save_and_load_policy(tmp_path, monkeypatch):
     assert loaded.allowed_targets == (CANARY_TARGET,)
 
 
-MALFORMED_TRUTHY_VALUES = [
+MALFORMED_BOOL_VALUES = [
     "false",  # non-empty string is truthy under bool()
     "true",
     "0",
     1,
     -1,
+    None,
+    [],
     [0],
+    {},
     {"enabled": False},
 ]
 
@@ -79,20 +82,35 @@ BOOLEAN_FLAGS = [
     "kill_switch",
 ]
 
+LIVE_ENABLE_FLAGS = [
+    "live_dispatch_enabled",
+    "active_wake_enabled",
+    "kanban_apply_enabled",
+]
+
 
 def _write_policy_json(tmp_path, payload):
     path = tmp_path / "policy.json"
     path.write_text(json.dumps(payload), encoding="utf-8")
 
 
-@pytest.mark.parametrize("flag", BOOLEAN_FLAGS)
-@pytest.mark.parametrize("value", MALFORMED_TRUTHY_VALUES)
-def test_policy_flags_fail_closed_on_malformed_types(tmp_path, monkeypatch, flag, value):
+@pytest.mark.parametrize("flag", LIVE_ENABLE_FLAGS)
+@pytest.mark.parametrize("value", MALFORMED_BOOL_VALUES)
+def test_live_enable_policy_flags_fail_closed_on_malformed_types(tmp_path, monkeypatch, flag, value):
     monkeypatch.setenv("AGENTFLOW_HOME", str(tmp_path))
     _write_policy_json(tmp_path, {flag: value})
     policy = load_policy()
     # Malformed (non-boolean) values must never enable operator/live behavior.
     assert getattr(policy, flag) is False
+
+
+@pytest.mark.parametrize("value", MALFORMED_BOOL_VALUES)
+def test_kill_switch_policy_malformed_types_fail_closed_enabled(tmp_path, monkeypatch, value):
+    monkeypatch.setenv("AGENTFLOW_HOME", str(tmp_path))
+    _write_policy_json(tmp_path, {"kill_switch": value})
+    policy = load_policy()
+    # A malformed kill switch must fail closed as an effective hard stop.
+    assert policy.kill_switch is True
 
 
 @pytest.mark.parametrize("flag", BOOLEAN_FLAGS)
@@ -180,16 +198,47 @@ def test_live_refused_when_kill_switch(tmp_path):
     assert receipts[0]["reason"] == "kill_switch"
 
 
-def test_live_dispatch_happy_path_canary(tmp_path):
+@pytest.mark.parametrize("value", ["true", "false", 1, [0], {"enabled": False}, None])
+def test_live_dispatch_refuses_malformed_kill_switch_from_policy_json(tmp_path, monkeypatch, value):
+    monkeypatch.setenv("AGENTFLOW_HOME", str(tmp_path))
+    _write_policy_json(
+        tmp_path,
+        {
+            "live_dispatch_enabled": True,
+            "allowed_targets": [CANARY_TARGET],
+            "canary_targets": [CANARY_TARGET],
+            "kill_switch": value,
+        },
+    )
+    store = AgentFlowStore(tmp_path / "agentflow.db")
+    created = store.enqueue(title="live job", target=CANARY_TARGET)
+    gateway = FakeGateway()
+
+    result = store.dispatch_live(created["job_id"], gateway=gateway, live=True, policy=load_policy())
+
+    assert result["success"] is False
+    assert result["error"] == "kill_switch"
+    assert gateway.calls == []
+    receipts = _receipts(store, created["job_id"])
+    assert receipts[0]["phase"] == "refused"
+    assert receipts[0]["reason"] == "kill_switch"
+
+
+def test_live_dispatch_allows_literal_false_kill_switch_from_policy_json(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENTFLOW_HOME", str(tmp_path))
+    _write_policy_json(
+        tmp_path,
+        {
+            "live_dispatch_enabled": True,
+            "allowed_targets": [CANARY_TARGET],
+            "canary_targets": [CANARY_TARGET],
+            "kill_switch": False,
+        },
+    )
     store = AgentFlowStore(tmp_path / "agentflow.db")
     created = store.enqueue(title="live job", target=CANARY_TARGET, body="do the thing")
     gateway = FakeGateway()
-    policy = LivePolicy(
-        live_dispatch_enabled=True,
-        allowed_targets=(CANARY_TARGET,),
-        canary_targets=(CANARY_TARGET,),
-    )
-    result = store.dispatch_live(created["job_id"], gateway=gateway, live=True, policy=policy)
+    result = store.dispatch_live(created["job_id"], gateway=gateway, live=True, policy=load_policy())
     assert result["success"] is True
     assert result["applied"] is True
     assert result["mode"] == "live"
