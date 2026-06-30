@@ -206,6 +206,8 @@ STEPS = [(1, SQL_V1), (2, SQL_V2), (3, SQL_V3)]
 
 ### 2.8 Stale final-fan-in supersession resolver (live-safe dry-run/apply candidate)
 
+> The concrete `RemediationPlanner`/`StaleFinalResolver`, `GraphIntent` capture, `SubscriptionEnsurer`, and `VerdictParser` that build on this section are specified in `docs/ack-remediation-control-plane.md`.
+
 Observed class: a terminal fan-in job (e.g. `t_695c95b3`) records a final verdict, but a **later** material event or remediation arrives that should supersede the stale final. The existing kanban resolver (`bridges/kanban.py`) and `FINAL_STATES` guard correctly refuse to mutate finals, so this needs a narrow, evidence-first resolver, mirroring the §8 blocked-remediation resolver in `docs/plugin-architecture.md`.
 
 Add `src/agentflow_hermes/bridges/supersession.py`:
