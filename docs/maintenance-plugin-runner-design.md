@@ -19,7 +19,7 @@ Status: design artifact only — no production code changes in this task.
   route is a precondition of accepting this design's verdict**, as in
   `docs/ack-remediation-control-plane.md` §Route evidence.
 - Supervisor route verification for this task: `type claude` resolved to the
-  profile wrapper at `/home/duckran/.hermes/profiles/ccsupervisor/home/bin/claude`;
+  profile wrapper at `<profile-home>/home/bin/claude` (under `$HERMES_HOME`);
   `claude --version` returned `2.1.196 (Claude Code)`; `claude auth status --text`
   reported `Login method: Claude Max account`; and the design run was invoked as
   `claude --model opus ... --output-format json`, returning `session_id`
@@ -61,10 +61,11 @@ two-key/fail-closed machinery as the live control plane.
 **Design stance (inherited, non-negotiable).** Additive and gated, never a mode
 switch on existing paths. Every new capability is **observe/propose/dry-run by
 default**. A real service cycle requires, in order: `kill_switch` off → mode is
-`guarded_cycle` → a **trust grant** exists for the exact gateway unit → a request
-graph exists with **reviewed sync GO** (and **runtime install GO** if a checkout
-move is involved) → the target unit ∈ **service allowlist** → no active workers /
-cc tmux → quiet-period / max-cycles-per-day satisfied → idempotency claim →
+`guarded_cycle` (reachable only through the atomic trust grant that also records
+the exact service allowlist) → a request graph exists with **reviewed sync GO**
+(and **runtime install GO** if a checkout move is involved) → the target unit ∈
+**service allowlist** → no active workers / cc tmux → quiet-period /
+max-cycles-per-day satisfied → idempotency claim →
 **fake-canary cycle passed** → receipt(attempt) → effect → post-smoke →
 receipt(terminal). Any miss **fails closed** to request_only semantics.
 
@@ -122,40 +123,61 @@ Engine subpackage (additive; mirrors `live/` and `bridges/` layout):
 ## 2. Maintenance modes
 
 A single enum drives everything; the default is the second-safest, and the only
-dangerous mode is doubly opt-in (mode **and** trust grant).
+dangerous mode is reachable only through an atomic opt-in (mode **plus** exact
+service allowlist **plus** host-bound trust grant).
 
 | Mode | Watcher behavior | Runner behavior | Default? |
 | --- | --- | --- | --- |
 | `disabled` | no-op (timer fires, exits 0 immediately) | no-op | — |
 | `observe_only` | probe + write an **observation note** to the ledger/Kanban (info card, no actionable request, no subscription edge) | no-op | — |
 | `request_only` | probe + create/refresh a **sync request Kanban graph** with `GraphIntent{origin, return_to, wants_subscription}` | **never cycles**; surfaces the request for human/reviewer action only | **yes** |
-| `guarded_cycle` | same as request_only | **may** execute the gated cycle plan when a request with reviewed GO exists and all §7 gates pass | — (requires trust grant) |
+| `guarded_cycle` | same as request_only | **may** execute the gated cycle plan when a request with reviewed GO exists and all §7 gates pass | — (set only by the atomic trust grant, §3) |
+
+`guarded_cycle` is never a standalone mode flag: it exists only as the product of
+the one-time **trust grant** (§3), which in a single atomic write records
+`mode="guarded_cycle"`, adds the exact unit to `allowed_services`, and stores the
+host-bound grant for that unit. There is therefore no reachable state where the
+mode is `guarded_cycle` but `allowed_services` is empty or carries no matching
+grant — the three move together or not at all.
 
 Resolution & fail-closed semantics (reusing the `live/policy._strict_bool`
 pattern): an unknown / malformed `mode` value resolves to `request_only` (not
 `guarded_cycle`); a malformed `maintenance_kill_switch` resolves to `true`
 (hard-stop), exactly mirroring `kill_switch` malformed→True at
-`live/policy.py:97`. `guarded_cycle` with no valid trust grant **downgrades to
-request_only at evaluation time** and records a `refused/no_trust_grant` receipt.
+`live/policy.py:97`. At evaluation time, `guarded_cycle` that is not backed by a
+**non-empty `allowed_services` and a valid host-bound trust grant for the target
+unit downgrades to request_only** and records a `refused/no_trust_grant` receipt.
+This makes the invariant self-healing: a hand-edited or copied `maintenance.json`
+that sets `mode="guarded_cycle"` without the allowlist+grant behaves exactly like
+`request_only`.
 
 ## 3. First-run trust grant UX (guarded cycles without repeated approvals)
 
 The goal: a guarded service cycle must not prompt the operator every time, yet must
 never happen on a fresh install. Solution: a **one-time, scoped, durable trust
-grant**, separate from the mode flag.
+grant** that is *also* the only way to reach `guarded_cycle` — granting trust and
+arming the mode are a single atomic operator decision, not two drift-prone knobs.
 
-- **Default safe.** A fresh install is `request_only`; `guarded_cycle` is
-  unreachable until *both* the mode is set and a trust grant exists.
-- **One-time grant, operator-only CLI** (never a model-callable tool):
+- **Default safe.** A fresh install is `request_only` with an **empty
+  `allowed_services` and no trust grant**; `guarded_cycle` is unreachable until the
+  trust grant exists. There is no "set the mode, then maybe add an allowlist later"
+  intermediate state to get wrong.
+- **One atomic grant, operator-only CLI** (never a model-callable tool), requiring
+  **explicit service selection** — the exact unit is the whole point of the grant:
 
   ```bash
   agentflow-hermes maintenance trust-grant --gateway hermes-gateway.service --confirm
   ```
 
-  Writes a trust record into `AGENTFLOW_HOME/maintenance.json`:
+  In a single write to `AGENTFLOW_HOME/maintenance.json`, this atomically (a) sets
+  `mode="guarded_cycle"`, (b) adds the exact unit to `allowed_services`, and (c)
+  records the host-bound grant — so the mode, the allowlist, and the grant can
+  never disagree:
 
   ```json
   {
+    "mode": "guarded_cycle",
+    "allowed_services": ["hermes-gateway.service"],
     "trust_grants": [
       { "gateway_unit": "hermes-gateway.service",
         "granted_at": 1750000000.0,
@@ -166,20 +188,29 @@ grant**, separate from the mode flag.
   }
   ```
 
-  - **Scoped to one exact unit name** (no globs), bound to a `host_id` so a copied
-    config can't silently authorize a cycle on a different host (the grant is
-    treated invalid if `host_id` mismatches → fail closed).
+  - **Scoped to one exact unit name** (no globs); the same exact name is what lands
+    in `allowed_services`, so §7's allowlist gate and the grant always reference the
+    identical unit. Bound to a `host_id` so a copied config can't silently authorize
+    a cycle on a different host (the grant is treated invalid if `host_id`
+    mismatches → fail closed, and the mode then degrades to request_only per §2).
   - `scope: "service_cycle"` authorizes restart only. A **separate**
     `runtime_install` scope is required before the runner may perform a pinned
     ff-only checkout move + reinstall (§6); absent that scope, the runner cycles
-    only and leaves the checkout exactly as the reviewer pinned it.
-  - `trust-revoke --gateway <unit>` removes it; `maintenance status` always prints
-    grant presence/scope/age so posture is visible before anything fires.
+    only and leaves the checkout exactly as the reviewer pinned it. Re-running
+    `trust-grant --scope runtime_install --gateway <unit>` adds that scope to the
+    existing grant atomically; it is still one explicit, unit-scoped decision, not
+    a per-cycle approval.
+  - `trust-revoke --gateway <unit>` atomically removes the grant **and** the unit
+    from `allowed_services`, and if no allowlisted+granted unit remains it resets
+    `mode` to `request_only` — the inverse of the grant, leaving no orphaned
+    `guarded_cycle`. `maintenance status` always prints mode + allowlist + grant
+    presence/scope/age so posture is visible before anything fires.
 - **No repeated ad-hoc approval.** Once granted, guarded cycles proceed under the
   §7 gates without re-prompting — the per-cycle safety comes from the gates, the
   *authorization* comes once from the grant. This is the deliberate trade: a single
-  reviewed human decision replaces N ad-hoc approvals, while every individual cycle
-  still has to pass mechanical gates and a fake canary.
+  reviewed human decision (one explicit unit selection) replaces N ad-hoc
+  approvals, while every individual cycle still has to pass mechanical gates and a
+  fake canary.
 
 ## 4. Opportunistic upstream watcher (read-only; M9)
 
@@ -230,9 +261,12 @@ from `agentflow-runner.service` (oneshot, `Type=oneshot`) on
 `agentflow-maintenance.slice`, outside the gateway cgroup** so restarting the
 gateway cannot kill the runner mid-cycle. Flow:
 
-1. **Mode/trust gate.** If mode ≠ `guarded_cycle` or no valid trust grant for the
-   target unit → exit with a `refused` receipt, no action. (request_only and below
-   never reach here.)
+1. **Mode/trust gate.** If mode ≠ `guarded_cycle`, or the target unit ∉
+   `allowed_services`, or there is no valid host-bound trust grant for it → exit
+   with a `refused` receipt, no action. (Because §3 writes these three together,
+   the only way they disagree is a hand-edited/copied config, which this gate —
+   and the §2 downgrade — treat as request_only. request_only and below never
+   reach here.)
 2. **Claim a request.** Find the single oldest open `maintenance_sync` request that
    carries a **reviewed sync GO** verdict (parsed via the shared `VerdictParser`,
    `confidence='explicit'`). Single-subject only — never batch-cycles. Claim it via
@@ -313,7 +347,10 @@ class MaintenancePolicy:
    control.
 2. **Exact service allowlist.** Target unit must be a verbatim member of
    `allowed_services` (`hermes-gateway.service`). No wildcards (blast-radius/
-   exfiltration risk, same stance as `live/policy` allowlist).
+   exfiltration risk, same stance as `live/policy` allowlist). `allowed_services`
+   is populated **only** by the atomic trust grant (§3) and emptied by
+   `trust-revoke`; it is never set independently of a matching grant, so this gate
+   and the trust grant always name the same unit.
 3. **No active workers / cc tmux / inflight jobs.** `require_no_active_workers` ⇒
    `activity.snapshot()` must show zero inflight non-final jobs and zero matching
    tmux sessions; otherwise refuse (a cycle would interrupt live work).
@@ -350,10 +387,13 @@ a storm of cards or cycles.
   set `disabled`, optionally purge timers. The clean uninstall path.
 - `agentflow-hermes maintenance status` — mode, gate values, trust-grant
   presence/scope/age, last watch facts, last cycle receipt, degraded flag.
-- `agentflow-hermes maintenance set-mode <disabled|observe_only|request_only|guarded_cycle>`
-  — operator-only.
+- `agentflow-hermes maintenance set-mode <disabled|observe_only|request_only>`
+  — operator-only. **Does not accept `guarded_cycle`**: that mode is reachable only
+  via the atomic `trust-grant` (§3), which sets the mode, allowlist, and grant
+  together. `set-mode` can always step *down* (e.g. to `request_only`/`disabled`).
 - `agentflow-hermes maintenance trust-grant|trust-revoke --gateway <unit> [--scope service_cycle|runtime_install] --confirm`
-  — operator-only (§3).
+  — operator-only (§3). `trust-grant` is the single atomic arm-up (mode +
+  allowlist + grant); `trust-revoke` is its exact inverse.
 - `agentflow-hermes maintenance watch [--dry-run]` — exactly what
   `agentflow-watch.service` invokes; read-only.
 - `agentflow-hermes maintenance run [--live]` — exactly what
@@ -393,7 +433,8 @@ gateway restart never reaps the runner.
 **After-install docs:** extend `plugins/hermes-agentflow/after-install.md` with a
 "Seamless maintenance (optional)" section: the one `install-runner` command, the
 explanation that the default is `request_only` (proposals only, nothing restarts),
-and the explicit two-step opt-in (`set-mode guarded_cycle` + `trust-grant`) needed
+and the explicit one-time `trust-grant --gateway <unit> --confirm` opt-in that
+atomically sets `guarded_cycle` + the exact service allowlist + the host-bound grant
 for auto-cycles, plus `disable`/`uninstall-runner`.
 
 ## 9. Installer UX — "install only and it works"
@@ -418,7 +459,8 @@ performs, in order, with a single summary JSON at the end:
 
 Net first-run result: upstream changes surface as Kanban sync cards with a
 subscription back to #hermes-main, the operator reviews them, and **only** after an
-explicit `set-mode guarded_cycle` + `trust-grant` does any restart ever happen.
+explicit unit-scoped `trust-grant --gateway <unit> --confirm` atomically arms
+`guarded_cycle` with a matching service allowlist does any restart ever happen.
 
 ## 10. Backward compatibility & schema
 
@@ -544,8 +586,8 @@ real gateway in CI.
   retry-storm.
 - **M11:** `install-runner` is idempotent, leaves the system in request_only,
   passes doctor/smoke, and `maintenance run` refuses with the exact gate; uninstall
-  removes all units and sets `disabled`; `after-install.md` documents the two-step
-  opt-in.
+  removes all units and sets `disabled`; `after-install.md` documents the atomic
+  one-time trust-grant opt-in.
 - **Cross-cutting:** the AgentFlow live-migration tests and all baseline suites
   remain green; no Hermes core monkeypatch; no raw secrets/private absolute paths/
   raw transcripts in any persistent ledger row.
