@@ -12,6 +12,15 @@ from agentflow_hermes.policy_ref import (
     preflight_task_body,
     resolve_policy_ref,
 )
+from agentflow_hermes.graph_creator import (
+    FakeKanbanGraphAdapter,
+    GraphIntentCandidate,
+    KanbanGraphAdapter,
+    RemediationGraphPolicy,
+    apply_remediation_graph,
+    propose_remediation_graph,
+    resolve_stale_final_candidate,
+)
 from agentflow_hermes.remediation import plan_remediation
 
 
@@ -183,6 +192,182 @@ def test_upstream_watcher_proposes_when_behind_and_no_graph():
     assert result["mutations"] == []
 
 
+def test_t64cf3160_style_block_yields_fix_review_final_vn_intent_dry_run_only():
+    summary = "Verdict: BLOCK — stale final fanin: old final task t_64cf3160 needs supersession."
+    result = propose_remediation_graph(summary, source_ref="t_64cf3160", origin="discord:#hermes-main")
+    assert result["success"] is True
+    assert result["dry_run"] is True
+    assert result["request_only"] is True
+    assert result["mutations"] == []
+    real = [c for c in result["candidates"] if c.get("action") != "noop"]
+    kinds = {c["kind"] for c in real}
+    assert "fix" in kinds
+    assert "review" in kinds
+    assert "final-vN" in kinds
+    for c in real:
+        assert c["metadata"]["dry_run_only"] is True
+        assert c["metadata"]["request_only"] is True
+        assert c["mutations"] == []
+
+
+def test_t3434c714_style_stale_trust_grant_block_yields_narrow_doc_cleanup_dry_run_only():
+    summary = "Verdict: BLOCK — stale_trust_grant_wording remains in docs; fix only the trust-grant wording."
+    result = propose_remediation_graph(summary, source_ref="t_3434c714")
+    assert result["success"] is True
+    assert result["mutations"] == []
+    real = [c for c in result["candidates"] if c.get("action") != "noop"]
+    kinds = {c["kind"] for c in real}
+    assert "fix" in kinds
+    assert "review" in kinds
+    assert "final-vN" not in kinds
+    assert len(real) == 2
+
+
+def test_stale_inline_route_yields_policy_ref_migration_no_legacy_route_copied():
+    summary = "Verdict: BLOCK — stale_inline_route: old claude-openrouter-opus route conflicts with policy."
+    result = propose_remediation_graph(summary, source_ref="review:policy")
+    assert result["success"] is True
+    real = [c for c in result["candidates"] if c.get("action") != "noop"]
+    assert real
+    blob = json.dumps(result)
+    # No legacy route values leaked into the output.
+    assert "claude-openrouter-opus" not in blob
+    # Policy refs present and contain only symbolic keys, not route attribute values.
+    for c in real:
+        assert c["policy_refs"]
+        assert "Policy refs:" in c["body"]
+        assert "policy:model.design_opus" in c["body"]
+        assert c["metadata"]["resolved_preview"]["binding"] is False
+        assert c["metadata"]["resolved_preview"]["redacted"] is True
+        for ref in c["policy_refs"]:
+            assert "anthropic-native" not in ref
+            assert "claude-opus" not in ref
+            assert "openrouter" not in ref
+
+
+def test_real_kanban_adapter_defaults_to_noop_without_adapter_apply_enable():
+    intent = GraphIntentCandidate(
+        kind="fix",
+        blocker="stale_inline_route",
+        title="policy migration [fix]",
+        idempotency_key="remediation:stale_inline_route:test:fix",
+        origin="discord:#hermes",
+        return_to="discord:#hermes",
+        policy_refs=("design_opus", "implementation_default"),
+        subscription_required=True,
+        supersedes="",
+        metadata={},
+    )
+    adapter = KanbanGraphAdapter()
+    result = apply_remediation_graph(
+        intent,
+        policy=RemediationGraphPolicy(apply_enabled=True),
+        adapter=adapter,
+    )
+    assert result["success"] is False
+    assert result["error"] == "adapter_apply_disabled"
+    assert result["mutations"] == []
+    assert adapter.created_intents == []
+
+
+def test_stale_final_v1_block_plus_remediation_go_yields_final_v2_intent():
+    old_final = {"id": "t_old_final_v1", "status": "blocked", "title": "Final v1 task"}
+    review = {
+        "id": "t_review_01",
+        "status": "done",
+        "title": "Remediation review",
+        "body": "Verdict: GO — fix confirmed, ready for supersession.",
+    }
+    result = resolve_stale_final_candidate(old_final, review, origin="discord:#hermes-main")
+    assert result["success"] is True
+    assert result["dry_run"] is True
+    assert result["mutations"] == []
+    candidate = result["candidate"]
+    assert candidate["kind"] == "final-v2"
+    assert candidate["blocker"] == "stale_final_fanin"
+    assert candidate["supersedes"] != ""
+    assert candidate["metadata"]["request_only"] is True
+    # No automatic re-run: mutations list is always empty.
+    assert candidate["mutations"] == []
+
+
+def test_stale_final_resolver_noop_when_review_has_no_go():
+    old_final = {"id": "t_final_v1", "status": "done"}
+    review = {"id": "t_review_02", "body": "Verdict: BLOCK — more work needed."}
+    result = resolve_stale_final_candidate(old_final, review)
+    assert result["success"] is False
+    assert result["error"] == "remediation_review_no_go_verdict"
+    assert result["candidate"] is None
+
+
+def test_idempotency_dedupe_prevents_duplicate_graph_proposals():
+    summary = "Verdict: BLOCK — stale_trust_grant_wording remains in docs."
+    result1 = propose_remediation_graph(summary, source_ref="t_idem_test")
+    assert result1["success"] is True
+    real1 = [c for c in result1["candidates"] if c.get("action") != "noop"]
+    assert real1
+    base_key = real1[0]["metadata"]["base_idempotency_key"]
+    prior = [{"idempotency_key": base_key, "blocker": "stale_trust_grant_wording", "metadata": {}}]
+    result2 = propose_remediation_graph(summary, source_ref="t_idem_test", prior_proposals=prior)
+    assert result2["success"] is True
+    assert all(c.get("action") == "noop" for c in result2["candidates"])
+    assert result2["candidates"][0]["reason"] == "existing_proposal"
+
+
+def test_idempotency_dedupe_via_fake_adapter():
+    adapter = FakeKanbanGraphAdapter()
+    summary = "Verdict: BLOCK — stale_trust_grant_wording in docs."
+    result1 = propose_remediation_graph(summary, source_ref="t_adapter_test", adapter=adapter)
+    assert result1["success"] is True
+    real1 = [c for c in result1["candidates"] if c.get("action") != "noop"]
+    assert real1
+    # Register one candidate into the adapter by its base key.
+    base_key = real1[0]["metadata"]["base_idempotency_key"]
+    adapter._proposals.append({"idempotency_key": base_key, "blocker": "stale_trust_grant_wording", "kind": "fix"})
+    result2 = propose_remediation_graph(summary, source_ref="t_adapter_test", adapter=adapter)
+    assert result2["success"] is True
+    assert all(c.get("action") == "noop" for c in result2["candidates"])
+
+
+def test_default_policy_prevents_real_apply_fake_adapter_sees_no_mutations_unless_enabled():
+    intent = GraphIntentCandidate(
+        kind="fix",
+        blocker="stale_final_fanin",
+        title="test intent [fix]",
+        idempotency_key="remediation:stale_final_fanin:test:fix",
+        origin="discord:#hermes",
+        return_to="discord:#hermes",
+        policy_refs=("design_opus",),
+        subscription_required=True,
+        supersedes="",
+        metadata={},
+    )
+    adapter = FakeKanbanGraphAdapter()
+    # Default policy → apply must fail closed.
+    result_default = apply_remediation_graph(intent)
+    assert result_default["success"] is False
+    assert result_default["error"] == "apply_disabled_by_policy"
+    assert result_default["mutations"] == []
+    assert len(adapter.create_calls) == 0
+
+    # Explicit test-only policy with apply_enabled=True → fake adapter records call, no real mutations.
+    test_policy = RemediationGraphPolicy(apply_enabled=True)
+    result_enabled = apply_remediation_graph(intent, policy=test_policy, adapter=adapter)
+    assert result_enabled["success"] is True
+    assert result_enabled["mutations"] == []
+    assert len(adapter.create_calls) == 1
+
+
+def test_storm_guard_max_proposals_per_blocker_class():
+    summary = "Verdict: BLOCK — stale_trust_grant_wording remains."
+    policy = RemediationGraphPolicy(max_proposals_per_blocker_class=1)
+    prior = [{"blocker": "stale_trust_grant_wording", "idempotency_key": "remediation:stale_trust_grant_wording:other", "metadata": {}}]
+    result = propose_remediation_graph(summary, source_ref="t_storm", prior_proposals=prior, policy=policy)
+    assert result["success"] is True
+    assert all(c.get("action") == "noop" for c in result["candidates"])
+    assert result["candidates"][0]["reason"] == "max_proposals_per_blocker_class"
+
+
 def test_no_raw_private_path_or_secret_persistence_in_proposals_and_evidence(tmp_path):
     policy = default_policy_document()
     resolution = resolve_policy_ref("design_opus", policy).as_dict()
@@ -202,3 +387,18 @@ def test_no_raw_private_path_or_secret_persistence_in_proposals_and_evidence(tmp
     assert "/home/alice" not in durable
     assert "TOKEN=abc123" not in durable
     assert "private/TOKEN" not in durable
+
+
+def test_no_raw_private_path_or_secret_in_graph_intent_candidates():
+    summary = "Verdict: BLOCK — stale_inline_route: /home/alice/private TOKEN=abc123 claude-openrouter-opus"
+    result = propose_remediation_graph(
+        summary,
+        source_ref="/home/alice/private/TOKEN=abc123",
+        origin="discord:#hermes",
+    )
+    blob = json.dumps(result)
+    assert "/home/alice" not in blob
+    assert "TOKEN=abc123" not in blob
+    assert "private/TOKEN" not in blob
+    # The stale route name must not leak into candidates.
+    assert "claude-openrouter-opus" not in blob
