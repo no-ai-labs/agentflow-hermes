@@ -151,24 +151,21 @@ def propose_remediation_graph(
     plan_proposals = plan.get("proposals") or []
     candidates: list[dict[str, Any]] = []
 
+    # Storm-guard running counts seeded from prior proposals, then incremented as
+    # real candidates are generated in THIS request so caps bound the combined
+    # total (prior + current), not just prior context.
+    blocker_counts: dict[str, int] = {}
+    src_count = 0
+    for p in prior:
+        b = p.get("blocker")
+        if b:
+            blocker_counts[b] = blocker_counts.get(b, 0) + 1
+        if safe_src and (p.get("metadata") or {}).get("source_ref_safe") == safe_src:
+            src_count += 1
+
     for prop in plan_proposals:
         blocker: str = prop["blocker"]
         base_key: str = prop["idempotency_key"]
-
-        # Storm guard: max proposals per blocker class in prior context.
-        blocker_count = sum(1 for p in prior if p.get("blocker") == blocker)
-        if blocker_count >= effective_policy.max_proposals_per_blocker_class:
-            candidates.append(_noop(base_key, blocker, "max_proposals_per_blocker_class"))
-            continue
-
-        # Storm guard: max proposals per source in prior context.
-        src_count = sum(
-            1 for p in prior
-            if (p.get("metadata") or {}).get("source_ref_safe") == safe_src and safe_src
-        )
-        if src_count >= effective_policy.max_proposals_per_source:
-            candidates.append(_noop(base_key, blocker, "max_proposals_per_source"))
-            continue
 
         # Idempotency dedupe: check adapter and prior_proposals.
         adapter_existing = adapter.list_existing(base_key) if adapter else []
@@ -188,6 +185,17 @@ def propose_remediation_graph(
 
         for kind in sequence:
             idem = f"{base_key}:{kind}"
+
+            # Storm guard: max proposals per blocker class (prior + current).
+            if blocker_counts.get(blocker, 0) >= effective_policy.max_proposals_per_blocker_class:
+                candidates.append(_noop(idem, blocker, "max_proposals_per_blocker_class"))
+                continue
+
+            # Storm guard: max proposals per source (prior + current).
+            if safe_src and src_count >= effective_policy.max_proposals_per_source:
+                candidates.append(_noop(idem, blocker, "max_proposals_per_source"))
+                continue
+
             intent = GraphIntentCandidate(
                 kind=kind,
                 blocker=blocker,
@@ -207,6 +215,9 @@ def propose_remediation_graph(
                 body=body,
             )
             candidates.append(intent.as_dict())
+            blocker_counts[blocker] = blocker_counts.get(blocker, 0) + 1
+            if safe_src:
+                src_count += 1
 
     return {
         "success": True,

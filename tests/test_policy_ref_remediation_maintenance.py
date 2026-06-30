@@ -194,7 +194,12 @@ def test_upstream_watcher_proposes_when_behind_and_no_graph():
 
 def test_t64cf3160_style_block_yields_fix_review_final_vn_intent_dry_run_only():
     summary = "Verdict: BLOCK — stale final fanin: old final task t_64cf3160 needs supersession."
-    result = propose_remediation_graph(summary, source_ref="t_64cf3160", origin="discord:#hermes-main")
+    result = propose_remediation_graph(
+        summary,
+        source_ref="t_64cf3160",
+        origin="discord:#hermes-main",
+        policy=RemediationGraphPolicy(max_proposals_per_blocker_class=3),
+    )
     assert result["success"] is True
     assert result["dry_run"] is True
     assert result["request_only"] is True
@@ -366,6 +371,41 @@ def test_storm_guard_max_proposals_per_blocker_class():
     assert result["success"] is True
     assert all(c.get("action") == "noop" for c in result["candidates"])
     assert result["candidates"][0]["reason"] == "max_proposals_per_blocker_class"
+
+
+def test_storm_guard_caps_count_current_request_candidates_for_multi_blocker_same_source():
+    # Adversarial regression: multiple blockers from the SAME source generate
+    # many candidates in a single request. Caps must count candidates produced in
+    # this request (not just prior context), bounding real actionable candidates
+    # by max_proposals_per_source and per-blocker counts by
+    # max_proposals_per_blocker_class.
+    summary = (
+        "Verdict: BLOCK — stale_inline_route and missing_subscription and "
+        "stale_final_fanin all present in the same review source."
+    )
+    policy = RemediationGraphPolicy(max_proposals_per_source=3, max_proposals_per_blocker_class=2)
+    result = propose_remediation_graph(summary, source_ref="t_multi_blocker", policy=policy)
+    assert result["success"] is True
+    assert result["mutations"] == []
+
+    real = [c for c in result["candidates"] if c.get("action") != "noop"]
+    # Per-source cap bounds the total real actionable candidates.
+    assert len(real) <= policy.max_proposals_per_source
+
+    # Per-blocker-class cap bounds candidates for each blocker.
+    per_blocker: dict[str, int] = {}
+    for c in real:
+        per_blocker[c["blocker"]] = per_blocker.get(c["blocker"], 0) + 1
+    for count in per_blocker.values():
+        assert count <= policy.max_proposals_per_blocker_class
+
+    # Candidates beyond the caps are explicit noop/capped entries, not dropped.
+    capped = [c for c in result["candidates"] if c.get("action") == "noop"]
+    assert capped
+    assert {c["reason"] for c in capped} <= {
+        "max_proposals_per_source",
+        "max_proposals_per_blocker_class",
+    }
 
 
 def test_no_raw_private_path_or_secret_persistence_in_proposals_and_evidence(tmp_path):
