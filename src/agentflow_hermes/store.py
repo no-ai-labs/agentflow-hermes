@@ -11,7 +11,7 @@ from typing import Any
 
 from .live.gateway import DeliveryResult, FakeGateway, GatewayUnavailable, HermesGateway
 from .live.policy import LivePolicy, load_policy
-from .live.sanitize import policy_snapshot, safe_body_for_delivery
+from .live.sanitize import policy_snapshot, safe_body_for_delivery, safe_durable_ref, safe_event_payload, safe_job_field
 from .live.throttle import check_throttle, consecutive_failures, record_failure, set_degraded
 from .migrations import migrate
 from .states import ALLOWED_TRANSITIONS, FINAL_STATES, JobStatus, normalize_status
@@ -65,6 +65,19 @@ class AgentFlowStore:
         now = time.time()
         job_id = f"job_{int(now * 1000):x}"
         correlation_id = correlation_id or job_id
+
+        safe_title, _ = safe_job_field(title, field="title", max_len=240)
+        safe_body, _ = safe_job_field(body, field="body", max_len=4000)
+        safe_target, _ = safe_job_field(target, field="target", max_len=240)
+        safe_origin_return, _ = safe_job_field(origin_return, field="origin_return", max_len=240)
+        safe_dedupe_key, _ = safe_job_field(dedupe_key, field="dedupe_key", max_len=240)
+        safe_correlation_id, _ = safe_job_field(correlation_id, field="correlation_id", max_len=240)
+        safe_causation_id, _ = safe_job_field(causation_id, field="causation_id", max_len=240)
+        safe_source_kind, _ = safe_job_field(source_kind, field="source_kind", max_len=120)
+        safe_source_id, _ = safe_job_field(source_id, field="source_id", max_len=240)
+        safe_source_ref, source_ref_redacted = safe_durable_ref(source_ref, field="source_ref", source_hash=source_hash)
+        safe_source_hash, _ = safe_job_field(source_hash, field="source_hash", max_len=128)
+
         with self.connect() as con:
             con.execute(
                 """
@@ -76,20 +89,20 @@ class AgentFlowStore:
                 """,
                 (
                     job_id,
-                    title,
-                    body,
-                    target,
-                    origin_return,
-                    dedupe_key,
+                    safe_title,
+                    safe_body,
+                    safe_target,
+                    safe_origin_return,
+                    safe_dedupe_key,
                     JobStatus.QUEUED.value,
                     now,
                     now,
-                    correlation_id,
-                    causation_id,
-                    source_kind,
-                    source_id,
-                    source_ref,
-                    source_hash,
+                    safe_correlation_id,
+                    safe_causation_id,
+                    safe_source_kind,
+                    safe_source_id,
+                    safe_source_ref,
+                    safe_source_hash,
                     0,
                 ),
             )
@@ -97,17 +110,20 @@ class AgentFlowStore:
                 job_id,
                 "enqueued",
                 con=con,
-                payload={
-                    "target": target,
-                    "origin_return": origin_return,
-                    "correlation_id": correlation_id,
-                    "causation_id": causation_id,
-                    "source_kind": source_kind,
-                    "source_id": source_id,
-                    "source_ref": source_ref,
-                    "source_hash": source_hash,
-                    "dedupe_key": dedupe_key,
-                },
+                payload=safe_event_payload({
+                    "title": safe_title,
+                    "body": safe_body,
+                    "target": safe_target,
+                    "origin_return": safe_origin_return,
+                    "correlation_id": safe_correlation_id,
+                    "causation_id": safe_causation_id,
+                    "source_kind": safe_source_kind,
+                    "source_id": safe_source_id,
+                    "source_ref": safe_source_ref,
+                    "source_hash": safe_source_hash,
+                    "dedupe_key": safe_dedupe_key,
+                    "source_ref_redacted": source_ref_redacted,
+                }),
             )
         return {"success": True, "job_id": job_id, "status": JobStatus.QUEUED.value}
 
@@ -150,7 +166,7 @@ class AgentFlowStore:
         transaction; otherwise a new connection/transaction is used.
         """
         now = time.time()
-        payload = dict(payload or {})
+        payload = safe_event_payload(dict(payload or {}))
         payload["created_at"] = now
 
         def _run(c: sqlite3.Connection) -> dict[str, Any]:

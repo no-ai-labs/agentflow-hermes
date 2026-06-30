@@ -9,7 +9,9 @@ _PRIVATE_PATH_RE = re.compile(r"(?:file://)?/(?:home|Users|var/folders|tmp|priva
 _WINDOWS_PRIVATE_PATH_RE = re.compile(r"\b[A-Za-z]:\\\\(?:Users|Documents and Settings)\\\\\S+", re.IGNORECASE)
 _SECRET_RE = re.compile(
     r"(?:"
-    r"\b(?:TOKEN|API[_-]?KEY|SECRET|PASSWORD|PASSWD|AUTHORIZATION|BEARER|SESSION|COOKIE)\b\s*[:=]\s*\S+"
+    # Fail closed on standalone dummy markers commonly used in safety tests.
+    r"\b(?:TOKEN|API[_-]?KEY|SECRET)\b"
+    r"|\b(?:TOKEN|API[_-]?KEY|SECRET|PASSWORD|PASSWD|AUTHORIZATION|BEARER|SESSION|COOKIE)\b\s*[:=]\s*\S+"
     r"|\bBearer\s+\S+"
     r"|\b(?:sk|ghp|gho|github_pat|xox[baprs])-[-_A-Za-z0-9]{12,}"
     r")",
@@ -85,6 +87,78 @@ def policy_snapshot(policy: Any) -> str:
         else:
             cleaned[k] = v
     return json.dumps(cleaned, ensure_ascii=False)
+
+
+def sanitize_string(value: Any, *, max_len: int = 2000, fallback: str = "redacted") -> str:
+    """Return a bounded string with secrets/private paths replaced by *fallback*.
+
+    Non-string values are stringified. Empty values are returned as-is.
+    """
+    text = "" if value is None else str(value)
+    text = short_text(text, max_len=max_len)
+    if not text:
+        return text
+    if contains_sensitive_text(text):
+        return fallback
+    return text
+
+
+def safe_job_field(value: Any, *, field: str, max_len: int = 2000) -> tuple[str, bool]:
+    """Sanitize a single job column or payload value.
+
+    Returns ``(clean_value, redacted)``. Secrets and absolute paths are replaced
+    with a short redaction marker; safe short strings are bounded but preserved.
+    """
+    text = "" if value is None else str(value)
+    text = short_text(text, max_len=max_len)
+    if not text:
+        return text, False
+    if contains_sensitive_text(text):
+        return f"{field}:redacted", True
+    return text, False
+
+
+def safe_durable_ref(value: Any, *, field: str = "source_ref", source_hash: str = "") -> tuple[str, bool]:
+    """Return a safe ref/hash-based placeholder for durable storage/delivery.
+
+    If *value* is already a safe reference it is returned unchanged. If it
+    contains secrets or absolute paths, it is replaced with
+    ``ref:sha256:<prefix>`` computed from the original value, optionally salted
+    with *source_hash*. The boolean return indicates whether redaction occurred.
+    """
+    ref = short_text(value, max_len=240)
+    if not ref:
+        return "", False
+    if contains_sensitive_text(ref) or not _SAFE_REF_RE.fullmatch(ref):
+        digest = _sha256(f"{ref}:{source_hash}")[:16]
+        return f"ref:sha256:{digest}", True
+    return ref, False
+
+
+def safe_event_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Return a deep-sanitized copy of an event payload safe for durable storage.
+
+    String values are bounded and have secrets/private paths replaced with
+    ``<key>:redacted``. Nested dicts and lists are walked. ``None`` and safe
+    primitives pass through unchanged.
+    """
+    cleaned: dict[str, Any] = {}
+    for key, value in payload.items():
+        cleaned[key] = _safe_value(value, key=key)
+    return cleaned
+
+
+def _safe_value(value: Any, *, key: str = "value") -> Any:
+    if isinstance(value, str):
+        lowered = key.lower()
+        if lowered.endswith("ref") or lowered.endswith("_ref") or lowered in {"raw_ref", "source_ref"}:
+            return safe_durable_ref(value, field=key)[0]
+        return safe_job_field(value, field=key)[0]
+    if isinstance(value, dict):
+        return {k: _safe_value(v, key=k) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_safe_value(v, key=key) for v in value]
+    return value
 
 
 def _sha256(text: str) -> str:
