@@ -306,6 +306,23 @@ def test_cli_loop_evaluate_malformed_policy_fails_closed_no_mutation(monkeypatch
     assert data["adapter_attempts"] == 0
 
 
+def test_cli_loop_evaluate_malformed_apply_enabled_type_fails_closed_no_mutation(monkeypatch, tmp_path):
+    policy = dict(SAFE_POLICY)
+    policy["active_mode"] = "apply"
+    policy["apply_enabled"] = "true"
+    fixture = _write_fixture(tmp_path, {
+        "event": _event(verdict="BLOCK", summary="Verdict: BLOCK — stale_inline_route", blocker_class="stale_inline_route"),
+        "policy": policy,
+    })
+    rc, data = _run(["loop", "evaluate", "--input-file", fixture], monkeypatch, tmp_path)
+
+    assert rc == 0
+    assert data["action"] == "escalate"
+    assert data["reason"] == "malformed_policy"
+    assert data["mutations"] == []
+    assert data["adapter_attempts"] == 0
+
+
 def test_cli_loop_evaluate_explicit_args_without_fixture_build_event_and_policy(monkeypatch, tmp_path):
     rc, data = _run([
         "loop", "evaluate",
@@ -329,6 +346,54 @@ def test_cli_loop_evaluate_explicit_args_without_fixture_build_event_and_policy(
     assert data["action"] == "propose"
     assert data["dry_run"] is True
     assert data["mutations"] == []
+
+
+def test_cli_loop_evaluate_malformed_round_no_type_fails_closed_no_traceback(monkeypatch, tmp_path):
+    fixture = _write_fixture(tmp_path, {
+        "event": _event(verdict="BLOCK", summary="Verdict: BLOCK — stale_inline_route", blocker_class="stale_inline_route", round_no="not-a-number"),
+        "policy": SAFE_POLICY,
+    })
+    rc, data = _run(["loop", "evaluate", "--input-file", fixture], monkeypatch, tmp_path)
+
+    assert rc != 0
+    assert data["success"] is False
+    assert data["error"] == "malformed_event"
+
+
+def test_cli_loop_evaluate_ledger_receipts_non_object_entry_fails_closed_no_traceback(monkeypatch, tmp_path):
+    fixture = _write_fixture(tmp_path, {
+        "event": _event(verdict="BLOCK", summary="Verdict: BLOCK — stale_inline_route", blocker_class="stale_inline_route"),
+        "policy": SAFE_POLICY,
+        "ledger_receipts": ["not-an-object"],
+    })
+    rc, data = _run(["loop", "evaluate", "--input-file", fixture], monkeypatch, tmp_path)
+
+    assert rc != 0
+    assert data["success"] is False
+    assert data["error"] == "malformed_ledger_receipts"
+    assert data["detail"] == "invalid_receipts:1"
+
+
+def test_cli_loop_evaluate_ledger_receipts_malformed_fields_fail_closed_no_traceback(monkeypatch, tmp_path):
+    bad_receipt = {
+        "event_id": "evt-prev",
+        "source_graph_id": "graph-1",
+        "blocker_class": "stale_inline_route",
+        "decision": "propose",
+        "round_no": "not-a-number",
+        "created_at": {"nested": "object"},
+    }
+    fixture = _write_fixture(tmp_path, {
+        "event": _event(verdict="BLOCK", summary="Verdict: BLOCK — stale_inline_route", blocker_class="stale_inline_route"),
+        "policy": SAFE_POLICY,
+        "ledger_receipts": [bad_receipt],
+    })
+    rc, data = _run(["loop", "evaluate", "--input-file", fixture], monkeypatch, tmp_path)
+
+    assert rc != 0
+    assert data["success"] is False
+    assert data["error"] == "malformed_ledger_receipts"
+    assert data["detail"] == "invalid_receipts:1"
 
 
 def test_cli_loop_evaluate_report_has_no_private_paths_or_secrets(monkeypatch, tmp_path):

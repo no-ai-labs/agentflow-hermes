@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from .graph_creator import FakeKanbanGraphAdapter
-from .live.sanitize import short_text
+from .live.sanitize import sanitize_string, short_text
 from .loop_supervisor import (
     InMemoryLoopLedger,
     LoopEvent,
@@ -32,6 +32,41 @@ _EVENT_FIELDS = (
     "source_final_id",
     "remediation_review_id",
 )
+
+_STR_EVENT_FIELDS = (
+    "event_id",
+    "source_graph_id",
+    "source_task_id",
+    "event_type",
+    "verdict",
+    "summary",
+    "blocker_class",
+    "origin",
+    "return_to",
+    "subscription_status",
+    "policy_resolution_ref",
+    "source_final_id",
+    "remediation_review_id",
+)
+_DICT_OR_NONE_EVENT_FIELDS = ("old_final_card", "remediation_review_card")
+
+_RECEIPT_STR_FIELDS = (
+    "event_id",
+    "source_graph_id",
+    "source_task_id",
+    "source_final_id",
+    "blocker_class",
+    "idempotency_key",
+    "policy_resolution_ref",
+    "origin_ref",
+    "return_to_ref",
+    "subscription_status",
+    "reason",
+    "decision",
+    "mode",
+)
+_RECEIPT_INT_FIELDS = ("round_no", "same_blocker_count", "final_vn")
+_RECEIPT_NUMERIC_FIELDS = ("created_at",)
 
 _POLICY_FIELDS = (
     "active_mode",
@@ -135,6 +170,59 @@ def _build_policy_kwargs(args: argparse.Namespace, fixture_policy: dict[str, Any
     return kwargs
 
 
+def _validate_event_kwargs(kwargs: dict[str, Any]) -> str | None:
+    """Return the offending field name if an event kwarg has a wrong/unsafe type, else None."""
+    for field in _STR_EVENT_FIELDS:
+        if field in kwargs and not isinstance(kwargs[field], str):
+            return field
+    if "round_no" in kwargs:
+        value = kwargs["round_no"]
+        if isinstance(value, bool) or not isinstance(value, int):
+            return "round_no"
+    if "occurred_at" in kwargs:
+        value = kwargs["occurred_at"]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return "occurred_at"
+    for field in _DICT_OR_NONE_EVENT_FIELDS:
+        if field in kwargs and kwargs[field] is not None and not isinstance(kwargs[field], dict):
+            return field
+    return None
+
+
+def _receipt_is_well_typed(receipt: dict[str, Any]) -> bool:
+    for field in _RECEIPT_STR_FIELDS:
+        if field in receipt and receipt[field] is not None and not isinstance(receipt[field], str):
+            return False
+    for field in _RECEIPT_INT_FIELDS:
+        if field in receipt:
+            value = receipt[field]
+            if isinstance(value, bool) or not isinstance(value, int):
+                return False
+    for field in _RECEIPT_NUMERIC_FIELDS:
+        if field in receipt:
+            value = receipt[field]
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return False
+    return True
+
+
+def _sanitize_ledger_receipts(raw_receipts: list[Any]) -> tuple[list[dict[str, Any]], int]:
+    """Reject non-object or malformed-field receipts before ledger construction.
+
+    Never lets a malformed receipt reach InMemoryLoopLedger/safe_event_payload,
+    where non-dict or wrong-typed numeric/timestamp fields can raise or distort
+    fail-closed round/cooldown accounting.
+    """
+    valid: list[dict[str, Any]] = []
+    dropped = 0
+    for receipt in raw_receipts:
+        if not isinstance(receipt, dict) or not _receipt_is_well_typed(receipt):
+            dropped += 1
+            continue
+        valid.append(receipt)
+    return valid, dropped
+
+
 def run_loop_evaluate(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
     """Evaluate one loop event and return (exit_code, sanitized report dict).
 
@@ -152,9 +240,12 @@ def run_loop_evaluate(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
 
     fixture_event = fixture.get("event") if isinstance(fixture.get("event"), dict) else {}
     fixture_policy = fixture.get("policy") if isinstance(fixture.get("policy"), dict) else {}
-    fixture_receipts = fixture.get("ledger_receipts") if isinstance(fixture.get("ledger_receipts"), list) else []
+    fixture_receipts_raw = fixture.get("ledger_receipts") if isinstance(fixture.get("ledger_receipts"), list) else []
 
     event_kwargs = _build_event_kwargs(args, fixture_event)
+    bad_field = _validate_event_kwargs(event_kwargs)
+    if bad_field is not None:
+        return 2, {"success": False, "error": "malformed_event", "detail": f"invalid_type:{short_text(bad_field)}"}
     try:
         event = LoopEvent(**event_kwargs)
     except TypeError:
@@ -166,11 +257,18 @@ def run_loop_evaluate(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
     except TypeError:
         policy = LoopPolicy(kill_switch=True)
 
+    fixture_receipts, dropped_receipts = _sanitize_ledger_receipts(fixture_receipts_raw)
+    if dropped_receipts:
+        return 2, {"success": False, "error": "malformed_ledger_receipts", "detail": f"invalid_receipts:{dropped_receipts}"}
     ledger = InMemoryLoopLedger(receipts=fixture_receipts)
 
     apply_gate_open = policy.active_mode == "apply" and policy.apply_enabled is True
     adapter = FakeKanbanGraphAdapter() if apply_gate_open else None
 
-    decision = evaluate_loop_event(event, ledger, policy, adapter=adapter)
-    report = build_loop_report(decision)
+    try:
+        decision = evaluate_loop_event(event, ledger, policy, adapter=adapter)
+        report = build_loop_report(decision)
+    except Exception as exc:  # fail closed: never leak a raw traceback to CLI output
+        return 2, {"success": False, "error": "evaluation_failed", "detail": sanitize_string(str(exc))}
+
     return 0, report
