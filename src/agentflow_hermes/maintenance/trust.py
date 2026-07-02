@@ -277,23 +277,60 @@ def revoke_trust_grant(
     })
 
 
+_REQUIRED_GRANT_FIELDS = (
+    "grant_id",
+    "mode",
+    "action",
+    "scope",
+    "gateway_unit",
+    "allowed_services",
+    "host_id",
+    "created_at",
+    "expires_at",
+    "provenance",
+)
+_GRANT_ID_PREFIX = "grant_"
+_GRANT_ID_HEX_LEN = 16
+_HEX_CHARS = set("0123456789abcdef")
+
+
+def _valid_grant_id_shape(value: Any) -> bool:
+    if not isinstance(value, str) or not value.startswith(_GRANT_ID_PREFIX):
+        return False
+    suffix = value[len(_GRANT_ID_PREFIX):]
+    return len(suffix) == _GRANT_ID_HEX_LEN and all(ch in _HEX_CHARS for ch in suffix)
+
+
+def _non_empty_sanitized(value: Any, *, field: str) -> bool:
+    if value is None:
+        return False
+    return bool(safe_job_field(value, field=field)[0])
+
+
 def _is_trust_grant_record_shape(entry: Any) -> bool:
     if not isinstance(entry, dict):
         return False
+    if any(field not in entry for field in _REQUIRED_GRANT_FIELDS):
+        return False
     try:
-        _validate_unit(entry.get("gateway_unit"))
+        unit = _validate_unit(entry.get("gateway_unit"))
         created = _strict_float(entry.get("created_at"), code="invalid_created_at")
         expires = _strict_float(entry.get("expires_at"), code="invalid_expiry")
     except TrustGrantError:
         return False
     if expires <= created:
         return False
-    if not isinstance(entry.get("grant_id"), str):
+    if not _valid_grant_id_shape(entry.get("grant_id")):
         return False
-    allowed = entry.get("allowed_services")
-    if not isinstance(allowed, list) or not all(isinstance(unit, str) for unit in allowed):
+    if entry.get("mode") != TRUST_MODE:
         return False
-    if not isinstance(entry.get("host_id"), str):
+    if entry.get("action") != TRUST_SCOPE or entry.get("scope") != TRUST_SCOPE:
+        return False
+    if entry.get("allowed_services") != [unit]:
+        return False
+    if not _non_empty_sanitized(entry.get("host_id"), field="host_id"):
+        return False
+    if not _non_empty_sanitized(entry.get("provenance"), field="provenance"):
         return False
     return True
 

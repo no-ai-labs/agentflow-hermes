@@ -283,6 +283,122 @@ def test_mixed_valid_and_malformed_object_trust_grants_fail_closed_sanitized(tmp
     assert "TOKEN=abc123" not in blob
 
 
+def _valid_grant_dict():
+    return build_trust_grant(
+        "hermes-gateway.service",
+        host_id="test-host",
+        created_at=1000.0,
+        expires_at=9999999999.0,
+        provenance="pytest explicit grant",
+    )
+
+
+def _malformed_dict_variants():
+    """Dict grants that are individually malformed but share a valid unit.
+
+    Each must invalidate the whole collection even when a valid grant is also
+    present, so the runner blocks with malformed_trust_grants instead of GO.
+    """
+    variants = {}
+
+    for missing in ("mode", "action", "scope", "provenance", "grant_id",
+                    "allowed_services", "host_id", "created_at", "expires_at"):
+        entry = _valid_grant_dict()
+        del entry[missing]
+        variants[f"missing_{missing}"] = entry
+
+    bad_prefix = _valid_grant_dict()
+    bad_prefix["grant_id"] = "trust_deadbeefdeadbeef"
+    variants["bad_grant_id_prefix"] = bad_prefix
+
+    bad_format = _valid_grant_dict()
+    bad_format["grant_id"] = "grant_bad"
+    variants["bad_grant_id_format"] = bad_format
+
+    empty_grant_id = _valid_grant_dict()
+    empty_grant_id["grant_id"] = ""
+    variants["empty_grant_id"] = empty_grant_id
+
+    for key, value in (
+        ("wrong_mode", ("mode", "observe")),
+        ("wrong_action", ("action", "observe")),
+        ("wrong_scope", ("scope", "observe")),
+    ):
+        entry = _valid_grant_dict()
+        entry[value[0]] = value[1]
+        variants[key] = entry
+
+    allowlist_string = _valid_grant_dict()
+    allowlist_string["allowed_services"] = "hermes-gateway.service"
+    variants["allowed_services_string"] = allowlist_string
+
+    allowlist_empty = _valid_grant_dict()
+    allowlist_empty["allowed_services"] = []
+    variants["allowed_services_empty"] = allowlist_empty
+
+    allowlist_extra = _valid_grant_dict()
+    allowlist_extra["allowed_services"] = ["hermes-gateway.service", "other.service"]
+    variants["allowed_services_extra"] = allowlist_extra
+
+    allowlist_wrong = _valid_grant_dict()
+    allowlist_wrong["allowed_services"] = ["other.service"]
+    variants["allowed_services_wrong"] = allowlist_wrong
+
+    allowlist_nonstring = _valid_grant_dict()
+    allowlist_nonstring["allowed_services"] = [123]
+    variants["allowed_services_nonstring"] = allowlist_nonstring
+
+    empty_provenance = _valid_grant_dict()
+    empty_provenance["provenance"] = "   "
+    variants["empty_provenance"] = empty_provenance
+
+    empty_host = _valid_grant_dict()
+    empty_host["host_id"] = ""
+    variants["empty_host_id"] = empty_host
+
+    bool_created = _valid_grant_dict()
+    bool_created["created_at"] = True
+    variants["bool_created_at"] = bool_created
+
+    bad_expiry = _valid_grant_dict()
+    bad_expiry["expires_at"] = "not-a-number"
+    variants["nonnumeric_expiry"] = bad_expiry
+
+    expiry_before_created = _valid_grant_dict()
+    expiry_before_created["expires_at"] = 500.0
+    variants["expiry_not_after_created"] = expiry_before_created
+
+    return variants
+
+
+@pytest.mark.parametrize("name,malformed", sorted(_malformed_dict_variants().items()))
+def test_mixed_valid_and_malformed_dict_entry_fails_closed(tmp_path, name, malformed):
+    path = _write_config(tmp_path, _guarded_config(
+        trust_grants=[_valid_grant_dict(), malformed],
+        allow_fake_execute=True,
+    ), name=f"runner_{name}.json")
+    report = evaluate_runner(load_runner_config(path), now=2000.0)
+
+    assert report["status"] == "BLOCK", name
+    assert report["reason"] == "malformed_trust_grants", name
+    assert report["dry_run"] is True, name
+    assert report["actions"]["executed"] == [], name
+
+
+def test_malformed_dict_entry_before_valid_grant_also_blocks(tmp_path):
+    malformed = _valid_grant_dict()
+    del malformed["mode"]
+    path = _write_config(tmp_path, _guarded_config(
+        trust_grants=[malformed, _valid_grant_dict()],
+        allow_fake_execute=True,
+    ))
+    report = evaluate_runner(load_runner_config(path), now=2000.0)
+
+    assert report["status"] == "BLOCK"
+    assert report["reason"] == "malformed_trust_grants"
+    assert report["actions"]["executed"] == []
+
+
 def test_service_cycle_mode_not_guarded_blocks(tmp_path):
     path = _write_config(tmp_path, _guarded_config(mode="request_only"))
     report = evaluate_runner(load_runner_config(path))
