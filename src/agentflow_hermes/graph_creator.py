@@ -308,6 +308,7 @@ def propose_remediation_graph(
         "request_only": True,
         "candidates": candidates,
         "mutations": [],
+        "adapter_attempts": auto_create_attempts,
     }
 
 
@@ -387,17 +388,20 @@ def resolve_stale_final_candidate(
         body=_policy_ref_body(policy_refs),
     )
 
+    # Gated auto-create for the final-v2 supersession intent.
+    adapter_attempts = 0
+    if adapter is not None and _is_apply_gated(effective_policy, "stale_final_fanin"):
+        adapter_attempts += 1
+        adapter.create_graph(intent)
+
     result: dict[str, Any] = {
         "success": True,
         "dry_run": True,
         "request_only": True,
         "candidate": intent.as_dict(),
         "mutations": [],
+        "adapter_attempts": adapter_attempts,
     }
-
-    # Gated auto-create for the final-v2 supersession intent.
-    if adapter is not None and _is_apply_gated(effective_policy, "stale_final_fanin"):
-        adapter.create_graph(intent)
 
     return result
 

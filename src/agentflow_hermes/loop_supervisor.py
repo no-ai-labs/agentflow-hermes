@@ -296,6 +296,8 @@ def evaluate_loop_event(
                 "ledger_round_no": ledger_max_round,
                 "effective_round_no": effective_round,
                 "receipt_round_no": effective_round + 1,
+                "round_no_derived": effective_round + 1,
+                "adapter_attempts": int(result.get("adapter_attempts") or 0),
             },
         ),
         ev,
@@ -338,7 +340,12 @@ def _evaluate_supersession(ev: LoopEvent, ledger: LoopLedger, policy: LoopPolicy
             blocker="stale_final_fanin",
             candidate=result.get("candidate"),
             mutations=tuple(result.get("mutations") or ()),
-            metadata={"final_vn": final_vn, "graph_creator_result": _safe_creator_result(result)},
+            metadata={
+                "final_vn": final_vn,
+                "graph_creator_result": _safe_creator_result(result),
+                "round_no_derived": ledger.max_round_for_graph(ev.source_graph_id),
+                "adapter_attempts": int(result.get("adapter_attempts") or 0),
+            },
         ),
         ev,
     )
@@ -416,6 +423,7 @@ def _safe_creator_result(result: dict[str, Any]) -> dict[str, Any]:
         "error": str(result.get("error") or ""),
         "candidate_count": len(result.get("candidates") or ([] if result.get("candidate") is None else [result.get("candidate")])) ,
         "mutations": result.get("mutations") or [],
+        "adapter_attempts": int(result.get("adapter_attempts") or 0),
     })
 
 
@@ -441,6 +449,18 @@ def _decision(
     key = _safe_ref(key, field="idempotency_key")
     final_vn = int((metadata or {}).get("final_vn") or 1)
     receipt_round_no = int((metadata or {}).get("receipt_round_no", event.round_no) or 0)
+    adapter_attempts = int((metadata or {}).get("adapter_attempts") or 0)
+    applied = action in {"apply", "supersede"} and adapter_attempts > 0
+    round_no_derived = int((metadata or {}).get("round_no_derived", receipt_round_no) or 0)
+    full_metadata = dict(metadata or {})
+    full_metadata.update({
+        "applied": applied,
+        "dry_run": not applied,
+        "adapter_attempts": adapter_attempts,
+        "noop_reason": reason if action in {"noop", "escalate"} else "",
+        "idempotency_key": key,
+        "round_no_derived": round_no_derived,
+    })
     receipt = safe_event_payload({
         "event_id": safe_event,
         "source_task_id": _safe_ref(event.source_task_id, field="source_task_id"),
@@ -478,7 +498,7 @@ def _decision(
         candidates=tuple(safe_event_payload(c) for c in candidates),
         candidate=safe_event_payload(candidate) if isinstance(candidate, dict) else None,
         mutations=tuple(safe_event_payload(m) for m in mutations),
-        metadata=safe_event_payload(metadata or {}),
+        metadata=safe_event_payload(full_metadata),
         receipt=receipt,
     )
 

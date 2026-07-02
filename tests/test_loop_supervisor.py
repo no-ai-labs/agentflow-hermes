@@ -266,6 +266,64 @@ def test_loop_apply_mode_inherits_graph_creator_failed_adapter_attempt_budget():
     assert all(c.get("action") == "noop" for c in capped)
 
 
+def test_loop_apply_enabled_safe_blocker_fake_adapter_sees_bounded_records():
+    """apply mode for an allowlisted safe blocker must produce exactly the bounded
+    fix/review/final-vN task/link/subscription records on the fake adapter — no more."""
+    adapter = FakeKanbanGraphAdapter()
+    policy = LoopPolicy(
+        active_mode="apply",
+        allowlisted_blockers=("stale_inline_route",),
+        expected_origin="discord:#hermes-main",
+        expected_return_to="discord:#hermes-main",
+        max_auto_creates_per_run=5,
+        max_tasks_per_graph=9,
+    )
+    decision = evaluate_loop_event(
+        _event(verdict="BLOCK", summary="Verdict: BLOCK — stale_inline_route old route", blocker_class="stale_inline_route"),
+        InMemoryLoopLedger(),
+        policy,
+        adapter=adapter,
+    )
+
+    assert decision.action == "apply"
+    assert decision.metadata["applied"] is True
+    assert decision.metadata["dry_run"] is False
+    assert decision.metadata["adapter_attempts"] == 3
+    assert len(adapter.create_calls) == 3
+    assert [t["kind"] for t in adapter.tasks] == ["fix", "review", "final-vN"]
+    assert len(adapter.links) == 2
+    assert all(l["from"] and l["to"] for l in adapter.links)
+    assert len(adapter.subscriptions) == 3
+    assert all(s["return_to"] == "discord:#hermes-main" for s in adapter.subscriptions)
+
+
+def test_loop_apply_enabled_stale_final_fanin_allowlisted_provenance_applies_once():
+    adapter = FakeKanbanGraphAdapter()
+    policy = LoopPolicy(
+        active_mode="apply",
+        allowlisted_blockers=("stale_final_fanin",),
+        expected_origin="discord:#hermes-main",
+        expected_return_to="discord:#hermes-main",
+    )
+    event = _event(
+        event_id="evt-final-apply",
+        event_type="remediation_review_go",
+        source_graph_id="graph-final-apply",
+        source_final_id="t_final_v1",
+        remediation_review_id="t_review_go",
+        old_final_card={"id": "t_final_v1", "status": "blocked"},
+        remediation_review_card={"id": "t_review_go", "body": "Verdict: GO — remediation passed."},
+    )
+    decision = evaluate_loop_event(event, InMemoryLoopLedger(), policy, adapter=adapter)
+
+    assert decision.action == "supersede"
+    assert decision.metadata["applied"] is True
+    assert decision.metadata["adapter_attempts"] == 1
+    assert len(adapter.create_calls) == 1
+    assert adapter.tasks[0]["kind"] == "final-v2"
+    assert adapter.tasks[0]["supersedes"]
+
+
 def test_loop_supersession_not_allowlisted_escalates_no_adapter_call():
     """stale_final_fanin not in allowlist → escalate, no final-v2 candidate, no adapter call."""
     policy_no_fanin = LoopPolicy(
