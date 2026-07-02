@@ -166,7 +166,7 @@ arming the mode are a single atomic operator decision, not two drift-prone knobs
   **explicit service selection** — the exact unit is the whole point of the grant:
 
   ```bash
-  agentflow-hermes maintenance trust-grant --gateway hermes-gateway.service --confirm
+  agentflow-hermes maintenance trust-grant --gateway hermes-gateway.service --write
   ```
 
   In a single write to `AGENTFLOW_HOME/maintenance.json`, this atomically (a) sets
@@ -332,6 +332,45 @@ fake bounded by `HARD_ATTEMPT_CAP`. **The gateway still cannot `systemctl` or
 restart itself; production service restart is not supported by this MVP** — the
 runner remains external to the gateway process/cgroup.
 
+### 5.2 M12 trust-grant UX implementation status
+
+M12 adds the operator-only trust-grant boundary promised in §3 without adding any
+real service mutation. The CLI surface is additive:
+
+```bash
+agentflow-hermes maintenance trust-grant \
+  --config-file /absolute/path/maintenance.json \
+  --gateway hermes-gateway.service \
+  --expires-at 9999999999 \
+  --comment "operator approved gateway cycle" \
+  [--write]
+agentflow-hermes maintenance trust-inspect --config-file /absolute/path/maintenance.json
+agentflow-hermes maintenance trust-revoke --config-file /absolute/path/maintenance.json --gateway hermes-gateway.service [--write]
+```
+
+- Default is preview/dry-run: without `--write`, `trust-grant` and
+  `trust-revoke` return the exact policy/grant posture that would be written and
+  leave the file untouched.
+- `--write` performs one atomic local JSON rewrite. Granting sets
+  `mode="guarded_cycle"`, `requested_action="service_cycle"`, an exact one-unit
+  `allowed_services` list, and a complete grant record together; revoking removes
+  the grant and allowlist entry together and drops back to `request_only` when no
+  service grant remains.
+- A grant record is intentionally self-contained and host-bound:
+  `grant_id`, `mode`, `action`, `scope`, exact `gateway_unit`, exact
+  `allowed_services`, `host_id`, `created_at`, `expires_at`, and sanitized
+  `provenance`. Copied, expired, malformed, or allowlist-mismatched grants fail
+  closed.
+- Machine output is refs/short fields only: no raw config path, no raw private
+  paths or secret-looking provenance, and stable error codes such as
+  `dry_run`, `malformed_grant_file`, `invalid_config_path`, and
+  `invalid_gateway_unit`.
+- The external runner now validates this full M12 grant shape before accepting a
+  `service_cycle`, but even a valid grant still only reaches the existing
+  dry-run/proposal path unless a fake executor is explicitly injected by tests.
+  This slice still performs no `systemctl`, restart, live send, active wake, git
+  checkout, or board mutation.
+
 ## 6. The only permitted mutations, and where they live
 
 | Mutation | Who | Precondition | Constraint |
@@ -418,7 +457,7 @@ a storm of cards or cycles.
   — operator-only. **Does not accept `guarded_cycle`**: that mode is reachable only
   via the atomic `trust-grant` (§3), which sets the mode, allowlist, and grant
   together. `set-mode` can always step *down* (e.g. to `request_only`/`disabled`).
-- `agentflow-hermes maintenance trust-grant|trust-revoke --gateway <unit> [--scope service_cycle|runtime_install] --confirm`
+- `agentflow-hermes maintenance trust-grant|trust-revoke --gateway <unit> [--scope service_cycle|runtime_install] --write`
   — operator-only (§3). `trust-grant` is the single atomic arm-up (mode +
   allowlist + grant); `trust-revoke` is its exact inverse.
 - `agentflow-hermes maintenance watch [--dry-run]` — exactly what
@@ -460,7 +499,7 @@ gateway restart never reaps the runner.
 **After-install docs:** extend `plugins/hermes-agentflow/after-install.md` with a
 "Seamless maintenance (optional)" section: the one `install-runner` command, the
 explanation that the default is `request_only` (proposals only, nothing restarts),
-and the explicit one-time `trust-grant --gateway <unit> --confirm` opt-in that
+and the explicit one-time `trust-grant --gateway <unit> --write` opt-in that
 atomically sets `guarded_cycle` + the exact service allowlist + the host-bound grant
 for auto-cycles, plus `disable`/`uninstall-runner`.
 
@@ -486,7 +525,7 @@ performs, in order, with a single summary JSON at the end:
 
 Net first-run result: upstream changes surface as Kanban sync cards with a
 subscription back to #hermes-main, the operator reviews them, and **only** after an
-explicit unit-scoped `trust-grant --gateway <unit> --confirm` atomically arms
+explicit unit-scoped `trust-grant --gateway <unit> --write` atomically arms
 `guarded_cycle` with a matching service allowlist does any restart ever happen.
 
 ## 10. Backward compatibility & schema

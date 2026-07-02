@@ -7,6 +7,7 @@ from contextlib import redirect_stdout
 import pytest
 
 from agentflow_hermes.cli import main as cli_main
+from agentflow_hermes.maintenance.trust import build_trust_grant
 from agentflow_hermes.maintenance.runner import (
     HARD_ATTEMPT_CAP,
     FakeServiceExecutor,
@@ -46,16 +47,22 @@ SAFE_LOOP_FIXTURE = {
 
 
 def _guarded_config(**overrides):
+    unit = overrides.get("target_unit", "hermes-gateway.service")
     config = {
         "mode": "guarded_cycle",
         "maintenance_kill_switch": False,
-        "allowed_services": ["hermes-gateway.service"],
-        "trust_grants": [
-            {"gateway_unit": "hermes-gateway.service", "scope": "service_cycle", "max_cycles_per_day": 2}
-        ],
+        "allowed_services": [unit],
+        "trust_grants": [build_trust_grant(
+            unit,
+            host_id="test-host",
+            created_at=1000.0,
+            expires_at=9999999999.0,
+            provenance="pytest explicit grant",
+        )],
         "requested_action": "service_cycle",
-        "target_unit": "hermes-gateway.service",
+        "target_unit": unit,
         "attempt_budget": 1,
+        "host_id": "test-host",
     }
     config.update(overrides)
     return config
@@ -147,6 +154,58 @@ def test_service_cycle_allowlisted_but_no_trust_grant_blocks(tmp_path):
     assert report["safety_gates"]["trust_grant"] is False
 
 
+def test_service_cycle_expired_trust_grant_blocks(tmp_path):
+    grant = build_trust_grant(
+        "hermes-gateway.service",
+        host_id="test-host",
+        created_at=1000.0,
+        expires_at=1500.0,
+        provenance="expired grant",
+    )
+    path = _write_config(tmp_path, _guarded_config(trust_grants=[grant]))
+    report = evaluate_runner(load_runner_config(path), now=2000.0)
+
+    assert report["status"] == "BLOCK"
+    assert report["reason"] == "no_trust_grant"
+    assert report["safety_gates"]["trust_grant"] is False
+
+
+def test_service_cycle_host_mismatch_trust_grant_blocks(tmp_path):
+    grant = build_trust_grant(
+        "hermes-gateway.service",
+        host_id="other-host",
+        created_at=1000.0,
+        expires_at=9999999999.0,
+        provenance="copied grant",
+    )
+    path = _write_config(tmp_path, _guarded_config(trust_grants=[grant]))
+    report = evaluate_runner(load_runner_config(path), now=2000.0)
+
+    assert report["status"] == "BLOCK"
+    assert report["reason"] == "no_trust_grant"
+
+
+def test_service_cycle_allowlist_mismatch_blocks_even_with_grant(tmp_path):
+    path = _write_config(tmp_path, _guarded_config(allowed_services=["other.service"]))
+    report = evaluate_runner(load_runner_config(path), now=2000.0)
+
+    assert report["status"] == "BLOCK"
+    assert report["reason"] == "service_not_allowlisted"
+
+
+def test_malformed_trust_grants_fail_closed_sanitized(tmp_path):
+    path = _write_config(tmp_path, _guarded_config(
+        trust_grants={"gateway_unit": "/home/alice/private TOKEN=abc123"},
+    ))
+    report = evaluate_runner(load_runner_config(path), now=2000.0)
+
+    assert report["status"] == "BLOCK"
+    assert report["reason"] == "malformed_trust_grants"
+    blob = json.dumps(report)
+    assert "/home/alice" not in blob
+    assert "TOKEN=abc123" not in blob
+
+
 def test_service_cycle_mode_not_guarded_blocks(tmp_path):
     path = _write_config(tmp_path, _guarded_config(mode="request_only"))
     report = evaluate_runner(load_runner_config(path))
@@ -165,6 +224,17 @@ def test_fully_granted_service_cycle_is_proposal_only_without_executor(tmp_path)
     assert report["actions"]["executed"] == []
     assert report["actions"]["proposed"][0]["kind"] == "service_restart"
     assert report["service_action"]["attempts"] == 0
+
+
+def test_runner_consumes_valid_m12_grant_but_stays_dry_run_without_executor(tmp_path):
+    path = _write_config(tmp_path, _guarded_config(allow_fake_execute=True))
+    report = evaluate_runner(load_runner_config(path), now=2000.0)
+
+    assert report["status"] == "GO"
+    assert report["reason"] == "eligible_proposal"
+    assert report["dry_run"] is True
+    assert report["actions"]["executed"] == []
+    assert report["safety_gates"]["trust_grant"] is True
 
 
 def test_fully_granted_with_executor_but_flag_off_is_proposal_only(tmp_path):

@@ -13,6 +13,7 @@ from .live.sanitize import short_text
 from .loop_cli import add_loop_cli_args, run_loop_evaluate
 from .maintenance.installer import install_runner, render_install_plan
 from .maintenance.runner import run_runner_evaluate
+from .maintenance.trust import create_trust_grant, inspect_trust_grants, revoke_trust_grant
 from .maintenance.units import UnitRenderError
 from .store import AgentFlowStore, render_dispatch_prompt
 
@@ -131,6 +132,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     maintenance_render = maintenance_sub.add_parser("render-units")
     maintenance_render.add_argument("--config-file", required=True)
     maintenance_render.add_argument("--unit-dir", default="")
+
+    trust_grant = maintenance_sub.add_parser("trust-grant")
+    trust_grant.add_argument("--config-file", required=True)
+    trust_grant.add_argument("--gateway", required=True)
+    trust_grant.add_argument("--expires-at", required=True)
+    trust_grant.add_argument("--comment", default="operator CLI trust grant")
+    trust_grant.add_argument("--write", action="store_true", default=False)
+
+    trust_inspect = maintenance_sub.add_parser("trust-inspect")
+    trust_inspect.add_argument("--config-file", required=True)
+
+    trust_revoke = maintenance_sub.add_parser("trust-revoke")
+    trust_revoke.add_argument("--config-file", required=True)
+    trust_revoke.add_argument("--gateway", required=True)
+    trust_revoke.add_argument("--write", action="store_true", default=False)
 
     bridge_kanban = bridge_sub.add_parser("kanban")
     bridge_kanban_sub = bridge_kanban.add_subparsers(dest="bridge_kanban_cmd", required=True)
@@ -369,6 +385,24 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 2
         print(_dump(plan))
         return 0
+    if args.cmd == "maintenance" and args.maintenance_cmd == "trust-grant":
+        result = create_trust_grant(
+            args.config_file,
+            gateway_unit=args.gateway,
+            expires_at=args.expires_at,
+            provenance=args.comment,
+            write=args.write,
+        )
+        print(_dump(result))
+        return 0 if result.get("success") else 2
+    if args.cmd == "maintenance" and args.maintenance_cmd == "trust-inspect":
+        result = inspect_trust_grants(args.config_file)
+        print(_dump(result))
+        return 0 if result.get("success") else 2
+    if args.cmd == "maintenance" and args.maintenance_cmd == "trust-revoke":
+        result = revoke_trust_grant(args.config_file, gateway_unit=args.gateway, write=args.write)
+        print(_dump(result))
+        return 0 if result.get("success") else 2
     if args.cmd == "maintenance" and args.maintenance_cmd == "install-runner":
         try:
             result = install_runner(

@@ -41,6 +41,11 @@ from agentflow_hermes.loop_supervisor import (
     evaluate_loop_event,
 )
 from agentflow_hermes.maintenance.policy import MaintenancePolicy, load_maintenance_policy
+from agentflow_hermes.maintenance.trust import (
+    host_binding,
+    is_valid_service_cycle_grant,
+    validate_trust_grants_shape,
+)
 
 # Absolute ceiling on service-action attempts, independent of any config value.
 # Proves the runner can never storm real services even if a config asks for it.
@@ -99,6 +104,8 @@ class RunnerConfig:
     kill_switch: bool = False
     allowed_services: tuple[str, ...] = ()
     trust_grants: tuple[dict[str, Any], ...] = ()
+    trust_grants_malformed: bool = False
+    host_id: str = ""
     requested_action: str = "observe"
     target_unit: str = ""
     attempt_budget: int = 1
@@ -118,19 +125,10 @@ def _read_json(path: str) -> dict[str, Any] | None:
 
 
 def _valid_grants(raw: Any) -> tuple[dict[str, Any], ...]:
-    """Keep only well-formed trust grants; malformed entries are dropped."""
+    """Keep dict grant records; exact M12 validation happens at evaluation time."""
     if not isinstance(raw, list):
         return ()
-    grants: list[dict[str, Any]] = []
-    for entry in raw:
-        if not isinstance(entry, dict):
-            continue
-        unit = entry.get("gateway_unit")
-        scope = entry.get("scope")
-        if not isinstance(unit, str) or not isinstance(scope, str):
-            continue
-        grants.append({"gateway_unit": short_text(unit), "scope": short_text(scope)})
-    return tuple(grants)
+    return tuple(entry for entry in raw if isinstance(entry, dict))
 
 
 def _strict_budget(value: Any) -> int:
@@ -165,6 +163,8 @@ def load_runner_config(path: str) -> RunnerConfig:
         kill_switch=policy.maintenance_kill_switch,
         allowed_services=policy.allowed_services,
         trust_grants=_valid_grants(raw.get("trust_grants")),
+        trust_grants_malformed=not validate_trust_grants_shape(raw.get("trust_grants", [])),
+        host_id=short_text(raw.get("host_id") or host_binding(path)),
         requested_action=requested_action,
         target_unit=target_unit,
         attempt_budget=_strict_budget(raw.get("attempt_budget", 1)),
@@ -174,9 +174,15 @@ def load_runner_config(path: str) -> RunnerConfig:
     )
 
 
-def _has_service_cycle_grant(config: RunnerConfig) -> bool:
+def _has_service_cycle_grant(config: RunnerConfig, *, now: float) -> bool:
     for grant in config.trust_grants:
-        if grant.get("gateway_unit") == config.target_unit and grant.get("scope") == "service_cycle":
+        if is_valid_service_cycle_grant(
+            grant,
+            target_unit=config.target_unit,
+            allowed_services=config.allowed_services,
+            host_id=config.host_id,
+            now=now,
+        ):
             return True
     return False
 
@@ -267,7 +273,7 @@ def evaluate_runner(config: RunnerConfig, *, executor: ServiceExecutor | None = 
         "kill_switch_clear": not config.kill_switch,
         "mode_guarded_cycle": config.mode == "guarded_cycle",
         "service_allowlisted": bool(config.target_unit) and config.target_unit in config.allowed_services,
-        "trust_grant": _has_service_cycle_grant(config),
+        "trust_grant": _has_service_cycle_grant(config, now=now),
         "fake_executor_only": True,
     }
 
@@ -289,6 +295,10 @@ def evaluate_runner(config: RunnerConfig, *, executor: ServiceExecutor | None = 
     if config.error:
         gates["kill_switch_clear"] = False
         return block("malformed_config")
+
+    if config.trust_grants_malformed:
+        gates["trust_grant"] = False
+        return block("malformed_trust_grants")
 
     # 1. Kill switch first.
     if config.kill_switch:
