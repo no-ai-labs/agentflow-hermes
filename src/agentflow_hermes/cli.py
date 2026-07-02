@@ -11,6 +11,7 @@ from .live.gateway import FakeGateway
 from .live.policy import LivePolicy, load_policy, policy_path, save_policy
 from .live.sanitize import short_text
 from .loop_cli import add_loop_cli_args, run_loop_evaluate
+from .maintenance.runner import run_runner_evaluate
 from .store import AgentFlowStore, render_dispatch_prompt
 
 
@@ -109,6 +110,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     loop_sub = loop.add_subparsers(dest="loop_cmd", required=True)
     loop_evaluate = loop_sub.add_parser("evaluate")
     add_loop_cli_args(loop_evaluate)
+
+    # M10 external maintenance runner (proposal/dry-run only from the CLI).
+    maintenance = sub.add_parser("maintenance")
+    maintenance_sub = maintenance.add_subparsers(dest="maintenance_cmd", required=True)
+    maintenance_runner = maintenance_sub.add_parser("runner")
+    maintenance_runner_sub = maintenance_runner.add_subparsers(dest="maintenance_runner_cmd", required=True)
+    runner_evaluate = maintenance_runner_sub.add_parser("evaluate")
+    runner_evaluate.add_argument("--input-file", required=True, help="JSON runner policy/config fixture")
 
     bridge_kanban = bridge_sub.add_parser("kanban")
     bridge_kanban_sub = bridge_kanban.add_subparsers(dest="bridge_kanban_cmd", required=True)
@@ -333,6 +342,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if args.cmd == "loop" and args.loop_cmd == "evaluate":
         rc, report = run_loop_evaluate(args)
+        print(_dump(report))
+        return rc
+    if args.cmd == "maintenance" and args.maintenance_cmd == "runner" and args.maintenance_runner_cmd == "evaluate":
+        rc, report = run_runner_evaluate(args)
         print(_dump(report))
         return rc
     if args.cmd == "bridge" and args.bridge_cmd == "kanban":

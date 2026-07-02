@@ -305,6 +305,33 @@ gateway cannot kill the runner mid-cycle. Flow:
    for an operator. All fallback records are refs/short-reasons only — no raw logs,
    secrets, or absolute private paths.
 
+### 5.1 M10 MVP implementation status (this slice)
+
+`maintenance/runner.py` implements only the **safe dry-run/proposal** subset of
+the flow above. What ships in this slice:
+
+- Observe / request-only by **default**; the runner can invoke the MP4c
+  request-only loop evaluation over an embedded fixture (no adapter → never
+  applies) and surface the loop decision summary in its report.
+- Fail-closed service-cycle gate order — kill switch → `guarded_cycle` mode →
+  exact service allowlist → valid `service_cycle` trust grant for the exact unit;
+  a malformed/missing allowlist blocks the path. Any miss → `BLOCK` refusal with
+  no executed action.
+- A machine-readable, sanitized report (`status` GO/BLOCK/NEED_MORE/noop,
+  proposed vs executed actions with **executed empty by default**, loop decision
+  summary, safety gates, policy refs, idempotency key) with no raw path/secret
+  persistence.
+
+Explicitly **not** in this slice: there is **no real `systemctl`/service
+restart, no gateway restart, no live send/active wake, and no board rewrite.**
+The real privileged executor is a stub (`UnavailableSystemctlExecutor`) that
+raises if reached and is never wired into the default path. Only an explicitly
+injected `FakeServiceExecutor` (tests/canary) combined with an explicit config
+`allow_fake_execute` flag ever produces an executed action, and even then it is a
+fake bounded by `HARD_ATTEMPT_CAP`. **The gateway still cannot `systemctl` or
+restart itself; production service restart is not supported by this MVP** — the
+runner remains external to the gateway process/cgroup.
+
 ## 6. The only permitted mutations, and where they live
 
 | Mutation | Who | Precondition | Constraint |
