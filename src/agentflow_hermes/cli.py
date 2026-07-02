@@ -11,7 +11,9 @@ from .live.gateway import FakeGateway
 from .live.policy import LivePolicy, load_policy, policy_path, save_policy
 from .live.sanitize import short_text
 from .loop_cli import add_loop_cli_args, run_loop_evaluate
+from .maintenance.installer import install_runner, render_install_plan
 from .maintenance.runner import run_runner_evaluate
+from .maintenance.units import UnitRenderError
 from .store import AgentFlowStore, render_dispatch_prompt
 
 
@@ -118,6 +120,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     maintenance_runner_sub = maintenance_runner.add_subparsers(dest="maintenance_runner_cmd", required=True)
     runner_evaluate = maintenance_runner_sub.add_parser("evaluate")
     runner_evaluate.add_argument("--input-file", required=True, help="JSON runner policy/config fixture")
+
+    # M11 installer UX: render/print (default) or write to an explicit dir.
+    # Never calls systemctl; never writes outside --unit-dir.
+    maintenance_install = maintenance_sub.add_parser("install-runner")
+    maintenance_install.add_argument("--config-file", required=True)
+    maintenance_install.add_argument("--unit-dir", default="")
+    maintenance_install.add_argument("--write-files", action="store_true", default=False)
+
+    maintenance_render = maintenance_sub.add_parser("render-units")
+    maintenance_render.add_argument("--config-file", required=True)
+    maintenance_render.add_argument("--unit-dir", default="")
 
     bridge_kanban = bridge_sub.add_parser("kanban")
     bridge_kanban_sub = bridge_kanban.add_subparsers(dest="bridge_kanban_cmd", required=True)
@@ -348,6 +361,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         rc, report = run_runner_evaluate(args)
         print(_dump(report))
         return rc
+    if args.cmd == "maintenance" and args.maintenance_cmd == "render-units":
+        try:
+            plan = render_install_plan(args.config_file)
+        except UnitRenderError as exc:
+            print(_dump({"success": False, "error": str(exc)}))
+            return 2
+        print(_dump(plan))
+        return 0
+    if args.cmd == "maintenance" and args.maintenance_cmd == "install-runner":
+        try:
+            result = install_runner(
+                args.config_file,
+                unit_dir=args.unit_dir or None,
+                write_files=args.write_files,
+            )
+        except UnitRenderError as exc:
+            print(_dump({"success": False, "error": str(exc)}))
+            return 2
+        print(_dump(result))
+        return 0
     if args.cmd == "bridge" and args.bridge_cmd == "kanban":
         if args.bridge_kanban_cmd == "resolve-blocked":
             fixture = load_fixture(args.input_file)
