@@ -266,6 +266,171 @@ def test_loop_apply_mode_inherits_graph_creator_failed_adapter_attempt_budget():
     assert all(c.get("action") == "noop" for c in capped)
 
 
+def test_loop_supersession_not_allowlisted_escalates_no_adapter_call():
+    """stale_final_fanin not in allowlist → escalate, no final-v2 candidate, no adapter call."""
+    policy_no_fanin = LoopPolicy(
+        active_mode="request_only",
+        allowlisted_blockers=("stale_inline_route",),  # stale_final_fanin NOT allowlisted
+        expected_origin="discord:#hermes-main",
+        expected_return_to="discord:#hermes-main",
+    )
+    ledger = InMemoryLoopLedger()
+    adapter = FakeKanbanGraphAdapter()
+    event = _event(
+        event_id="evt-sup-nope",
+        event_type="remediation_review_go",
+        source_graph_id="graph-sup-nope",
+        source_final_id="t_final_v1",
+        remediation_review_id="t_review_go",
+        old_final_card={"id": "t_final_v1", "status": "blocked"},
+        remediation_review_card={"id": "t_review_go", "body": "Verdict: GO — remediation passed."},
+    )
+    decision = evaluate_loop_event(event, ledger, policy_no_fanin, adapter=adapter)
+
+    assert decision.action == "escalate"
+    assert decision.reason == "blocker_not_allowlisted"
+    assert decision.candidate is None
+    assert decision.candidates == ()
+    assert len(adapter.create_calls) == 0
+
+
+def test_loop_ledger_derived_max_rounds_blocks_low_event_round_no():
+    """Ledger showing max round >= policy cap must block even if caller provides low/zero round_no."""
+    policy = LoopPolicy(
+        active_mode="request_only",
+        allowlisted_blockers=("stale_inline_route",),
+        expected_origin="discord:#hermes-main",
+        expected_return_to="discord:#hermes-main",
+        max_rounds=1,
+    )
+    # Preload ledger with a receipt that records round_no=1 for the same graph
+    ledger = InMemoryLoopLedger(receipts=[{
+        "event_id": "evt-prev",
+        "source_graph_id": "graph-1",
+        "source_task_id": "",
+        "source_final_id": "",
+        "blocker_class": "stale_inline_route",
+        "round_no": 1,
+        "same_blocker_count": 0,
+        "final_vn": 1,
+        "decision": "propose",
+        "idempotency_key": "loop:propose:graph-1:evt-prev",
+        "policy_resolution_ref": "",
+        "origin_ref": "",
+        "return_to_ref": "",
+        "subscription_status": "verified",
+        "reason": "bounded_remediation",
+        "created_at": 100.0,
+        "mode": "request_only",
+    }])
+    # Caller supplies low round_no=0 — without ledger-derived check this would bypass the cap
+    decision = evaluate_loop_event(
+        _event(event_id="evt-bypass", verdict="BLOCK", summary="Verdict: BLOCK — stale_inline_route", blocker_class="stale_inline_route", round_no=0),
+        ledger,
+        policy,
+    )
+
+    assert decision.action == "escalate"
+    assert decision.reason == "max_rounds"
+    assert decision.metadata.get("ledger_round_no") == 1
+    assert decision.metadata.get("effective_round_no") == 1
+
+
+def test_loop_ledger_derived_rounds_advance_when_event_round_no_omitted():
+    policy = LoopPolicy(
+        active_mode="request_only",
+        allowlisted_blockers=("stale_inline_route", "missing_subscription"),
+        expected_origin="discord:#hermes-main",
+        expected_return_to="discord:#hermes-main",
+        max_rounds=2,
+        max_same_blocker=3,
+        cooldown_seconds=0,
+    )
+    ledger = InMemoryLoopLedger()
+    first = evaluate_loop_event(
+        _event(event_id="evt-round-a", verdict="BLOCK", summary="Verdict: BLOCK — stale_inline_route", blocker_class="stale_inline_route"),
+        ledger,
+        policy,
+    )
+    second = evaluate_loop_event(
+        _event(event_id="evt-round-b", verdict="BLOCK", summary="Verdict: BLOCK — missing_subscription", blocker_class="missing_subscription"),
+        ledger,
+        policy,
+    )
+    third = evaluate_loop_event(
+        _event(event_id="evt-round-c", verdict="BLOCK", summary="Verdict: BLOCK — missing_subscription", blocker_class="missing_subscription"),
+        ledger,
+        policy,
+    )
+
+    assert first.action == "propose"
+    assert first.receipt["round_no"] == 1
+    assert second.action == "propose"
+    assert second.receipt["round_no"] == 2
+    assert third.action == "escalate"
+    assert third.reason == "max_rounds"
+
+
+def test_loop_supersession_requires_concrete_old_final_and_review_provenance():
+    adapter = FakeKanbanGraphAdapter()
+    decision = evaluate_loop_event(
+        _event(
+            event_id="evt-sup-missing-provenance",
+            event_type="remediation_review_go",
+            source_graph_id="graph-sup-missing-provenance",
+            source_final_id="",
+            remediation_review_id="",
+            old_final_card=None,
+            remediation_review_card=None,
+            summary="Verdict: GO — remediation passed.",
+        ),
+        InMemoryLoopLedger(),
+        SAFE_POLICY,
+        adapter=adapter,
+    )
+
+    assert decision.action == "escalate"
+    assert decision.reason == "supersession_provenance_missing"
+    assert decision.candidate is None
+    assert len(adapter.create_calls) == 0
+
+
+def test_loop_request_only_never_calls_adapter_apply_path():
+    """request_only mode must never invoke adapter apply/create regardless of event type."""
+    adapter = FakeKanbanGraphAdapter()
+
+    # Block path: propose must not call adapter
+    decision_block = evaluate_loop_event(
+        _event(verdict="BLOCK", summary="Verdict: BLOCK — stale_inline_route", blocker_class="stale_inline_route"),
+        InMemoryLoopLedger(),
+        SAFE_POLICY,
+        adapter=adapter,
+    )
+    assert decision_block.action == "propose"
+    assert decision_block.mutations == ()
+    assert len(adapter.create_calls) == 0
+
+    # Supersession path: supersede in request_only must not mutate or call adapter
+    ledger = InMemoryLoopLedger()
+    decision_sup = evaluate_loop_event(
+        _event(
+            event_id="evt-sup-ro",
+            event_type="remediation_review_go",
+            source_graph_id="graph-sup-ro",
+            source_final_id="t_final_v1",
+            remediation_review_id="t_review_ro",
+            old_final_card={"id": "t_final_v1", "status": "blocked"},
+            remediation_review_card={"id": "t_review_ro", "body": "Verdict: GO"},
+        ),
+        ledger,
+        SAFE_POLICY,  # request_only
+        adapter=adapter,
+    )
+    assert decision_sup.action == "supersede"
+    assert decision_sup.mutations == ()
+    assert len(adapter.create_calls) == 0
+
+
 def test_loop_decision_receipts_do_not_persist_private_paths_or_secrets():
     ledger = InMemoryLoopLedger()
     decision = evaluate_loop_event(

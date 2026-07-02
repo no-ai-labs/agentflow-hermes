@@ -199,6 +199,8 @@ def evaluate_loop_event(
     ev = _coerce_event(event)
     effective_policy, malformed = _coerce_policy(policy)
     now = float(ev.occurred_at or time.time())
+    # MP4a: adapter calls must be impossible unless active_mode is "apply"
+    effective_adapter = adapter if effective_policy.active_mode == "apply" else None
 
     if ledger.has_event(ev.event_id):
         prior = ledger.decision_for_event(ev.event_id) or {}
@@ -214,7 +216,7 @@ def evaluate_loop_event(
         return _record(ledger, _decision(ev, "escalate", "foreign_origin", effective_policy, now), ev)
 
     if ev.event_type in {"remediation_review_go", "stale_final_block"} or (ev.old_final_card and ev.remediation_review_card):
-        return _evaluate_supersession(ev, ledger, effective_policy, now, adapter=adapter)
+        return _evaluate_supersession(ev, ledger, effective_policy, now, adapter=effective_adapter)
 
     parsed = parse_verdict_summary(ev.summary, source_ref=ev.source_task_id or ev.source_graph_id)
     verdict = (ev.verdict or parsed.verdict or "UNKNOWN").upper()
@@ -234,8 +236,14 @@ def evaluate_loop_event(
         return _record(ledger, _decision(ev, "escalate", "policy_resolution_missing", effective_policy, now, verdict=verdict, blocker=blocker), ev)
     if effective_policy.require_subscription_verified and ev.subscription_status != "verified":
         return _record(ledger, _decision(ev, "escalate", "subscription_unverified", effective_policy, now, verdict=verdict, blocker=blocker), ev)
-    if ev.round_no >= effective_policy.max_rounds:
-        return _record(ledger, _decision(ev, "escalate", "max_rounds", effective_policy, now, verdict=verdict, blocker=blocker), ev)
+    ledger_max_round = ledger.max_round_for_graph(ev.source_graph_id)
+    effective_round = max(ev.round_no, ledger_max_round)
+    if effective_round >= effective_policy.max_rounds:
+        return _record(
+            ledger,
+            _decision(ev, "escalate", "max_rounds", effective_policy, now, verdict=verdict, blocker=blocker, metadata={"ledger_round_no": ledger_max_round, "effective_round_no": effective_round}),
+            ev,
+        )
     if ledger.count_blocker(ev.source_graph_id, blocker) >= effective_policy.max_same_blocker:
         return _record(ledger, _decision(ev, "escalate", "max_same_blocker", effective_policy, now, verdict=verdict, blocker=blocker), ev)
 
@@ -268,7 +276,7 @@ def evaluate_loop_event(
         origin=ev.origin,
         return_to=ev.return_to,
         policy=graph_policy,
-        adapter=adapter if effective_policy.active_mode == "apply" else None,
+        adapter=effective_adapter,
     )
     action = "apply" if effective_policy.active_mode == "apply" else "propose"
     return _record(
@@ -283,17 +291,30 @@ def evaluate_loop_event(
             blocker=blocker,
             candidates=tuple(result.get("candidates") or ()),
             mutations=tuple(result.get("mutations") or ()),
-            metadata={"graph_creator_result": _safe_creator_result(result)},
+            metadata={
+                "graph_creator_result": _safe_creator_result(result),
+                "ledger_round_no": ledger_max_round,
+                "effective_round_no": effective_round,
+                "receipt_round_no": effective_round + 1,
+            },
         ),
         ev,
     )
 
 
 def _evaluate_supersession(ev: LoopEvent, ledger: LoopLedger, policy: LoopPolicy, now: float, *, adapter: Any) -> LoopDecision:
+    # Fail-closed: stale_final_fanin must be explicitly allowlisted before any candidate resolution
+    if "stale_final_fanin" not in policy.allowlisted_blockers:
+        return _record(ledger, _decision(ev, "escalate", "blocker_not_allowlisted", policy, now, blocker="stale_final_fanin"), ev)
+    # Provenance gates before resolve_stale_final_candidate
+    if not _origin_ok(ev, policy):
+        return _record(ledger, _decision(ev, "escalate", "foreign_origin", policy, now, blocker="stale_final_fanin"), ev)
     if policy.require_policy_resolution and not ev.policy_resolution_ref:
-        return _record(ledger, _decision(ev, "escalate", "policy_resolution_missing", policy, now), ev)
+        return _record(ledger, _decision(ev, "escalate", "policy_resolution_missing", policy, now, blocker="stale_final_fanin"), ev)
     if policy.require_subscription_verified and ev.subscription_status != "verified":
         return _record(ledger, _decision(ev, "escalate", "subscription_unverified", policy, now, blocker="stale_final_fanin"), ev)
+    if not _supersession_provenance_ok(ev):
+        return _record(ledger, _decision(ev, "escalate", "supersession_provenance_missing", policy, now, blocker="stale_final_fanin"), ev)
     key = _final_supersession_key(ev)
     if ledger.has_idempotency_key(key):
         return _record(ledger, _decision(ev, "noop", "existing_supersession", policy, now, idempotency_key=key, blocker="stale_final_fanin"), ev)
@@ -321,6 +342,13 @@ def _evaluate_supersession(ev: LoopEvent, ledger: LoopLedger, policy: LoopPolicy
         ),
         ev,
     )
+
+
+def _supersession_provenance_ok(event: LoopEvent) -> bool:
+    """Require concrete old-final and remediation-review provenance before final-vN proposals."""
+    old_final_id = event.source_final_id or str((event.old_final_card or {}).get("id") or "")
+    review_id = event.remediation_review_id or str((event.remediation_review_card or {}).get("id") or "")
+    return bool(_safe_ref(old_final_id, field="source_final_id") and _safe_ref(review_id, field="remediation_review_id"))
 
 
 def _coerce_event(event: LoopEvent | dict[str, Any]) -> LoopEvent:
@@ -412,13 +440,14 @@ def _decision(
     key = idempotency_key or f"loop:{action}:{safe_graph}:{safe_event}"
     key = _safe_ref(key, field="idempotency_key")
     final_vn = int((metadata or {}).get("final_vn") or 1)
+    receipt_round_no = int((metadata or {}).get("receipt_round_no", event.round_no) or 0)
     receipt = safe_event_payload({
         "event_id": safe_event,
         "source_task_id": _safe_ref(event.source_task_id, field="source_task_id"),
         "source_graph_id": safe_graph,
         "source_final_id": _safe_ref(event.source_final_id, field="source_final_id"),
         "blocker_class": blocker,
-        "round_no": event.round_no,
+        "round_no": receipt_round_no,
         "same_blocker_count": 0,
         "final_vn": final_vn,
         "decision": action,
