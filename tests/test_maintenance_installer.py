@@ -122,6 +122,62 @@ def test_malformed_unit_dir_fails_closed_sanitized(tmp_path):
         install_runner(str(config_path), unit_dir="relative/units", write_files=True)
 
 
+def test_install_runner_unsafe_config_path_creates_no_files(tmp_path):
+    # Absolute path but containing a newline/control char: must fail closed with
+    # a sanitized error and leave no config/unit/timer file side effects.
+    unsafe_config = str(tmp_path / "bad\nname.json")
+    unit_dir = tmp_path / "units"
+
+    with pytest.raises(UnitRenderError) as excinfo:
+        install_runner(unsafe_config, unit_dir=str(unit_dir), write_files=True)
+
+    # Sanitized: the raw unsafe path/control chars must not leak into the message.
+    assert "bad" not in str(excinfo.value)
+    assert "\n" not in str(excinfo.value)
+    # No default config, no unit dir, no unit/timer files were written.
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_cli_install_runner_unsafe_config_path_fails_closed_no_side_effects(tmp_path):
+    unsafe_config = str(tmp_path / "bad\nname.json")
+    unit_dir = tmp_path / "units"
+
+    captured = io.StringIO()
+    with redirect_stdout(captured):
+        rc = cli_main([
+            "maintenance", "install-runner",
+            "--config-file", unsafe_config,
+            "--unit-dir", str(unit_dir),
+            "--write-files",
+        ])
+    data = json.loads(captured.getvalue())
+
+    assert rc == 2
+    assert data["success"] is False
+    assert "\n" not in data["error"]
+    assert "bad" not in data["error"]
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_install_runner_valid_path_writes_default_config_and_units(tmp_path):
+    config_path = tmp_path / "maintenance.json"
+    unit_dir = tmp_path / "units"
+
+    result = install_runner(str(config_path), unit_dir=str(unit_dir), write_files=True)
+
+    # Default request_only config written to the explicit config path.
+    assert config_path.exists()
+    loaded = json.loads(config_path.read_text(encoding="utf-8"))
+    assert loaded == default_maintenance_config()
+    assert loaded["mode"] == "request_only"
+
+    # Unit/timer/slice files written to the explicit unit dir.
+    assert result["wrote_files"] is True
+    assert (unit_dir / RUNNER_SERVICE_NAME).exists()
+    assert (unit_dir / RUNNER_TIMER_NAME).exists()
+    assert (unit_dir / SLICE_NAME).exists()
+
+
 # CLI integration
 
 

@@ -18,6 +18,7 @@ from agentflow_hermes.maintenance.units import (
     SLICE_NAME,
     UnitRenderError,
     render_runner_units,
+    validate_config_path,
 )
 
 
@@ -79,7 +80,10 @@ def install_runner(
     not yet exist, a safe default request_only config is written there first;
     an existing operator config is never overwritten.
     """
-    config_path = _validate_absolute(config_file, label="config file")
+    # Apply the same whitespace/control-char + absolute checks as unit rendering
+    # BEFORE any filesystem write, so a malformed path can never leave a stray
+    # default-config or unit/timer file behind.
+    config_path = validate_config_path(config_file)
     if not config_path.exists():
         config_path.parent.mkdir(parents=True, exist_ok=True)
         config_path.write_text(json.dumps(default_maintenance_config(), indent=2), encoding="utf-8")

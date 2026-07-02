@@ -31,14 +31,24 @@ class UnitRenderError(ValueError):
     """A unit could not be safely rendered; caller must fail closed."""
 
 
-def _validate_config_path(config_path: Path | str) -> Path:
+def validate_config_path(config_path: Path | str) -> Path:
+    """Validate a config path: no unsafe whitespace/control chars, absolute only.
+
+    Failures raise :class:`UnitRenderError` with a sanitized message that never
+    echoes the raw (potentially malformed) path, so callers can safely fail
+    closed before touching the filesystem.
+    """
     text = str(config_path)
     if _UNSAFE_CHARS_RE.search(text):
         raise UnitRenderError("config path contains unsafe whitespace/control characters")
     path = Path(text)
     if not path.is_absolute():
-        raise UnitRenderError(f"config path must be absolute: {config_path!r}")
+        raise UnitRenderError("config path must be absolute")
     return path
+
+
+# Backwards-compatible private alias for existing internal call sites.
+_validate_config_path = validate_config_path
 
 
 def _validate_exec_name(exec_name: str) -> str:
