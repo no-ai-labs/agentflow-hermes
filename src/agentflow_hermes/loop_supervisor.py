@@ -516,6 +516,40 @@ def _decision(
     )
 
 
+def build_loop_report(decision: LoopDecision) -> dict[str, Any]:
+    """Assemble a machine-readable, sanitized CLI report from a LoopDecision.
+
+    Pure function: no I/O, no adapter/ledger access. Safe to unit test directly.
+    """
+    payload = decision.as_dict()
+    metadata = payload.get("metadata") or {}
+    candidates = payload.get("candidates") or []
+    candidate = payload.get("candidate")
+    report = {
+        "success": True,
+        "action": payload.get("action", ""),
+        "verdict": payload.get("verdict", ""),
+        "reason": payload.get("reason", ""),
+        "dry_run": bool(metadata.get("dry_run", True)),
+        "applied": bool(metadata.get("applied", False)),
+        "noop_reason": metadata.get("noop_reason", ""),
+        "idempotency_key": payload.get("idempotency_key", ""),
+        "round_no_derived": metadata.get("round_no_derived", 0),
+        "adapter_attempts": metadata.get("adapter_attempts", 0),
+        "blocker_class": payload.get("blocker_class", ""),
+        "source_graph_id": payload.get("source_graph_id", ""),
+        "event_id": payload.get("event_id", ""),
+        "proposal": {
+            "candidate_count": len(candidates) if candidates else (1 if candidate else 0),
+            "candidates": candidates,
+            "candidate": candidate,
+        },
+        "mutations": payload.get("mutations", []),
+        "receipt": payload.get("receipt", {}),
+    }
+    return safe_event_payload(report)
+
+
 def _record(ledger: LoopLedger, decision: LoopDecision, event: LoopEvent) -> LoopDecision:
     ledger.record_decision(decision, event)
     return decision
