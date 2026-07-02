@@ -246,6 +246,7 @@ def test_loop_apply_mode_inherits_graph_creator_failed_adapter_attempt_budget():
     adapter = FailingAdapter()
     policy = LoopPolicy(
         active_mode="apply",
+        apply_enabled=True,
         allowlisted_blockers=("stale_inline_route",),
         expected_origin="discord:#hermes-main",
         expected_return_to="discord:#hermes-main",
@@ -266,12 +267,80 @@ def test_loop_apply_mode_inherits_graph_creator_failed_adapter_attempt_budget():
     assert all(c.get("action") == "noop" for c in capped)
 
 
+def test_loop_active_mode_apply_alone_without_apply_enabled_blocks_adapter():
+    """active_mode='apply' with the apply_enabled gate left at its False default must
+    not call the adapter or mutate anything."""
+    adapter = FakeKanbanGraphAdapter()
+    policy = LoopPolicy(
+        active_mode="apply",
+        allowlisted_blockers=("stale_inline_route",),
+        expected_origin="discord:#hermes-main",
+        expected_return_to="discord:#hermes-main",
+    )
+    decision = evaluate_loop_event(
+        _event(verdict="BLOCK", summary="Verdict: BLOCK — stale_inline_route old route", blocker_class="stale_inline_route"),
+        InMemoryLoopLedger(),
+        policy,
+        adapter=adapter,
+    )
+
+    assert decision.action == "escalate"
+    assert decision.reason == "apply_disabled_by_policy"
+    assert decision.mutations == ()
+    assert len(adapter.create_calls) == 0
+
+
+def test_loop_apply_enabled_false_explicit_blocks_adapter():
+    adapter = FakeKanbanGraphAdapter()
+    policy = LoopPolicy(
+        active_mode="apply",
+        apply_enabled=False,
+        allowlisted_blockers=("stale_inline_route",),
+        expected_origin="discord:#hermes-main",
+        expected_return_to="discord:#hermes-main",
+    )
+    decision = evaluate_loop_event(
+        _event(verdict="BLOCK", summary="Verdict: BLOCK — stale_inline_route old route", blocker_class="stale_inline_route"),
+        InMemoryLoopLedger(),
+        policy,
+        adapter=adapter,
+    )
+
+    assert decision.action == "escalate"
+    assert decision.reason == "apply_disabled_by_policy"
+    assert decision.mutations == ()
+    assert len(adapter.create_calls) == 0
+
+
+def test_loop_apply_enabled_malformed_non_bool_fails_closed_no_adapter_call():
+    adapter = FakeKanbanGraphAdapter()
+    policy = LoopPolicy(
+        active_mode="apply",
+        apply_enabled="true",  # type: ignore[arg-type]
+        allowlisted_blockers=("stale_inline_route",),
+        expected_origin="discord:#hermes-main",
+        expected_return_to="discord:#hermes-main",
+    )
+    decision = evaluate_loop_event(
+        _event(verdict="BLOCK", summary="Verdict: BLOCK — stale_inline_route old route", blocker_class="stale_inline_route"),
+        InMemoryLoopLedger(),
+        policy,
+        adapter=adapter,
+    )
+
+    assert decision.action == "escalate"
+    assert decision.reason == "malformed_policy"
+    assert decision.mutations == ()
+    assert len(adapter.create_calls) == 0
+
+
 def test_loop_apply_enabled_safe_blocker_fake_adapter_sees_bounded_records():
     """apply mode for an allowlisted safe blocker must produce exactly the bounded
     fix/review/final-vN task/link/subscription records on the fake adapter — no more."""
     adapter = FakeKanbanGraphAdapter()
     policy = LoopPolicy(
         active_mode="apply",
+        apply_enabled=True,
         allowlisted_blockers=("stale_inline_route",),
         expected_origin="discord:#hermes-main",
         expected_return_to="discord:#hermes-main",
@@ -301,6 +370,7 @@ def test_loop_apply_enabled_stale_final_fanin_allowlisted_provenance_applies_onc
     adapter = FakeKanbanGraphAdapter()
     policy = LoopPolicy(
         active_mode="apply",
+        apply_enabled=True,
         allowlisted_blockers=("stale_final_fanin",),
         expected_origin="discord:#hermes-main",
         expected_return_to="discord:#hermes-main",

@@ -15,6 +15,7 @@ _VALID_MODES = {"disabled", "observe_only", "request_only", "apply"}
 @dataclass(frozen=True)
 class LoopPolicy:
     active_mode: str = "request_only"  # disabled | observe_only | request_only | apply
+    apply_enabled: bool = False
     kill_switch: bool = False
     allowlisted_blockers: tuple[str, ...] = ()
     max_rounds: int = 2
@@ -199,8 +200,10 @@ def evaluate_loop_event(
     ev = _coerce_event(event)
     effective_policy, malformed = _coerce_policy(policy)
     now = float(ev.occurred_at or time.time())
-    # MP4a: adapter calls must be impossible unless active_mode is "apply"
-    effective_adapter = adapter if effective_policy.active_mode == "apply" else None
+    # MP4a/MP4b: adapter calls must be impossible unless active_mode is "apply" AND
+    # apply_enabled is explicitly True.
+    apply_gate_open = _apply_effectively_enabled(effective_policy)
+    effective_adapter = adapter if apply_gate_open else None
 
     if ledger.has_event(ev.event_id):
         prior = ledger.decision_for_event(ev.event_id) or {}
@@ -266,6 +269,8 @@ def evaluate_loop_event(
 
     if effective_policy.active_mode == "observe_only":
         return _record(ledger, _decision(ev, "noop", "observe_only", effective_policy, now, verdict=verdict, blocker=blocker), ev)
+    if effective_policy.active_mode == "apply" and not apply_gate_open:
+        return _record(ledger, _decision(ev, "escalate", "apply_disabled_by_policy", effective_policy, now, verdict=verdict, blocker=blocker), ev)
 
     creator = graph_creator or propose_remediation_graph
     graph_policy = _graph_policy(effective_policy, blocker)
@@ -278,7 +283,7 @@ def evaluate_loop_event(
         policy=graph_policy,
         adapter=effective_adapter,
     )
-    action = "apply" if effective_policy.active_mode == "apply" else "propose"
+    action = "apply" if apply_gate_open else "propose"
     return _record(
         ledger,
         _decision(
@@ -317,13 +322,15 @@ def _evaluate_supersession(ev: LoopEvent, ledger: LoopLedger, policy: LoopPolicy
         return _record(ledger, _decision(ev, "escalate", "subscription_unverified", policy, now, blocker="stale_final_fanin"), ev)
     if not _supersession_provenance_ok(ev):
         return _record(ledger, _decision(ev, "escalate", "supersession_provenance_missing", policy, now, blocker="stale_final_fanin"), ev)
+    if policy.active_mode == "apply" and not _apply_effectively_enabled(policy):
+        return _record(ledger, _decision(ev, "escalate", "apply_disabled_by_policy", policy, now, blocker="stale_final_fanin"), ev)
     key = _final_supersession_key(ev)
     if ledger.has_idempotency_key(key):
         return _record(ledger, _decision(ev, "noop", "existing_supersession", policy, now, idempotency_key=key, blocker="stale_final_fanin"), ev)
     old_final = ev.old_final_card or {"id": ev.source_final_id, "status": "blocked"}
     review = ev.remediation_review_card or {"id": ev.remediation_review_id, "body": ev.summary or "Verdict: GO"}
     graph_policy = _graph_policy(policy, "stale_final_fanin")
-    result = resolve_stale_final_candidate(old_final, review, origin=ev.origin, return_to=ev.return_to, policy=graph_policy, adapter=adapter if policy.active_mode == "apply" else None)
+    result = resolve_stale_final_candidate(old_final, review, origin=ev.origin, return_to=ev.return_to, policy=graph_policy, adapter=adapter if _apply_effectively_enabled(policy) else None)
     if not result.get("success"):
         return _record(ledger, _decision(ev, "escalate", str(result.get("error") or "supersession_failed"), policy, now, blocker="stale_final_fanin"), ev)
     final_vn = ledger.current_final_vn(ev.source_graph_id) + 1
@@ -377,6 +384,8 @@ def _coerce_policy(policy: LoopPolicy | None) -> tuple[LoopPolicy, bool]:
         return LoopPolicy(kill_switch=True), True
     if policy.active_mode not in _VALID_MODES:
         return LoopPolicy(kill_switch=True), True
+    if not isinstance(policy.apply_enabled, bool):
+        return LoopPolicy(kill_switch=True), True
     if not isinstance(policy.allowlisted_blockers, tuple) or not all(isinstance(b, str) for b in policy.allowlisted_blockers):
         return LoopPolicy(kill_switch=True), True
     numeric_values = (
@@ -403,9 +412,13 @@ def _origin_ok(event: LoopEvent, policy: LoopPolicy) -> bool:
     return True
 
 
+def _apply_effectively_enabled(policy: LoopPolicy) -> bool:
+    return policy.active_mode == "apply" and policy.apply_enabled is True
+
+
 def _graph_policy(policy: LoopPolicy, blocker: str) -> RemediationGraphPolicy:
     return RemediationGraphPolicy(
-        apply_enabled=policy.active_mode == "apply",
+        apply_enabled=_apply_effectively_enabled(policy),
         active_mode="apply" if policy.active_mode == "apply" else policy.active_mode,
         kill_switch=policy.kill_switch,
         allowlisted_blockers=(blocker,) if blocker in policy.allowlisted_blockers else (),
