@@ -206,6 +206,83 @@ def test_malformed_trust_grants_fail_closed_sanitized(tmp_path):
     assert "TOKEN=abc123" not in blob
 
 
+def test_mixed_valid_and_malformed_trust_grants_fail_closed(tmp_path):
+    valid_grant = build_trust_grant(
+        "hermes-gateway.service",
+        host_id="test-host",
+        created_at=1000.0,
+        expires_at=9999999999.0,
+        provenance="pytest explicit grant",
+    )
+    path = _write_config(tmp_path, _guarded_config(
+        trust_grants=[valid_grant, "/home/alice/private TOKEN=abc123"],
+        allow_fake_execute=True,
+    ))
+    report = evaluate_runner(load_runner_config(path), now=2000.0)
+
+    assert report["status"] == "BLOCK"
+    assert report["reason"] == "malformed_trust_grants"
+    assert report["actions"]["executed"] == []
+    assert report["dry_run"] is True
+    blob = json.dumps(report)
+    assert "/home/alice" not in blob
+    assert "TOKEN=abc123" not in blob
+
+
+def test_valid_trust_grant_only_still_yields_go_eligible_proposal(tmp_path):
+    path = _write_config(tmp_path, _guarded_config(allow_fake_execute=True))
+    report = evaluate_runner(load_runner_config(path), now=2000.0)
+
+    assert report["status"] == "GO"
+    assert report["reason"] == "eligible_proposal"
+    assert report["dry_run"] is True
+    assert report["actions"]["executed"] == []
+
+
+def test_malformed_trust_grant_only_blocks(tmp_path):
+    path = _write_config(tmp_path, _guarded_config(
+        trust_grants=["/home/alice/private TOKEN=abc123"],
+        allow_fake_execute=True,
+    ))
+    report = evaluate_runner(load_runner_config(path), now=2000.0)
+
+    assert report["status"] == "BLOCK"
+    assert report["reason"] == "malformed_trust_grants"
+    assert report["dry_run"] is True
+    assert report["actions"]["executed"] == []
+
+
+def test_mixed_valid_and_malformed_object_trust_grants_fail_closed_sanitized(tmp_path):
+    valid_grant = build_trust_grant(
+        "hermes-gateway.service",
+        host_id="test-host",
+        created_at=1000.0,
+        expires_at=9999999999.0,
+        provenance="pytest explicit grant",
+    )
+    malformed_grant = {
+        "grant_id": "grant_bad",
+        "gateway_unit": "/home/alice/private TOKEN=abc123",
+        "created_at": 1000.0,
+        "expires_at": 9999999999.0,
+        "allowed_services": ["hermes-gateway.service"],
+        "host_id": "test-host",
+    }
+    path = _write_config(tmp_path, _guarded_config(
+        trust_grants=[valid_grant, malformed_grant],
+        allow_fake_execute=True,
+    ))
+    report = evaluate_runner(load_runner_config(path), now=2000.0)
+
+    assert report["status"] == "BLOCK"
+    assert report["reason"] == "malformed_trust_grants"
+    assert report["dry_run"] is True
+    assert report["actions"]["executed"] == []
+    blob = json.dumps(report)
+    assert "/home/alice" not in blob
+    assert "TOKEN=abc123" not in blob
+
+
 def test_service_cycle_mode_not_guarded_blocks(tmp_path):
     path = _write_config(tmp_path, _guarded_config(mode="request_only"))
     report = evaluate_runner(load_runner_config(path))

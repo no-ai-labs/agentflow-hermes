@@ -277,8 +277,39 @@ def revoke_trust_grant(
     })
 
 
+def _is_trust_grant_record_shape(entry: Any) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    try:
+        _validate_unit(entry.get("gateway_unit"))
+        created = _strict_float(entry.get("created_at"), code="invalid_created_at")
+        expires = _strict_float(entry.get("expires_at"), code="invalid_expiry")
+    except TrustGrantError:
+        return False
+    if expires <= created:
+        return False
+    if not isinstance(entry.get("grant_id"), str):
+        return False
+    allowed = entry.get("allowed_services")
+    if not isinstance(allowed, list) or not all(isinstance(unit, str) for unit in allowed):
+        return False
+    if not isinstance(entry.get("host_id"), str):
+        return False
+    return True
+
+
 def validate_trust_grants_shape(raw: Any) -> bool:
-    return isinstance(raw, list)
+    """Validate the entire trust_grants collection shape.
+
+    Fail closed on any malformed entry: a single non-object or malformed grant
+    record must invalidate the whole collection, even if another record is a
+    valid grant for the requested service. Semantic grant eligibility (mode,
+    host binding, expiry relative to now, exact target) remains in
+    :func:`is_valid_service_cycle_grant`.
+    """
+    if not isinstance(raw, list):
+        return False
+    return all(_is_trust_grant_record_shape(entry) for entry in raw)
 
 
 def is_valid_service_cycle_grant(
