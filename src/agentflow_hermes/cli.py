@@ -136,7 +136,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     trust_grant = maintenance_sub.add_parser("trust-grant")
     trust_grant.add_argument("--config-file", required=True)
     trust_grant.add_argument("--gateway", required=True)
-    trust_grant.add_argument("--expires-at", required=True)
+    trust_grant.add_argument("--expires-at", required=True, type=float)
     trust_grant.add_argument("--comment", default="operator CLI trust grant")
     trust_grant.add_argument("--write", action="store_true", default=False)
 

@@ -7,6 +7,7 @@ file that the external runner later evaluates fail-closed.
 from __future__ import annotations
 
 import json
+import math
 import os
 import socket
 import time
@@ -59,12 +60,11 @@ def _validate_unit(unit: Any) -> str:
 
 
 def _strict_float(value: Any, *, code: str) -> float:
-    if isinstance(value, bool):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise TrustGrantError(code)
-    try:
-        parsed = float(value)
-    except (TypeError, ValueError) as exc:
-        raise TrustGrantError(code) from exc
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed < 0:
+        raise TrustGrantError(code)
     return parsed
 
 

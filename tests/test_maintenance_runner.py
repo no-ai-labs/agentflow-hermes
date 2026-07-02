@@ -399,6 +399,60 @@ def test_malformed_dict_entry_before_valid_grant_also_blocks(tmp_path):
     assert report["actions"]["executed"] == []
 
 
+def _nonfinite_timestamp_variants():
+    """Mixed valid + non-finite/wrong-typed created_at/expires_at must fail closed."""
+    variants = {}
+
+    nan_created_str = _valid_grant_dict()
+    nan_created_str["created_at"] = "nan"
+    variants["created_at_nan_string"] = nan_created_str
+
+    nan_created_float = _valid_grant_dict()
+    nan_created_float["created_at"] = float("nan")
+    variants["created_at_nan_float"] = nan_created_float
+
+    inf_expiry_str = _valid_grant_dict()
+    inf_expiry_str["expires_at"] = "inf"
+    variants["expires_at_inf_string"] = inf_expiry_str
+
+    inf_expiry_float = _valid_grant_dict()
+    inf_expiry_float["expires_at"] = float("inf")
+    variants["expires_at_inf_float"] = inf_expiry_float
+
+    neg_inf_expiry_float = _valid_grant_dict()
+    neg_inf_expiry_float["expires_at"] = float("-inf")
+    variants["expires_at_neg_inf_float"] = neg_inf_expiry_float
+
+    return variants
+
+
+@pytest.mark.parametrize("name,malformed", sorted(_nonfinite_timestamp_variants().items()))
+def test_mixed_valid_and_nonfinite_timestamp_fails_closed(tmp_path, name, malformed):
+    path = _write_config(tmp_path, _guarded_config(
+        trust_grants=[_valid_grant_dict(), malformed],
+        allow_fake_execute=True,
+    ), name=f"runner_{name}.json")
+    report = evaluate_runner(load_runner_config(path), now=2000.0)
+
+    assert report["status"] == "BLOCK", name
+    assert report["reason"] == "malformed_trust_grants", name
+    assert report["dry_run"] is True, name
+    assert report["actions"]["executed"] == [], name
+
+
+def test_valid_finite_timestamps_still_eligible_dry_run(tmp_path):
+    path = _write_config(tmp_path, _guarded_config(
+        trust_grants=[_valid_grant_dict()],
+        allow_fake_execute=True,
+    ))
+    report = evaluate_runner(load_runner_config(path), now=2000.0)
+
+    assert report["status"] == "GO"
+    assert report["reason"] == "eligible_proposal"
+    assert report["dry_run"] is True
+    assert report["actions"]["executed"] == []
+
+
 def test_service_cycle_mode_not_guarded_blocks(tmp_path):
     path = _write_config(tmp_path, _guarded_config(mode="request_only"))
     report = evaluate_runner(load_runner_config(path))
