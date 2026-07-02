@@ -26,12 +26,24 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any
 
 from agentflow_hermes.live.sanitize import (
     safe_durable_ref,
     safe_event_payload,
     short_text,
+)
+from agentflow_hermes.maintenance.adapter import (
+    ActionAdapter,
+    ActionReceipt,
+    ActionRequest,
+    ExecResult,
+    FakeActionAdapter,
+    FakeServiceExecutor,
+    LiveActionAdapter,
+    NoopActionAdapter,
+    ServiceExecutor,
+    UnavailableSystemctlExecutor,
 )
 from agentflow_hermes.loop_supervisor import (
     InMemoryLoopLedger,
@@ -52,50 +64,25 @@ from agentflow_hermes.maintenance.trust import (
 HARD_ATTEMPT_CAP = 3
 
 
-@dataclass(frozen=True)
-class ExecResult:
-    ok: bool
-    detail: str = ""
-
-
-class ServiceExecutor(Protocol):
-    """Boundary that would perform a real ``systemctl --user`` restart.
-
-    In the MVP only :class:`FakeServiceExecutor` is ever injected (tests/canary);
-    the real path is intentionally unbuilt and unreachable by default.
-    """
-
-    def restart_unit(self, unit: str) -> ExecResult: ...
-
-
-class UnavailableSystemctlExecutor:
-    """Stub standing in for the real privileged executor.
-
-    Deliberately not implemented in this MVP: it must never be reachable by the
-    default code path. Calling it raises so a misconfiguration fails loudly
-    instead of silently touching a real service.
-    """
-
-    def restart_unit(self, unit: str) -> ExecResult:  # pragma: no cover - guard
-        raise RuntimeError(
-            "real systemctl executor is not available in the M10 runner MVP; "
-            "production service restart is not supported"
-        )
-
-
-class FakeServiceExecutor:
-    """Test/canary executor. Records calls, never touches a real service."""
-
-    def __init__(self, *, healthy: bool = True, fail_times: int = 0) -> None:
-        self.healthy = healthy
-        self.fail_times = fail_times
-        self.calls: list[str] = []
-
-    def restart_unit(self, unit: str) -> ExecResult:
-        self.calls.append(short_text(unit))
-        if len(self.calls) <= self.fail_times:
-            return ExecResult(ok=False, detail="canary_unhealthy")
-        return ExecResult(ok=self.healthy, detail="ok" if self.healthy else "unhealthy")
+# Re-exported so existing imports (``from ...runner import FakeServiceExecutor``)
+# keep working after the adapter boundary was split into ``adapter.py``.
+__all__ = [
+    "HARD_ATTEMPT_CAP",
+    "ActionAdapter",
+    "ActionReceipt",
+    "ActionRequest",
+    "ExecResult",
+    "FakeActionAdapter",
+    "FakeServiceExecutor",
+    "LiveActionAdapter",
+    "NoopActionAdapter",
+    "RunnerConfig",
+    "ServiceExecutor",
+    "UnavailableSystemctlExecutor",
+    "evaluate_runner",
+    "load_runner_config",
+    "run_runner_evaluate",
+]
 
 
 @dataclass(frozen=True)
@@ -109,6 +96,7 @@ class RunnerConfig:
     requested_action: str = "observe"
     target_unit: str = ""
     attempt_budget: int = 1
+    cooldown_seconds: float = 0.0
     allow_fake_execute: bool = False
     loop_fixture: dict[str, Any] | None = None
     error: str = ""
@@ -135,6 +123,15 @@ def _strict_budget(value: Any) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         return 0  # fail closed: unknown budget => no attempts
     return max(0, value)
+
+
+def _strict_cooldown(value: Any) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0.0  # unknown cooldown => no extra gating beyond budget/hard cap
+    parsed = float(value)
+    if parsed != parsed or parsed < 0:  # NaN or negative => no cooldown
+        return 0.0
+    return parsed
 
 
 def load_runner_config(path: str) -> RunnerConfig:
@@ -168,6 +165,7 @@ def load_runner_config(path: str) -> RunnerConfig:
         requested_action=requested_action,
         target_unit=target_unit,
         attempt_budget=_strict_budget(raw.get("attempt_budget", 1)),
+        cooldown_seconds=_strict_cooldown(raw.get("cooldown_seconds", 0)),
         allow_fake_execute=raw.get("allow_fake_execute") is True,
         loop_fixture=loop_fixture,
         error=policy.error,
@@ -230,10 +228,37 @@ def _status_from_verdict(action: str, verdict: str) -> str:
     return "noop"
 
 
+def _synth_receipt(config: RunnerConfig, *, status: str, reason: str, dry_run: bool,
+                   executed: list[dict[str, Any]], attempts: int,
+                   idempotency_key: str) -> dict[str, Any]:
+    """Build a machine-readable receipt for a non-adapter (block/observe) path."""
+    applied = bool(executed)
+    return {
+        "action_id": "",
+        "idempotency_key": short_text(idempotency_key),
+        "target": short_text(config.target_unit),
+        "status": status,
+        "dry_run": dry_run,
+        "fake": False,
+        "noop": not applied,
+        "applied": applied,
+        "executed": applied,
+        "attempts": attempts,
+        "noop_reason": "" if applied else reason,
+        "detail": "",
+    }
+
+
 def _base_report(config: RunnerConfig, *, status: str, reason: str, gates: dict[str, bool],
                  loop: dict[str, Any] | None, idempotency_key: str, dry_run: bool,
                  proposed: list[dict[str, Any]], executed: list[dict[str, Any]],
-                 attempts: int, service_requested: bool) -> dict[str, Any]:
+                 attempts: int, service_requested: bool,
+                 receipt: dict[str, Any] | None = None) -> dict[str, Any]:
+    if receipt is None:
+        receipt = _synth_receipt(
+            config, status=status, reason=reason, dry_run=dry_run,
+            executed=executed, attempts=attempts, idempotency_key=idempotency_key,
+        )
     report = {
         "success": True,
         "status": status,
@@ -249,6 +274,7 @@ def _base_report(config: RunnerConfig, *, status: str, reason: str, gates: dict[
             "executed": bool(executed),
             "dry_run": dry_run,
         },
+        "receipt": receipt,
         "loop": loop,
         "safety_gates": gates,
         "policy_refs": {
@@ -260,13 +286,31 @@ def _base_report(config: RunnerConfig, *, status: str, reason: str, gates: dict[
     return safe_event_payload(report)
 
 
+def _resolve_adapter(adapter: ActionAdapter | None, executor: ServiceExecutor | None,
+                     config: RunnerConfig) -> ActionAdapter | None:
+    """Pick the adapter that may execute, or ``None`` for proposal-only.
+
+    An explicitly injected ``adapter`` is honored (post-gate). Otherwise a
+    :class:`FakeServiceExecutor` is only wired when ``allow_fake_execute`` is set,
+    wrapped in a bounded :class:`FakeActionAdapter`. With neither, the runner is
+    proposal/dry-run only — the production CLI path.
+    """
+    if adapter is not None:
+        return adapter
+    if executor is not None and config.allow_fake_execute:
+        return FakeActionAdapter(executor, cooldown_seconds=config.cooldown_seconds)
+    return None
+
+
 def evaluate_runner(config: RunnerConfig, *, executor: ServiceExecutor | None = None,
+                    adapter: ActionAdapter | None = None,
                     now: float = 0.0) -> dict[str, Any]:
     """Evaluate one runner invocation and return a sanitized machine report.
 
-    Never performs a real service action: only an explicitly injected
-    :class:`FakeServiceExecutor` combined with ``allow_fake_execute`` in the
-    config produces any executed action, and even then it is a fake.
+    Never performs a real service action: an adapter is reached only after every
+    fail-closed gate passes, and the only executing adapter wired by default is a
+    :class:`FakeActionAdapter` over a :class:`FakeServiceExecutor` combined with
+    ``allow_fake_execute``. An explicit ``adapter`` may be injected for tests.
     """
     service_requested = config.requested_action == "service_cycle"
     gates = {
@@ -328,39 +372,58 @@ def evaluate_runner(config: RunnerConfig, *, executor: ServiceExecutor | None = 
 
     # Gates pass: the runner is eligible. Default is proposal/dry-run only.
     proposal = {"kind": "service_restart", "target": short_text(config.target_unit)}
+    action_id = safe_durable_ref(
+        f"action:service_cycle:{config.target_unit or 'observe'}", field="action_id"
+    )[0]
 
-    can_execute = executor is not None and config.allow_fake_execute
-    if not can_execute:
+    active = _resolve_adapter(adapter, executor, config)
+    if active is None:
+        # No executing adapter wired: eligible proposal, no action considered.
+        receipt = _synth_receipt(
+            config, status="GO", reason="eligible_proposal", dry_run=True,
+            executed=[], attempts=0, idempotency_key=idem,
+        )
+        receipt.update({"action_id": action_id, "noop": True, "noop_reason": "proposal_only"})
         return _base_report(
             config, status="GO", reason="eligible_proposal", gates=gates, loop=loop,
             idempotency_key=idem, dry_run=True, proposed=[proposal], executed=[],
-            attempts=0, service_requested=True,
+            attempts=0, service_requested=True, receipt=receipt,
         )
 
-    # Fake-executor path: bounded attempt budget, never a real service.
+    # Gated adapter call: bounded attempt budget, never a real service by default.
     budget = min(config.attempt_budget, HARD_ATTEMPT_CAP)
-    attempts = 0
-    succeeded = False
-    for _ in range(budget):
-        attempts += 1
-        result = executor.restart_unit(config.target_unit)
-        if result.ok:
-            succeeded = True
-            break
+    request = ActionRequest(
+        action_id=action_id,
+        idempotency_key=idem,
+        target_unit=config.target_unit,
+        attempt_budget=budget,
+    )
+    receipt = active.consider(request, now=now)
+    return _report_from_receipt(config, receipt, gates=gates, loop=loop,
+                                idempotency_key=idem, proposal=proposal)
 
-    if not succeeded:
-        report = _base_report(
-            config, status="BLOCK", reason="service_action_failed", gates=gates, loop=loop,
-            idempotency_key=idem, dry_run=True, proposed=[proposal], executed=[],
-            attempts=attempts, service_requested=True,
-        )
-        return report
 
-    executed = [{"kind": "service_restart", "target": short_text(config.target_unit), "result": "ok"}]
+def _report_from_receipt(config: RunnerConfig, receipt: ActionReceipt, *,
+                         gates: dict[str, bool], loop: dict[str, Any] | None,
+                         idempotency_key: str, proposal: dict[str, Any]) -> dict[str, Any]:
+    """Map a bounded adapter receipt onto the sanitized runner report."""
+    if receipt.noop:
+        # Noop family: noop adapter, cooldown, idempotent replay, disabled live.
+        # Checked first so an idempotent replay never re-emits an executed action.
+        status = receipt.status
+        reason = receipt.noop_reason or "noop"
+        dry_run, executed = True, []
+    elif receipt.applied:
+        status, reason, dry_run = "GO", "service_action_applied", False
+        executed = [{"kind": "service_restart", "target": receipt.target, "result": "ok"}]
+    else:
+        # Attempted a fake action but it failed; budget consumed, safe failure.
+        status, reason, dry_run, executed = "BLOCK", "service_action_failed", True, []
     return _base_report(
-        config, status="GO", reason="service_action_applied", gates=gates, loop=loop,
-        idempotency_key=idem, dry_run=False, proposed=[proposal], executed=executed,
-        attempts=attempts, service_requested=True,
+        config, status=status, reason=reason, gates=gates, loop=loop,
+        idempotency_key=idempotency_key, dry_run=dry_run, proposed=[proposal],
+        executed=executed, attempts=receipt.attempts, service_requested=True,
+        receipt=receipt.as_dict(),
     )
 
 
