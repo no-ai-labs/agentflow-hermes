@@ -396,6 +396,54 @@ def test_cli_loop_evaluate_ledger_receipts_malformed_fields_fail_closed_no_trace
     assert data["detail"] == "invalid_receipts:1"
 
 
+def test_cli_loop_evaluate_missing_private_input_file_path_sanitized(monkeypatch, tmp_path):
+    missing_path = "/home/alice/private/TOKEN=abc123.json"
+    rc, data = _run(["loop", "evaluate", "--input-file", missing_path], monkeypatch, tmp_path)
+
+    assert rc != 0
+    assert data["success"] is False
+    assert data["error"] == "malformed_input"
+    assert data["detail"] == "input_file_unreadable"
+
+    blob = json.dumps(data)
+    assert missing_path not in blob
+    assert "/home/alice" not in blob
+    assert "TOKEN" not in blob
+    assert "TOKEN=abc123" not in blob
+    assert "abc123" not in blob
+
+
+def test_cli_loop_evaluate_malformed_json_input_file_path_sanitized(monkeypatch, tmp_path):
+    secret_dir = tmp_path / "home" / "alice" / "private"
+    secret_dir.mkdir(parents=True)
+    bad_path = secret_dir / "TOKEN=abc123.json"
+    bad_path.write_text("{not-json /home/alice/private/TOKEN=abc123", encoding="utf-8")
+    rc, data = _run(["loop", "evaluate", "--input-file", str(bad_path)], monkeypatch, tmp_path)
+
+    assert rc != 0
+    assert data["success"] is False
+    assert data["error"] == "malformed_input"
+    assert data["detail"] == "input_json_invalid"
+
+    blob = json.dumps(data)
+    assert str(bad_path) not in blob
+    assert "/home/alice" not in blob
+    assert "TOKEN" not in blob
+    assert "TOKEN=abc123" not in blob
+    assert "abc123" not in blob
+
+
+def test_cli_loop_evaluate_non_object_root_fixture_sanitized(monkeypatch, tmp_path):
+    bad_path = tmp_path / "root.json"
+    bad_path.write_text(json.dumps(["not", "an", "object"]), encoding="utf-8")
+    rc, data = _run(["loop", "evaluate", "--input-file", str(bad_path)], monkeypatch, tmp_path)
+
+    assert rc != 0
+    assert data["success"] is False
+    assert data["error"] == "malformed_input"
+    assert data["detail"] == "input_json_invalid"
+
+
 def test_cli_loop_evaluate_report_has_no_private_paths_or_secrets(monkeypatch, tmp_path):
     fixture = _write_fixture(tmp_path, {
         "event": _event(

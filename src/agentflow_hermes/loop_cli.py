@@ -235,8 +235,14 @@ def run_loop_evaluate(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
     if args.input_file:
         try:
             fixture = _load_fixture(args.input_file)
-        except (OSError, ValueError, json.JSONDecodeError) as exc:
-            return 2, {"success": False, "error": "malformed_input", "detail": short_text(str(exc))}
+        except OSError:
+            # Never echo the raw path/errno text: it can leak private paths or
+            # token-like filename fragments back to the CLI caller.
+            return 2, {"success": False, "error": "malformed_input", "detail": "input_file_unreadable"}
+        except (json.JSONDecodeError, ValueError):
+            # JSON parse errors and fixture-root validation embed offending
+            # source text; return a stable generic detail instead.
+            return 2, {"success": False, "error": "malformed_input", "detail": "input_json_invalid"}
 
     fixture_event = fixture.get("event") if isinstance(fixture.get("event"), dict) else {}
     fixture_policy = fixture.get("policy") if isinstance(fixture.get("policy"), dict) else {}
