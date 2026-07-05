@@ -26,13 +26,14 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from agentflow_hermes.live.sanitize import (
     safe_durable_ref,
     safe_event_payload,
     short_text,
 )
+from agentflow_hermes.maintenance import durable
 from agentflow_hermes.maintenance.adapter import (
     ActionAdapter,
     ActionReceipt,
@@ -58,6 +59,7 @@ from agentflow_hermes.maintenance.trust import (
     is_valid_service_cycle_grant,
     validate_trust_grants_shape,
 )
+from agentflow_hermes.remediation import parse_verdict_summary
 
 # Absolute ceiling on service-action attempts, independent of any config value.
 # Proves the runner can never storm real services even if a config asks for it.
@@ -100,6 +102,19 @@ class RunnerConfig:
     allow_fake_execute: bool = False
     loop_fixture: dict[str, Any] | None = None
     error: str = ""
+    # M13 prerequisites: remaining fake-only gates and durable-test wiring.
+    repo_id: str = ""
+    cycle_ref: str = ""
+    db_path: str = ""
+    activity_active: bool = False
+    reviewed_summary: str = ""
+    require_no_active_workers: bool = True
+    require_reviewed_sync_go: bool = True
+    max_cycles_per_day: int = 2
+    min_seconds_between_cycles: int = 1800
+    quiet_hours_enabled: bool = False
+    quiet_hours_start: int = 0
+    quiet_hours_end: int = 0
 
 
 def _read_json(path: str) -> dict[str, Any] | None:
@@ -134,6 +149,12 @@ def _strict_cooldown(value: Any) -> float:
     return parsed
 
 
+def _strict_hour(value: Any, default: int = 0) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return default
+    return max(0, min(23, value))
+
+
 def load_runner_config(path: str) -> RunnerConfig:
     """Load and fail-closed parse the runner config fixture.
 
@@ -155,6 +176,9 @@ def load_runner_config(path: str) -> RunnerConfig:
 
     loop_fixture = raw.get("loop") if isinstance(raw.get("loop"), dict) else None
 
+    activity_raw = raw.get("activity") if isinstance(raw.get("activity"), dict) else {}
+    quiet_hours_raw = raw.get("quiet_hours") if isinstance(raw.get("quiet_hours"), dict) else {}
+
     return RunnerConfig(
         mode=policy.mode,
         kill_switch=policy.maintenance_kill_switch,
@@ -169,6 +193,18 @@ def load_runner_config(path: str) -> RunnerConfig:
         allow_fake_execute=raw.get("allow_fake_execute") is True,
         loop_fixture=loop_fixture,
         error=policy.error,
+        repo_id=short_text(raw.get("repo_id") or ""),
+        cycle_ref=short_text(raw.get("cycle_ref") or ""),
+        db_path=short_text(raw.get("db_path") or "", max_len=4000),
+        activity_active=activity_raw.get("active") is True,
+        reviewed_summary=short_text(raw.get("reviewed_summary") or "", max_len=2000),
+        require_no_active_workers=policy.require_no_active_workers,
+        require_reviewed_sync_go=policy.require_reviewed_sync_go,
+        max_cycles_per_day=policy.max_cycles_per_day,
+        min_seconds_between_cycles=policy.min_seconds_between_cycles,
+        quiet_hours_enabled=quiet_hours_raw.get("enabled") is True,
+        quiet_hours_start=_strict_hour(quiet_hours_raw.get("start_hour"), 0),
+        quiet_hours_end=_strict_hour(quiet_hours_raw.get("end_hour"), 0),
     )
 
 
@@ -302,26 +338,101 @@ def _resolve_adapter(adapter: ActionAdapter | None, executor: ServiceExecutor | 
     return None
 
 
+def _has_reviewed_go(config: RunnerConfig) -> bool:
+    if not config.require_reviewed_sync_go:
+        return True
+    parsed = parse_verdict_summary(config.reviewed_summary)
+    return parsed.verdict == "GO" and parsed.confidence == "explicit"
+
+
+def _in_quiet_hours(hour: int, start: int, end: int) -> bool:
+    if start == end:
+        return False
+    if start < end:
+        return start <= hour < end
+    return hour >= start or hour < end
+
+
+_PRIOR_CYCLE_STATUS_MAP = {
+    "applied": ("GO", "duplicate_cycle_applied", True),
+    "failed": ("BLOCK", "service_action_failed", False),
+    "degraded": ("BLOCK", "post_smoke_failed", False),
+    "refused": ("BLOCK", "", False),
+    "attempt": ("BLOCK", "cycle_in_progress", False),
+}
+
+
+def _report_from_prior_cycle(config: RunnerConfig, prior_row: dict[str, Any], *,
+                             gates: dict[str, bool], loop: dict[str, Any] | None,
+                             idempotency_key: str, proposal: dict[str, Any] | None) -> dict[str, Any]:
+    """Map a durable prior cycle decision onto a report; never a second action."""
+    prior_status = prior_row.get("status", "attempt")
+    status, reason, was_applied = _PRIOR_CYCLE_STATUS_MAP.get(
+        prior_status, ("BLOCK", prior_row.get("reason") or "duplicate_cycle_claim", False),
+    )
+    if prior_status == "refused":
+        reason = prior_row.get("reason") or "duplicate_cycle_refused"
+    receipt = _synth_receipt(
+        config, status=status, reason=reason, dry_run=True,
+        executed=[], attempts=0, idempotency_key=idempotency_key,
+    )
+    receipt.update({"noop": True, "noop_reason": reason, "applied": was_applied})
+    return _base_report(
+        config, status=status, reason=reason, gates=gates, loop=loop,
+        idempotency_key=idempotency_key, dry_run=True, proposed=[proposal] if proposal else [], executed=[],
+        attempts=0, service_requested=True, receipt=receipt,
+    )
+
+
 def evaluate_runner(config: RunnerConfig, *, executor: ServiceExecutor | None = None,
                     adapter: ActionAdapter | None = None,
-                    now: float = 0.0) -> dict[str, Any]:
+                    now: float = 0.0,
+                    activity_provider: Callable[[], bool] | None = None,
+                    kill_switch_provider: Callable[[], bool] | None = None,
+                    post_smoke_provider: Callable[[], bool] | None = None,
+                    clock_hour: Callable[[], int] | None = None) -> dict[str, Any]:
     """Evaluate one runner invocation and return a sanitized machine report.
 
     Never performs a real service action: an adapter is reached only after every
-    fail-closed gate passes, and the only executing adapter wired by default is a
-    :class:`FakeActionAdapter` over a :class:`FakeServiceExecutor` combined with
-    ``allow_fake_execute``. An explicit ``adapter`` may be injected for tests.
+    fail-closed gate passes, an M13 durable idempotency claim (when a ``db_path``
+    is configured) is not a duplicate, and an immediate pre-effect recheck of
+    activity/kill-switch still clears right before adapter construction. The
+    only executing adapter wired by default is a :class:`FakeActionAdapter` over
+    a :class:`FakeServiceExecutor` combined with ``allow_fake_execute``. An
+    explicit ``adapter`` may be injected for tests.
     """
     service_requested = config.requested_action == "service_cycle"
+
+    kill_switch_check = kill_switch_provider if kill_switch_provider is not None else (lambda: config.kill_switch)
+    activity_check = activity_provider if activity_provider is not None else (lambda: config.activity_active)
+    kill_switch_now = kill_switch_check()
+    active_now = activity_check()
+
     gates = {
-        "kill_switch_clear": not config.kill_switch,
+        "kill_switch_clear": not kill_switch_now,
         "mode_guarded_cycle": config.mode == "guarded_cycle",
         "service_allowlisted": bool(config.target_unit) and config.target_unit in config.allowed_services,
         "trust_grant": _has_service_cycle_grant(config, now=now),
+        "no_active_workers": not (config.require_no_active_workers and active_now),
+        "reviewed_go": _has_reviewed_go(config),
         "fake_executor_only": True,
     }
 
     def block(reason: str) -> dict[str, Any]:
+        if service_requested and config.db_path:
+            db_key = durable.build_cycle_key(
+                repo_id=config.repo_id, target_unit=config.target_unit, cycle_ref=config.cycle_ref,
+            )
+            claimed, prior_row = durable.claim_cycle(
+                config.db_path, idempotency_key=db_key, target_unit=config.target_unit,
+                repo_id=config.repo_id, reason=reason, dry_run=True, fake=False,
+                source_ref="", policy_ref="maintenance.json", now=now,
+            )
+            if not claimed:
+                return _report_from_prior_cycle(
+                    config, prior_row, gates=gates, loop=loop, idempotency_key=idem, proposal=None,
+                )
+            durable.update_cycle_status(config.db_path, db_key, status="refused", reason=reason)
         return _base_report(
             config, status="BLOCK", reason=reason, gates=gates, loop=loop,
             idempotency_key=idem, dry_run=True, proposed=[], executed=[],
@@ -345,7 +456,7 @@ def evaluate_runner(config: RunnerConfig, *, executor: ServiceExecutor | None = 
         return block("malformed_trust_grants")
 
     # 1. Kill switch first.
-    if config.kill_switch:
+    if kill_switch_now:
         return block("kill_switch")
 
     # Observe / request-only default path: never a service action.
@@ -369,6 +480,41 @@ def evaluate_runner(config: RunnerConfig, *, executor: ServiceExecutor | None = 
     # 4. valid service_cycle trust grant for the exact unit.
     if not gates["trust_grant"]:
         return block("no_trust_grant")
+    # 5. activity / no-active-workers snapshot.
+    if not gates["no_active_workers"]:
+        return block("active_workers_present")
+
+    # 6-7. max cycles per day / min seconds between cycles (durable-test only;
+    # with no db_path there is no history to gate against, so both trivially pass).
+    if config.db_path:
+        day_start, day_end = durable.day_bucket(now)
+        count_today = durable.count_cycles_today(
+            config.db_path, repo_id=config.repo_id, target_unit=config.target_unit,
+            day_start=day_start, day_end=day_end,
+        )
+        gates["cycles_under_cap"] = count_today < config.max_cycles_per_day
+        if not gates["cycles_under_cap"]:
+            return block("max_cycles_exhausted")
+
+        last_at = durable.last_applied_at(config.db_path, repo_id=config.repo_id, target_unit=config.target_unit)
+        interval_ok = last_at is None or (now - last_at) >= config.min_seconds_between_cycles
+        gates["min_interval_elapsed"] = interval_ok
+        if not interval_ok:
+            return block("min_interval_not_elapsed")
+
+    # 8. optional quiet-hours with an injected host-local clock.
+    if config.quiet_hours_enabled:
+        if clock_hour is None:
+            gates["quiet_hours_clear"] = False
+            return block("quiet_hours_clock_missing")
+        hour = clock_hour()
+        gates["quiet_hours_clear"] = not _in_quiet_hours(hour, config.quiet_hours_start, config.quiet_hours_end)
+        if not gates["quiet_hours_clear"]:
+            return block("quiet_hours_active")
+
+    # 9. explicit reviewed sync GO via the shared verdict parser.
+    if not gates["reviewed_go"]:
+        return block("no_reviewed_go")
 
     # Gates pass: the runner is eligible. Default is proposal/dry-run only.
     proposal = {"kind": "service_restart", "target": short_text(config.target_unit)}
@@ -376,9 +522,37 @@ def evaluate_runner(config: RunnerConfig, *, executor: ServiceExecutor | None = 
         f"action:service_cycle:{config.target_unit or 'observe'}", field="action_id"
     )[0]
 
+    # 10. DB-backed cross-process idempotency claim, before any adapter construction.
+    db_key = ""
+    if config.db_path:
+        db_key = durable.build_cycle_key(
+            repo_id=config.repo_id, target_unit=config.target_unit, cycle_ref=config.cycle_ref,
+        )
+        claimed, prior_row = durable.claim_cycle(
+            config.db_path, idempotency_key=db_key, target_unit=config.target_unit,
+            repo_id=config.repo_id, reason="eligible", dry_run=True, fake=True,
+            source_ref="", policy_ref="maintenance.json", now=now,
+        )
+        if not claimed:
+            return _report_from_prior_cycle(
+                config, prior_row, gates=gates, loop=loop, idempotency_key=idem, proposal=proposal,
+            )
+
+    # 11. immediate pre-effect recheck for activity and kill switch, right
+    # before the adapter is ever constructed.
+    recheck_kill = kill_switch_check()
+    recheck_active = activity_check()
+    if recheck_kill or (config.require_no_active_workers and recheck_active):
+        reason = "kill_switch" if recheck_kill else "active_workers_present"
+        if db_key:
+            durable.update_cycle_status(config.db_path, db_key, status="refused", reason=reason)
+        return block(reason)
+
     active = _resolve_adapter(adapter, executor, config)
     if active is None:
         # No executing adapter wired: eligible proposal, no action considered.
+        if db_key:
+            durable.update_cycle_status(config.db_path, db_key, status="refused", reason="proposal_only")
         receipt = _synth_receipt(
             config, status="GO", reason="eligible_proposal", dry_run=True,
             executed=[], attempts=0, idempotency_key=idem,
@@ -399,8 +573,38 @@ def evaluate_runner(config: RunnerConfig, *, executor: ServiceExecutor | None = 
         attempt_budget=budget,
     )
     receipt = active.consider(request, now=now)
-    return _report_from_receipt(config, receipt, gates=gates, loop=loop,
-                                idempotency_key=idem, proposal=proposal)
+    report = _report_from_receipt(config, receipt, gates=gates, loop=loop,
+                                  idempotency_key=idem, proposal=proposal)
+
+    if not db_key:
+        return report
+
+    if receipt.applied:
+        # 12. fake post-smoke / doctor-canary abstraction. A single fake
+        # restart already happened; failure here degrades the system and
+        # writes a refs-only deadletter fallback — it never retries.
+        healthy = post_smoke_provider() if post_smoke_provider is not None else True
+        if healthy:
+            durable.update_cycle_status(config.db_path, db_key, status="applied", reason="service_action_applied")
+        else:
+            durable.update_cycle_status(config.db_path, db_key, status="degraded", reason="post_smoke_failed")
+            durable.set_degraded(config.db_path, True)
+            durable.write_deadletter(
+                config.db_path, reason="post_smoke_failed", target_unit=config.target_unit,
+                idempotency_key=db_key, ref=receipt.detail or "post_smoke_unhealthy",
+            )
+            report = _base_report(
+                config, status="BLOCK", reason="post_smoke_failed", gates=gates, loop=loop,
+                idempotency_key=idem, dry_run=True, proposed=[proposal],
+                executed=report["actions"]["executed"], attempts=receipt.attempts,
+                service_requested=True, receipt=receipt.as_dict(),
+            )
+    elif receipt.noop:
+        durable.update_cycle_status(config.db_path, db_key, status="refused", reason=receipt.noop_reason or "noop")
+    else:
+        durable.update_cycle_status(config.db_path, db_key, status="failed", reason="service_action_failed")
+
+    return report
 
 
 def _report_from_receipt(config: RunnerConfig, receipt: ActionReceipt, *,

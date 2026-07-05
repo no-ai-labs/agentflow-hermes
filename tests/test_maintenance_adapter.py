@@ -52,6 +52,7 @@ def _guarded_config(**overrides):
         "target_unit": unit,
         "attempt_budget": 1,
         "host_id": "test-host",
+        "reviewed_summary": "Verdict: GO — pytest reviewed",
     }
     config.update(overrides)
     return config

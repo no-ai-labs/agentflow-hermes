@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 SQL_V1 = """
 create table if not exists jobs (
@@ -119,7 +119,48 @@ create index if not exists idx_receipts_idempotency on operator_receipts(idempot
 create index if not exists idx_idempotency_keys on idempotency_keys(key);
 """
 
-STEPS = [(1, SQL_V1), (2, SQL_V2), (3, SQL_V3)]
+SQL_V4 = """
+-- M13 durable maintenance-cycle receipts / idempotency claims / failure path.
+-- Refs, reasons, and short sanitized identifiers only; never raw transcripts,
+-- private paths, or secrets.
+create table if not exists maintenance_cycles (
+    id integer primary key autoincrement,
+    idempotency_key text not null,
+    status text not null default 'attempt',
+    reason text not null default '',
+    target_unit text not null default '',
+    repo_id text not null default '',
+    dry_run integer not null default 1,
+    fake integer not null default 0,
+    source_ref text not null default '',
+    policy_ref text not null default '',
+    created_at real not null,
+    updated_at real not null
+);
+
+-- tiny key-value store for maintenance degraded / circuit-breaker state
+create table if not exists maintenance_state (
+    key text primary key,
+    value text not null default '',
+    updated_at real not null
+);
+
+-- refs-only deadletter/journal fallback for maintenance failure paths
+create table if not exists maintenance_deadletter (
+    id integer primary key autoincrement,
+    reason text not null default '',
+    target_unit text not null default '',
+    idempotency_key text not null default '',
+    ref text not null default '',
+    created_at real not null
+);
+
+create unique index if not exists uniq_maintenance_cycles_key on maintenance_cycles(idempotency_key);
+create index if not exists idx_maintenance_cycles_repo_unit on maintenance_cycles(repo_id, target_unit, status, created_at);
+create index if not exists idx_maintenance_deadletter_target on maintenance_deadletter(target_unit, created_at);
+"""
+
+STEPS = [(1, SQL_V1), (2, SQL_V2), (3, SQL_V3), (4, SQL_V4)]
 
 
 def migrate(con) -> int:
