@@ -548,6 +548,19 @@ def evaluate_runner(config: RunnerConfig, *, executor: ServiceExecutor | None = 
             durable.update_cycle_status(config.db_path, db_key, status="refused", reason=reason)
         return block(reason)
 
+    # 12. pre-adapter degraded/circuit-breaker read gate. A prior fake
+    # post-smoke failure for the same repo/unit scope sets durable degraded
+    # state; a fresh cycle_ref must never reach adapter construction while that
+    # scoped state is open. No reset/clear is wired here — a future reset slice
+    # would add an explicit, audited clear path.
+    if config.db_path and durable.is_degraded(
+        config.db_path, repo_id=config.repo_id, target_unit=config.target_unit,
+    ):
+        reason = "degraded_state_open"
+        if db_key:
+            durable.update_cycle_status(config.db_path, db_key, status="refused", reason=reason)
+        return block(reason)
+
     active = _resolve_adapter(adapter, executor, config)
     if active is None:
         # No executing adapter wired: eligible proposal, no action considered.
@@ -588,7 +601,9 @@ def evaluate_runner(config: RunnerConfig, *, executor: ServiceExecutor | None = 
             durable.update_cycle_status(config.db_path, db_key, status="applied", reason="service_action_applied")
         else:
             durable.update_cycle_status(config.db_path, db_key, status="degraded", reason="post_smoke_failed")
-            durable.set_degraded(config.db_path, True)
+            durable.set_degraded(
+                config.db_path, True, repo_id=config.repo_id, target_unit=config.target_unit,
+            )
             durable.write_deadletter(
                 config.db_path, reason="post_smoke_failed", target_unit=config.target_unit,
                 idempotency_key=db_key, ref=receipt.detail or "post_smoke_unhealthy",

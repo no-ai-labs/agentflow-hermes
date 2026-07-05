@@ -309,7 +309,9 @@ def test_fake_post_smoke_success_terminal_applied_receipt(tmp_path):
     key = durable.build_cycle_key(repo_id="repo1", target_unit="hermes-gateway.service", cycle_ref="sha-smoke-ok")
     row = durable.get_cycle(db_path, key)
     assert row["status"] == "applied"
-    assert durable.is_degraded(db_path) is False
+    assert durable.is_degraded(
+        db_path, repo_id="repo1", target_unit="hermes-gateway.service",
+    ) is False
 
 
 def test_fake_post_smoke_failure_degraded_deadletter_no_retry_storm(tmp_path):
@@ -330,7 +332,9 @@ def test_fake_post_smoke_failure_degraded_deadletter_no_retry_storm(tmp_path):
     key = durable.build_cycle_key(repo_id="repo1", target_unit="hermes-gateway.service", cycle_ref="sha-smoke-bad")
     row = durable.get_cycle(db_path, key)
     assert row["status"] == "degraded"
-    assert durable.is_degraded(db_path) is True
+    assert durable.is_degraded(
+        db_path, repo_id="repo1", target_unit="hermes-gateway.service",
+    ) is True
     # Exactly one fake restart call: no retry storm on post-smoke failure.
     assert fake.calls == ["hermes-gateway.service"]
 
@@ -339,6 +343,72 @@ def test_fake_post_smoke_failure_degraded_deadletter_no_retry_storm(tmp_path):
     dead = con.execute("select * from maintenance_deadletter").fetchall()
     assert len(dead) == 1
     assert dead[0]["reason"] == "post_smoke_failed"
+
+
+# --- pre-adapter degraded/circuit-breaker read gate --------------------------
+
+def test_degraded_state_blocks_fresh_cycle_before_adapter(tmp_path):
+    from agentflow_hermes.maintenance import durable
+
+    db_path = str(tmp_path / "maintenance.db")
+    path = _write_config(tmp_path, _guarded_config(
+        db_path=db_path, repo_id="repo1", cycle_ref="sha-smoke-bad",
+    ))
+    fake = FakeServiceExecutor(healthy=True)
+    adapter = FakeActionAdapter(fake)
+    first = evaluate_runner(
+        load_runner_config(path), adapter=adapter, now=1000.0, post_smoke_provider=lambda: False,
+    )
+    assert first["status"] == "BLOCK"
+    assert first["reason"] == "post_smoke_failed"
+    assert durable.is_degraded(
+        db_path, repo_id="repo1", target_unit="hermes-gateway.service",
+    ) is True
+
+    # A fresh cycle_ref, otherwise fully eligible, must never reach adapter
+    # construction/call while degraded state is open.
+    spy = RecordingAdapter()
+    path_b = _write_config(tmp_path, _guarded_config(
+        db_path=db_path, repo_id="repo1", cycle_ref="sha-fresh-b",
+    ), name="runner_b.json")
+    second = evaluate_runner(load_runner_config(path_b), adapter=spy, now=1100.0)
+
+    assert second["status"] == "BLOCK"
+    assert second["reason"] == "degraded_state_open"
+    assert spy.calls == []
+    assert second["actions"]["executed"] == []
+
+    key_b = durable.build_cycle_key(
+        repo_id="repo1", target_unit="hermes-gateway.service", cycle_ref="sha-fresh-b",
+    )
+    row_b = durable.get_cycle(db_path, key_b)
+    assert row_b is not None
+    assert row_b["status"] == "refused"
+    assert row_b["reason"] == "degraded_state_open"
+
+    # Same cycle_ref (B) duplicate: returns the prior terminal decision, no
+    # second adapter call.
+    spy2 = RecordingAdapter()
+    third = evaluate_runner(load_runner_config(path_b), adapter=spy2, now=1101.0)
+    assert third["status"] == "BLOCK"
+    assert third["reason"] == "degraded_state_open"
+    assert spy2.calls == []
+
+    other_unit = "hermes-worker.service"
+    other_fake = FakeServiceExecutor(healthy=True)
+    other_adapter = FakeActionAdapter(other_fake)
+    path_other = _write_config(tmp_path, _guarded_config(
+        db_path=db_path, repo_id="repo1", target_unit=other_unit, cycle_ref="sha-other-unit",
+        allowed_services=[other_unit],
+        trust_grants=[build_trust_grant(
+            other_unit, host_id="test-host", created_at=1000.0,
+            expires_at=9999999999.0, provenance="pytest explicit grant",
+        )],
+        min_seconds_between_cycles=0,
+    ), name="runner_other.json")
+    other = evaluate_runner(load_runner_config(path_other), adapter=other_adapter, now=1200.0)
+    assert other["status"] == "GO"
+    assert other_fake.calls == [other_unit]
 
 
 # --- receipt sanitization ----------------------------------------------------

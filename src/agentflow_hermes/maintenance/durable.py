@@ -166,21 +166,29 @@ def last_applied_at(db_path: str, *, repo_id: str, target_unit: str) -> float | 
     return float(ts) if ts is not None else None
 
 
-def set_degraded(db_path: str, value: bool) -> None:
+def _degraded_key(*, repo_id: str = "", target_unit: str = "") -> str:
+    if repo_id or target_unit:
+        return f"degraded:{short_text(repo_id) or 'default'}:{short_text(target_unit) or 'observe'}"
+    return "degraded"
+
+
+def set_degraded(db_path: str, value: bool, *, repo_id: str = "", target_unit: str = "") -> None:
     now = time.time()
+    key = _degraded_key(repo_id=repo_id, target_unit=target_unit)
     with _connect(db_path) as con:
         con.execute(
             """
-            insert into maintenance_state(key, value, updated_at) values('degraded', ?, ?)
+            insert into maintenance_state(key, value, updated_at) values(?, ?, ?)
             on conflict(key) do update set value=excluded.value, updated_at=excluded.updated_at
             """,
-            ("1" if value else "0", now),
+            (key, "1" if value else "0", now),
         )
 
 
-def is_degraded(db_path: str) -> bool:
+def is_degraded(db_path: str, *, repo_id: str = "", target_unit: str = "") -> bool:
+    key = _degraded_key(repo_id=repo_id, target_unit=target_unit)
     with _connect(db_path) as con:
-        row = con.execute("select value from maintenance_state where key='degraded'").fetchone()
+        row = con.execute("select value from maintenance_state where key=?", (key,)).fetchone()
     return bool(row) and row["value"] == "1"
 
 
