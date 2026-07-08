@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import json
 
-from agentflow_hermes.graph_creator import FakeKanbanGraphAdapter
+from agentflow_hermes.graph_creator import FakeKanbanGraphAdapter, propose_next_slice_graph
 from agentflow_hermes.loop_supervisor import InMemoryLoopLedger, LoopEvent, LoopPolicy, evaluate_loop_event
+from agentflow_hermes.roadmap import InMemoryRoadmapPromotionLedger, RoadmapPromotionPolicy, RoadmapTransition, RoadmapTransitionRegistry
 
 
 SAFE_POLICY = LoopPolicy(
@@ -30,6 +31,69 @@ def _event(**kwargs):
     return LoopEvent(**defaults)
 
 
+
+
+def _roadmap_registry() -> RoadmapTransitionRegistry:
+    return RoadmapTransitionRegistry(
+        version="test-v1",
+        source_ref="test-registry",
+        transitions={
+            "m14->m15.impl_review_fanin": RoadmapTransition(
+                transition_id="m14->m15.impl_review_fanin",
+                roadmap_id="hermes.live-migration",
+                from_slice="m14",
+                to_slice="m15",
+                slice_template=("impl", "review", "fanin"),
+                policy_refs=("design_opus", "implementation_default"),
+                max_chain_depth=2,
+            )
+        },
+    )
+
+
+def _go_summary(**overrides) -> str:
+    lines = [
+        f"Verdict: {overrides.get('verdict', 'GO')}",
+        "Origin/return_to: discord:#hermes-main",
+        "Return-To: discord:#hermes-main",
+        f"Auto-Continue: {overrides.get('auto', 'true')}",
+        f"Roadmap-Transition: {overrides.get('transition', 'm14->m15.impl_review_fanin')}",
+    ]
+    if "next_slice" not in overrides or overrides["next_slice"] is not None:
+        lines.append(f"Next-Slice: {overrides.get('next_slice', 'm15')}")
+    lines.extend([
+        f"Review-Edge: {overrides.get('review', 'verified')}",
+        f"ACK-Edge: {overrides.get('ack', 'verified')}",
+        "Parent-GO: verified",
+    ])
+    return "\n".join(lines)
+
+
+def _roadmap_policy(**kwargs) -> LoopPolicy:
+    defaults = {
+        "active_mode": "request_only",
+        "allowlisted_blockers": ("stale_inline_route", "missing_subscription", "stale_final_fanin"),
+        "expected_origin": "discord:#hermes-main",
+        "expected_return_to": "discord:#hermes-main",
+        "cooldown_seconds": 900,
+        "roadmap_auto_continue": True,
+        "roadmap_allowlisted_transitions": ("m14->m15.impl_review_fanin",),
+        "roadmap_trusted_assignees": ("ccreviewer",),
+    }
+    defaults.update(kwargs)
+    return LoopPolicy(**defaults)
+
+
+def _roadmap_promotion_policy() -> RoadmapPromotionPolicy:
+    return RoadmapPromotionPolicy(
+        auto_continue=True,
+        allowlisted_transitions=("m14->m15.impl_review_fanin",),
+        trusted_assignees=("ccreviewer",),
+        expected_origin="discord:#hermes-main",
+        expected_return_to="discord:#hermes-main",
+    )
+
+
 def test_loop_go_terminal_stops_stabilizes_no_graph_call():
     ledger = InMemoryLoopLedger()
     calls = []
@@ -46,6 +110,88 @@ def test_loop_go_terminal_stops_stabilizes_no_graph_call():
     assert calls == []
     assert ledger.has_event("evt-1") is True
 
+
+
+def test_loop_go_autopromote_attaches_request_only_next_slice_proposal():
+    adapter = FakeKanbanGraphAdapter()
+    decision = evaluate_loop_event(
+        _event(
+            verdict="GO",
+            summary=_go_summary(),
+            source_final_id="t_final_go",
+            source_assignee="ccreviewer",
+        ),
+        InMemoryLoopLedger(),
+        _roadmap_policy(),
+        adapter=adapter,
+        roadmap_registry=_roadmap_registry(),
+        roadmap_ledger=InMemoryRoadmapPromotionLedger(),
+    )
+
+    proposal = decision.metadata["roadmap_autopromote"]
+    assert decision.action == "stabilize"
+    assert decision.reason == "go_terminal"
+    assert proposal["action"] == "propose"
+    assert proposal["reason"] == "roadmap_promotion_proposed"
+    assert proposal["request_only"] is True
+    assert proposal["mutations"] == []
+    assert proposal["adapter_attempts"] == 0
+    assert [c["kind"] for c in decision.candidates] == ["impl", "review", "fanin"]
+    assert len(adapter.create_calls) == 0
+
+
+def test_loop_go_autopromote_refusals_are_machine_readable_noop_no_candidates():
+    cases = [
+        (_go_summary(next_slice=None), "missing_next_slice"),
+        (_go_summary(review="missing"), "missing_review_edge"),
+        (_go_summary(ack="missing"), "missing_ack_edge"),
+        (_go_summary() + "\nRoute: claude-openrouter-opus via Kimi", "stale_inline_route"),
+    ]
+    for idx, (summary, reason) in enumerate(cases):
+        decision = evaluate_loop_event(
+            _event(
+                event_id=f"evt-roadmap-refuse-{idx}",
+                verdict="GO",
+                summary=summary,
+                source_final_id=f"t_final_{idx}",
+                source_assignee="ccreviewer",
+            ),
+            InMemoryLoopLedger(),
+            _roadmap_policy(),
+            roadmap_registry=_roadmap_registry(),
+        )
+
+        proposal = decision.metadata["roadmap_autopromote"]
+        assert decision.action == "stabilize"
+        assert proposal["action"] == "refuse"
+        assert proposal["reason"] == reason
+        assert decision.candidates == ()
+        assert proposal["mutations"] == []
+
+
+def test_graph_creator_propose_next_slice_graph_is_request_only_no_mutations():
+    adapter = FakeKanbanGraphAdapter()
+    result = propose_next_slice_graph(
+        _go_summary(),
+        event_id="evt-graph-surface",
+        source_final_ref="t_final_graph_surface",
+        source_assignee="ccreviewer",
+        origin="discord:#hermes-main",
+        return_to="discord:#hermes-main",
+        subscription_status="verified",
+        policy_resolution_ref="policy:model.implementation_default@v1",
+        registry=_roadmap_registry(),
+        ledger=InMemoryRoadmapPromotionLedger(),
+        policy=_roadmap_promotion_policy(),
+        adapter=adapter,
+    )
+
+    assert result["action"] == "propose"
+    assert result["request_only"] is True
+    assert result["mutations"] == []
+    assert result["adapter_attempts"] == 0
+    assert [c["kind"] for c in result["candidates"]] == ["impl", "review", "fanin"]
+    assert len(adapter.create_calls) == 0
 
 def test_loop_need_more_stops_escalates_no_auto_create():
     ledger = InMemoryLoopLedger()

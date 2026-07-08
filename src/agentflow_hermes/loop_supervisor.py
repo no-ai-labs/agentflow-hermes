@@ -4,9 +4,10 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Protocol
 
-from .graph_creator import RemediationGraphPolicy, propose_remediation_graph, resolve_stale_final_candidate
+from .graph_creator import RemediationGraphPolicy, propose_next_slice_graph, propose_remediation_graph, resolve_stale_final_candidate
 from .live.sanitize import safe_durable_ref, safe_event_payload, short_text
 from .remediation import parse_verdict_summary
+from .roadmap import InMemoryRoadmapPromotionLedger, RoadmapPromotionPolicy
 
 
 _VALID_MODES = {"disabled", "observe_only", "request_only", "apply"}
@@ -30,6 +31,18 @@ class LoopPolicy:
     request_only_by_default: bool = True
     expected_origin: str = ""
     expected_return_to: str = ""
+    # M14a roadmap-GO autopromoter config. Defaults keep GO terminal/stable
+    # behavior unchanged and proposal-only.
+    roadmap_auto_continue: bool = False
+    roadmap_allowlisted_transitions: tuple[str, ...] = ()
+    roadmap_max_chain_depth: int = 3
+    roadmap_max_promotions_per_roadmap: int = 6
+    roadmap_promote_cooldown_seconds: int = 900
+    roadmap_require_review_edge: bool = True
+    roadmap_require_ack_edge: bool = True
+    roadmap_require_trusted_assignee: bool = True
+    roadmap_trusted_assignees: tuple[str, ...] = ()
+    roadmap_require_policy_resolution: bool = True
 
 
 @dataclass(frozen=True)
@@ -49,6 +62,8 @@ class LoopEvent:
     occurred_at: float = 0.0
     source_final_id: str = ""
     remediation_review_id: str = ""
+    source_assignee: str = ""
+    chain_depth: int = 0
     old_final_card: dict[str, Any] | None = None
     remediation_review_card: dict[str, Any] | None = None
 
@@ -190,6 +205,9 @@ def evaluate_loop_event(
     *,
     graph_creator: GraphCreator | None = None,
     adapter: Any = None,
+    roadmap_registry: Any = None,
+    roadmap_ledger: Any = None,
+    roadmap_promoter: GraphCreator | None = None,
 ) -> LoopDecision:
     """Evaluate one loop event and return a dry-run/request-only decision.
 
@@ -226,7 +244,17 @@ def evaluate_loop_event(
     blocker = short_text(ev.blocker_class or (parsed.blockers[0] if parsed.blockers else ""))
 
     if verdict == "GO":
-        return _record(ledger, _decision(ev, "stabilize", "go_terminal", effective_policy, now, verdict=verdict), ev)
+        decision = _decision(ev, "stabilize", "go_terminal", effective_policy, now, verdict=verdict)
+        decision = _attach_roadmap_autopromote(
+            decision,
+            ev,
+            effective_policy,
+            now,
+            registry=roadmap_registry,
+            roadmap_ledger=roadmap_ledger,
+            promoter=roadmap_promoter,
+        )
+        return _record(ledger, decision, ev)
     if verdict == "NEED_MORE":
         return _record(ledger, _decision(ev, "escalate", "needs_input", effective_policy, now, verdict=verdict), ev)
     if verdict != "BLOCK":
@@ -309,6 +337,57 @@ def evaluate_loop_event(
     )
 
 
+def _attach_roadmap_autopromote(
+    decision: LoopDecision,
+    event: LoopEvent,
+    policy: LoopPolicy,
+    now: float,
+    *,
+    registry: Any,
+    roadmap_ledger: Any,
+    promoter: GraphCreator | None,
+) -> LoopDecision:
+    """Attach request-only next-slice proposal metadata/candidates to GO."""
+    if not policy.roadmap_auto_continue:
+        return decision
+
+    promote = promoter or propose_next_slice_graph
+    result = promote(
+        event.summary or "",
+        event_id=event.event_id,
+        source_final_ref=event.source_final_id or event.source_task_id or event.source_graph_id,
+        source_assignee=event.source_assignee,
+        origin=event.origin,
+        return_to=event.return_to,
+        subscription_status=event.subscription_status,
+        policy_resolution_ref=event.policy_resolution_ref,
+        chain_depth=event.chain_depth,
+        occurred_at=now,
+        registry=registry,
+        ledger=roadmap_ledger or InMemoryRoadmapPromotionLedger(),
+        policy=_roadmap_policy(policy),
+        adapter=None,
+    )
+    safe_result = _safe_next_slice_result(result)
+    metadata = dict(decision.metadata)
+    metadata["roadmap_autopromote"] = safe_result
+    candidates = tuple(result.get("candidates") or ()) if result.get("action") == "propose" else ()
+    return LoopDecision(
+        action=decision.action,
+        reason=decision.reason,
+        event_id=decision.event_id,
+        source_graph_id=decision.source_graph_id,
+        idempotency_key=decision.idempotency_key,
+        verdict=decision.verdict,
+        blocker_class=decision.blocker_class,
+        candidates=tuple(safe_event_payload(c) for c in candidates),
+        candidate=decision.candidate,
+        mutations=(),
+        metadata=safe_event_payload(metadata),
+        receipt=decision.receipt,
+    )
+
+
 def _evaluate_supersession(ev: LoopEvent, ledger: LoopLedger, policy: LoopPolicy, now: float, *, adapter: Any) -> LoopDecision:
     # Fail-closed: stale_final_fanin must be explicitly allowlisted before any candidate resolution
     if "stale_final_fanin" not in policy.allowlisted_blockers:
@@ -388,12 +467,21 @@ def _coerce_policy(policy: LoopPolicy | None) -> tuple[LoopPolicy, bool]:
         return LoopPolicy(kill_switch=True), True
     if not isinstance(policy.allowlisted_blockers, tuple) or not all(isinstance(b, str) for b in policy.allowlisted_blockers):
         return LoopPolicy(kill_switch=True), True
+    if not isinstance(policy.roadmap_auto_continue, bool):
+        return LoopPolicy(kill_switch=True), True
+    if not isinstance(policy.roadmap_allowlisted_transitions, tuple) or not all(isinstance(t, str) for t in policy.roadmap_allowlisted_transitions):
+        return LoopPolicy(kill_switch=True), True
+    if not isinstance(policy.roadmap_trusted_assignees, tuple) or not all(isinstance(a, str) for a in policy.roadmap_trusted_assignees):
+        return LoopPolicy(kill_switch=True), True
     numeric_values = (
         policy.max_rounds,
         policy.max_same_blocker,
         policy.max_auto_creates_per_run,
         policy.max_tasks_per_graph,
         policy.cooldown_seconds,
+        policy.roadmap_max_chain_depth,
+        policy.roadmap_max_promotions_per_roadmap,
+        policy.roadmap_promote_cooldown_seconds,
     )
     if any(not isinstance(v, int) or v < 0 for v in numeric_values):
         return LoopPolicy(kill_switch=True), True
@@ -426,6 +514,43 @@ def _graph_policy(policy: LoopPolicy, blocker: str) -> RemediationGraphPolicy:
         max_proposals_per_blocker_class=policy.max_tasks_per_graph,
         max_auto_creates_per_run=policy.max_auto_creates_per_run,
     )
+
+
+def _roadmap_policy(policy: LoopPolicy) -> RoadmapPromotionPolicy:
+    return RoadmapPromotionPolicy(
+        auto_continue=policy.roadmap_auto_continue,
+        allowlisted_transitions=policy.roadmap_allowlisted_transitions,
+        max_chain_depth=policy.roadmap_max_chain_depth,
+        max_promotions_per_roadmap=policy.roadmap_max_promotions_per_roadmap,
+        promote_cooldown_seconds=policy.roadmap_promote_cooldown_seconds,
+        require_review_edge=policy.roadmap_require_review_edge,
+        require_ack_edge=policy.roadmap_require_ack_edge,
+        require_trusted_assignee=policy.roadmap_require_trusted_assignee,
+        trusted_assignees=policy.roadmap_trusted_assignees,
+        require_origin_match=policy.require_origin_match,
+        expected_origin=policy.expected_origin,
+        expected_return_to=policy.expected_return_to,
+        require_policy_resolution=policy.roadmap_require_policy_resolution,
+    )
+
+
+def _safe_next_slice_result(result: dict[str, Any]) -> dict[str, Any]:
+    return safe_event_payload({
+        "success": bool(result.get("success")),
+        "action": str(result.get("action") or ""),
+        "reason": str(result.get("reason") or ""),
+        "verdict": str(result.get("verdict") or ""),
+        "transition_id": str(result.get("transition_id") or ""),
+        "roadmap_id": str(result.get("roadmap_id") or ""),
+        "chain_depth": int(result.get("chain_depth") or 0),
+        "idempotency_key": str(result.get("idempotency_key") or ""),
+        "request_only": bool(result.get("request_only", True)),
+        "dry_run": bool(result.get("dry_run", True)),
+        "candidate_count": len(result.get("candidates") or []),
+        "candidates": result.get("candidates") or [],
+        "mutations": [],
+        "adapter_attempts": 0,
+    })
 
 
 def _safe_creator_result(result: dict[str, Any]) -> dict[str, Any]:

@@ -312,6 +312,51 @@ def propose_remediation_graph(
     }
 
 
+def propose_next_slice_graph(
+    summary: str,
+    *,
+    event_id: str,
+    source_final_ref: str,
+    source_assignee: str = "",
+    origin: str = "",
+    return_to: str = "",
+    subscription_status: str = "unverified",
+    policy_resolution_ref: str = "",
+    chain_depth: int = 0,
+    occurred_at: float = 0.0,
+    registry: Any = None,
+    ledger: Any = None,
+    policy: Any = None,
+    adapter: Any = None,
+) -> dict[str, Any]:
+    """Request-only next-slice roadmap graph proposal surface.
+
+    Exposes the M14a roadmap-GO autopromoter through graph_creator without
+    adding a board-writer/apply boundary. ``adapter`` is intentionally ignored:
+    this function returns proposed graph JSON only, with no mutations.
+    """
+
+    from .roadmap import propose_roadmap_promotion
+
+    result = propose_roadmap_promotion(
+        summary,
+        event_id=event_id,
+        source_final_ref=source_final_ref,
+        source_assignee=source_assignee,
+        origin=origin,
+        return_to=return_to,
+        subscription_status=subscription_status,
+        policy_resolution_ref=policy_resolution_ref,
+        chain_depth=chain_depth,
+        occurred_at=occurred_at,
+        registry=registry,
+        ledger=ledger,
+        policy=policy,
+        adapter=None,
+    )
+    return safe_event_payload({**result, "mutations": [], "adapter_attempts": 0})
+
+
 def apply_remediation_graph(
     intent: GraphIntentCandidate,
     *,
