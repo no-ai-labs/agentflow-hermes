@@ -112,18 +112,26 @@ class FakeKanbanGraphAdapter:
 
     def create_graph(self, intent: GraphIntentCandidate) -> dict[str, Any]:
         self.create_calls.append(intent)
+        # Deterministic (no clock/random) task id so duplicate applies resolve to
+        # the same recorded id and never create a second board card.
+        task_id = "task:" + hashlib.sha256(intent.idempotency_key.encode()).hexdigest()[:12]
         task: dict[str, Any] = {
+            "task_id": task_id,
             "idempotency_key": intent.idempotency_key,
             "blocker": intent.blocker,
             "kind": intent.kind,
             "origin": intent.origin,
             "return_to": intent.return_to,
+            "assignee": (intent.metadata or {}).get("assignee", ""),
+            "acceptance_criteria": (intent.metadata or {}).get("acceptance_criteria", ""),
+            "ack_trigger_agent": (intent.metadata or {}).get("ack_trigger_agent", ""),
             "subscription_required": intent.subscription_required,
             "notify_subscribe_required": intent.subscription_required,
             "supersedes": intent.supersedes,
         }
         self.tasks.append(task)
         self._proposals.append({
+            "task_id": task_id,
             "idempotency_key": intent.idempotency_key,
             "blocker": intent.blocker,
             "kind": intent.kind,
@@ -139,6 +147,7 @@ class FakeKanbanGraphAdapter:
         return {
             "success": True,
             "action": "fake_noop",
+            "task_id": task_id,
             "idempotency_key": intent.idempotency_key,
             "mutations": [],
         }

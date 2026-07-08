@@ -3,12 +3,12 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
 from .graph_creator import GraphIntentCandidate, _policy_ref_body
-from .live.sanitize import safe_durable_ref, safe_event_payload, short_text
+from .live.sanitize import safe_durable_ref, safe_event_payload, sanitize_summary, short_text
 from .remediation import parse_verdict_summary
 
 _EXPLICIT_TRUE = {"true", "yes", "verified", "present", "ok"}
@@ -108,6 +108,13 @@ class RoadmapPromotionPolicy:
     expected_origin: str = ""
     expected_return_to: str = ""
     require_policy_resolution: bool = True
+    # M14b guarded apply-mode fields. apply_enabled is False by default so the
+    # public surface remains request-only unless an operator explicitly arms it.
+    apply_enabled: bool = False
+    impl_assignee: str = ""
+    review_assignee: str = ""
+    ack_trigger_agent: str = ""
+    max_apply_tasks_per_graph: int = 5
 
 
 @dataclass
@@ -145,6 +152,28 @@ class InMemoryRoadmapPromotionLedger:
 
     def record(self, receipt: dict[str, Any]) -> None:
         self.receipts.append(safe_event_payload(receipt))
+
+
+@dataclass
+class InMemoryRoadmapApplyLedger:
+    """Idempotency ledger for guarded apply-mode board writes.
+
+    Keyed by the roadmap promotion idempotency key. A repeated apply for the same
+    source final event/template resolves to the same key and returns the already
+    recorded task ids instead of creating a duplicate graph.
+    """
+
+    applied: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+    def has(self, idempotency_key: str) -> bool:
+        return _safe_ref(idempotency_key, field="idempotency_key") in self.applied
+
+    def get(self, idempotency_key: str) -> dict[str, Any]:
+        return dict(self.applied.get(_safe_ref(idempotency_key, field="idempotency_key")) or {})
+
+    def record(self, idempotency_key: str, receipt: dict[str, Any]) -> None:
+        safe_key = _safe_ref(idempotency_key, field="idempotency_key")
+        self.applied[safe_key] = safe_event_payload(receipt)
 
 
 def load_roadmap_transition_registry(path: str | Path) -> RoadmapTransitionRegistry:
@@ -326,6 +355,245 @@ def propose_roadmap_promotion(
     })
 
 
+def apply_roadmap_promotion(
+    summary: str,
+    *,
+    event_id: str,
+    source_final_ref: str,
+    source_assignee: str = "",
+    origin: str = "",
+    return_to: str = "",
+    subscription_status: str = "unverified",
+    policy_resolution_ref: str = "",
+    chain_depth: int = 0,
+    occurred_at: float = 0.0,
+    registry: RoadmapTransitionRegistry | None = None,
+    ledger: InMemoryRoadmapPromotionLedger | None = None,
+    apply_ledger: InMemoryRoadmapApplyLedger | None = None,
+    policy: RoadmapPromotionPolicy | None = None,
+    adapter: Any = None,
+) -> dict[str, Any]:
+    """Guarded apply-mode wrapper around ``propose_roadmap_promotion`` (M14b).
+
+    Delegates every safety gate to the request-only proposer, then creates the
+    implementation/review/final task graph via ``adapter`` only when
+    ``policy.apply_enabled`` is True and the proposal is a fresh GO promotion.
+
+    - ``apply_enabled=False`` (the default) returns the proposal with no board
+      writes and ``mutations=[]``.
+    - A repeated apply for the same source final event/template returns the
+      already-created task ids and a duplicate receipt; the adapter is never
+      called a second time.
+
+    This function performs no live send, no active wake, and no gateway/systemd
+    action. The only side effect is the injected board adapter, which is a
+    fake/no-op unless an operator arms a real writer.
+    """
+
+    effective_policy, _ = _coerce_policy(policy)
+    now = float(occurred_at or 0.0)
+    ledger = ledger or InMemoryRoadmapPromotionLedger()
+    apply_ledger = apply_ledger or InMemoryRoadmapApplyLedger()
+
+    proposal = propose_roadmap_promotion(
+        summary,
+        event_id=event_id,
+        source_final_ref=source_final_ref,
+        source_assignee=source_assignee,
+        origin=origin,
+        return_to=return_to,
+        subscription_status=subscription_status,
+        policy_resolution_ref=policy_resolution_ref,
+        chain_depth=chain_depth,
+        occurred_at=occurred_at,
+        registry=registry,
+        ledger=ledger,
+        policy=policy,
+        adapter=None,
+    )
+
+    key = _apply_key_from_proposal(proposal)
+
+    # Idempotency: a previously applied graph for this key returns existing ids.
+    if key and apply_ledger.has(key):
+        return _duplicate_apply_result(proposal, apply_ledger.get(key), key)
+
+    # Request-only unless every gate passed (fresh propose) AND apply is armed.
+    if proposal.get("action") != "propose":
+        return _proposal_only_result(proposal, apply_enabled=effective_policy.apply_enabled)
+    if not effective_policy.apply_enabled:
+        return _proposal_only_result(proposal, apply_enabled=False, reason="apply_disabled")
+    if registry is None or proposal.get("transition_id") not in registry.transitions:
+        return _proposal_only_result(proposal, apply_enabled=True, reason="unknown_transition")
+    if adapter is None:
+        return _proposal_only_result(proposal, apply_enabled=True, reason="no_adapter")
+
+    transition = registry.transitions[proposal["transition_id"]]
+    depth = int(proposal.get("chain_depth") or 0)
+    safe_source = _safe_ref(source_final_ref, field="source_final_ref") or "source_final"
+    plan = _build_plan(transition, key, depth, origin=origin, return_to=return_to, source_final_ref=safe_source)
+    if len(plan.candidates) > effective_policy.max_apply_tasks_per_graph:
+        return _proposal_only_result(proposal, apply_enabled=True, reason="max_apply_tasks_per_graph")
+
+    created_tasks: list[dict[str, Any]] = []
+    created_task_ids: list[str] = []
+    mutations: list[dict[str, Any]] = []
+    key_to_task_id: dict[str, str] = {}
+
+    for candidate in plan.candidates:
+        assignee, acceptance, ack_agent = _apply_task_profile(candidate.kind, transition, effective_policy)
+        enriched = replace(candidate, metadata={
+            **candidate.metadata,
+            "assignee": assignee,
+            "acceptance_criteria": acceptance,
+            "ack_trigger_agent": ack_agent,
+        })
+        result = adapter.create_graph(enriched)
+        task_id = str(result.get("task_id") or "")
+        key_to_task_id[candidate.idempotency_key] = task_id
+        parent_task_id = key_to_task_id.get(candidate.parent_key, "") if candidate.parent_key else ""
+        record = {
+            "task_id": task_id,
+            "kind": candidate.kind,
+            "idempotency_key": candidate.idempotency_key,
+            "assignee": assignee,
+            "acceptance_criteria": acceptance,
+            "ack_trigger_agent": ack_agent,
+            "parent_task_id": parent_task_id,
+            "origin": candidate.origin,
+            "return_to": candidate.return_to,
+        }
+        created_tasks.append(record)
+        created_task_ids.append(task_id)
+        mutations.append({"op": "create_task", "task_id": task_id, "kind": candidate.kind, "idempotency_key": candidate.idempotency_key})
+
+    sanitized_summary, _ = sanitize_summary(summary)
+    template_id = transition.version or transition.transition_id
+    receipt = safe_event_payload({
+        "event_id": _safe_ref(event_id, field="event_id") or "missing_event_id",
+        "idempotency_key": key,
+        "source_final_ref": safe_source,
+        "roadmap_id": transition.roadmap_id,
+        "transition_id": transition.transition_id,
+        "template_id": template_id,
+        "policy_resolution_ref": _safe_ref(policy_resolution_ref, field="policy_resolution_ref"),
+        "created_task_ids": created_task_ids,
+        "summary": sanitized_summary,
+        "decision": "apply",
+        "reason": "roadmap_graph_applied",
+        "chain_depth": depth,
+        "registry_ref": getattr(registry, "source_ref", ""),
+        "registry_hash": getattr(registry, "content_hash", ""),
+        "dry_run": False,
+        "request_only": False,
+        "created_at": now,
+    })
+
+    apply_ledger.record(key, {
+        "idempotency_key": key,
+        "created_task_ids": created_task_ids,
+        "tasks": created_tasks,
+        "receipt": receipt,
+    })
+
+    return safe_event_payload({
+        "success": True,
+        "action": "apply",
+        "applied": True,
+        "reason": "roadmap_graph_applied",
+        "apply_enabled": True,
+        "request_only": False,
+        "dry_run": False,
+        "verdict": "GO",
+        "transition_id": transition.transition_id,
+        "roadmap_id": transition.roadmap_id,
+        "template_id": template_id,
+        "chain_depth": depth,
+        "idempotency_key": key,
+        "created_task_ids": created_task_ids,
+        "tasks": created_tasks,
+        "candidates": proposal.get("candidates", []),
+        "mutations": mutations,
+        "receipt": receipt,
+    })
+
+
+def _apply_task_profile(kind: str, transition: RoadmapTransition, policy: RoadmapPromotionPolicy) -> tuple[str, str, str]:
+    """Return (assignee, acceptance_criteria, ack_trigger_agent) for a task kind.
+
+    All strings are template-derived, never synthesized from free-text summary
+    content, so the apply surface cannot smuggle raw source text into a card.
+    """
+    trusted = policy.trusted_assignees[0] if policy.trusted_assignees else ""
+    ack_agent_default = policy.ack_trigger_agent or trusted
+    to_slice = transition.to_slice
+    tid = transition.transition_id
+    if kind in {"impl", "implementation"}:
+        return (
+            policy.impl_assignee or trusted,
+            f"Complete {to_slice} implementation slice per template {tid}",
+            "",
+        )
+    if kind == "review":
+        return (
+            policy.review_assignee or trusted,
+            f"Review {to_slice} implementation and emit GO/BLOCK verdict for {tid}",
+            "",
+        )
+    # fanin / final: emit ACK edge back to origin.
+    return (
+        ack_agent_default,
+        f"Fan-in {to_slice} outputs, confirm review GO, emit ACK for {tid}",
+        ack_agent_default,
+    )
+
+
+def _apply_key_from_proposal(proposal: dict[str, Any]) -> str:
+    if proposal.get("idempotency_key"):
+        return str(proposal["idempotency_key"])
+    receipt = proposal.get("receipt") or {}
+    if receipt.get("idempotency_key"):
+        return str(receipt["idempotency_key"])
+    prior = proposal.get("prior_decision") or {}
+    return str(prior.get("idempotency_key") or "")
+
+
+def _proposal_only_result(proposal: dict[str, Any], *, apply_enabled: bool, reason: str = "") -> dict[str, Any]:
+    payload = {
+        **proposal,
+        "applied": False,
+        "apply_enabled": apply_enabled,
+        "mutations": [],
+        "created_task_ids": [],
+        "tasks": [],
+    }
+    if reason:
+        payload["apply_reason"] = reason
+    return safe_event_payload(payload)
+
+
+def _duplicate_apply_result(proposal: dict[str, Any], existing: dict[str, Any], key: str) -> dict[str, Any]:
+    receipt = dict(existing.get("receipt") or {})
+    receipt["duplicate"] = True
+    return safe_event_payload({
+        "success": True,
+        "action": "apply",
+        "applied": False,
+        "duplicate": True,
+        "reason": "duplicate_graph",
+        "apply_enabled": True,
+        "request_only": False,
+        "transition_id": proposal.get("transition_id", receipt.get("transition_id", "")),
+        "roadmap_id": proposal.get("roadmap_id", receipt.get("roadmap_id", "")),
+        "idempotency_key": key,
+        "created_task_ids": existing.get("created_task_ids", []),
+        "tasks": existing.get("tasks", []),
+        "candidates": proposal.get("candidates", []),
+        "mutations": [],
+        "receipt": receipt,
+    })
+
+
 def _build_plan(transition: RoadmapTransition, promotion_key: str, chain_depth: int, *, origin: str, return_to: str, source_final_ref: str) -> NextSlicePlan:
     candidates: list[GraphIntentCandidate] = []
     parent_key = ""
@@ -384,8 +652,12 @@ def _coerce_policy(policy: RoadmapPromotionPolicy | None) -> tuple[RoadmapPromot
         return RoadmapPromotionPolicy(), True
     if not isinstance(policy.trusted_assignees, tuple) or not all(isinstance(x, str) for x in policy.trusted_assignees):
         return RoadmapPromotionPolicy(), True
-    numeric = (policy.max_chain_depth, policy.max_promotions_per_roadmap, policy.promote_cooldown_seconds)
+    numeric = (policy.max_chain_depth, policy.max_promotions_per_roadmap, policy.promote_cooldown_seconds, policy.max_apply_tasks_per_graph)
     if any(isinstance(v, bool) or not isinstance(v, int) or v < 0 for v in numeric):
+        return RoadmapPromotionPolicy(), True
+    if not isinstance(policy.apply_enabled, bool):
+        return RoadmapPromotionPolicy(), True
+    if any(not isinstance(v, str) for v in (policy.impl_assignee, policy.review_assignee, policy.ack_trigger_agent)):
         return RoadmapPromotionPolicy(), True
     return policy, False
 
