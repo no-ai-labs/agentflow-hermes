@@ -13,6 +13,14 @@ from .live.sanitize import short_text
 from .loop_cli import add_loop_cli_args, run_loop_evaluate
 from .maintenance.installer import install_runner, render_install_plan
 from .roadmap_cli import add_roadmap_promote_args, add_roadmap_watch_args, run_roadmap_promote, run_roadmap_watch
+from .roadmap_register import (
+    add_roadmap_init_config_args,
+    add_roadmap_register_args,
+    add_roadmap_unregister_args,
+    run_roadmap_init_config,
+    run_roadmap_register,
+    run_roadmap_unregister,
+)
 from .maintenance.runner import run_runner_evaluate
 from .maintenance.trust import create_trust_grant, inspect_trust_grants, revoke_trust_grant
 from .maintenance.units import UnitRenderError
@@ -122,6 +130,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     add_roadmap_promote_args(roadmap_promote)
     roadmap_watch = roadmap_sub.add_parser("watch")
     add_roadmap_watch_args(roadmap_watch)
+    # M18 scaffold + registry UX (config/register only; no live cron changes).
+    roadmap_init = roadmap_sub.add_parser("init-config")
+    add_roadmap_init_config_args(roadmap_init)
+    roadmap_register = roadmap_sub.add_parser("register-watchdog")
+    add_roadmap_register_args(roadmap_register)
+    roadmap_unregister = roadmap_sub.add_parser("unregister-watchdog")
+    add_roadmap_unregister_args(roadmap_unregister)
 
     # M10 external maintenance runner (proposal/dry-run only from the CLI).
     maintenance = sub.add_parser("maintenance")
@@ -388,6 +403,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         return rc
     if args.cmd == "roadmap" and args.roadmap_cmd == "watch":
         rc, report = run_roadmap_watch(args)
+        print(_dump(report))
+        return rc
+    if args.cmd == "roadmap" and args.roadmap_cmd == "init-config":
+        rc, report = run_roadmap_init_config(args)
+        print(_dump(report))
+        return rc
+    if args.cmd == "roadmap" and args.roadmap_cmd == "register-watchdog":
+        rc, report = run_roadmap_register(args)
+        print(_dump(report))
+        return rc
+    if args.cmd == "roadmap" and args.roadmap_cmd == "unregister-watchdog":
+        rc, report = run_roadmap_unregister(args)
         print(_dump(report))
         return rc
     if args.cmd == "maintenance" and args.maintenance_cmd == "runner" and args.maintenance_runner_cmd == "evaluate":
