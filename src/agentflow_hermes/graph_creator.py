@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import re
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol
 
 from .live.sanitize import safe_durable_ref, safe_event_payload, short_text
 from .remediation import plan_remediation
@@ -158,6 +158,117 @@ class FakeKanbanGraphAdapter:
             if p.get("idempotency_key") == idempotency_key
             or str(p.get("idempotency_key") or "").startswith(f"{idempotency_key}:")
         ]
+
+
+class RealKanbanBoardClient(Protocol):
+    """Minimal same-board client protocol for real roadmap graph writes."""
+
+    def create_task(self, **kwargs: Any) -> dict[str, Any]: ...
+
+
+class RealKanbanGraphAdapter:
+    """Apply roadmap graph intents to a real same-board Kanban client.
+
+    This adapter is only constructed by explicit apply-mode configuration. It
+    preserves idempotency, carries template-derived assignees/body/acceptance,
+    links tasks in graph order, and can comment a sanitized receipt on the
+    source task. It has no live-send, active-wake, restart, or cross-board API.
+    """
+
+    def __init__(
+        self,
+        client: RealKanbanBoardClient,
+        *,
+        board: str = "",
+        source_task_id: str = "",
+        dispatch_created_impl: bool = False,
+    ) -> None:
+        self.client = client
+        self.board = short_text(board)
+        self.source_task_id = short_text(source_task_id)
+        self.dispatch_created_impl = dispatch_created_impl
+        self.create_calls: list[GraphIntentCandidate] = []
+        self._key_to_task_id: dict[str, str] = {}
+
+    def list_existing(self, idempotency_key: str) -> list[dict[str, Any]]:
+        safe_key = short_text(idempotency_key)
+        if not safe_key:
+            return []
+        finder = getattr(self.client, "find_tasks_by_idempotency_key", None)
+        if callable(finder):
+            result = finder(safe_key, board=self.board)
+            rows = result if isinstance(result, list) else []
+            return [dict(x) for x in rows if isinstance(x, dict)]
+        lister = getattr(self.client, "list_tasks", None)
+        if callable(lister):
+            result = lister(board=self.board, idempotency_key=safe_key)
+            rows = result if isinstance(result, list) else []
+            return [dict(x) for x in rows if isinstance(x, dict)]
+        return []
+
+    def create_graph(self, intent: GraphIntentCandidate) -> dict[str, Any]:
+        self.create_calls.append(intent)
+        existing = self.list_existing(intent.idempotency_key)
+        if existing:
+            task_id = _task_id_from_result(existing[0])
+            if task_id:
+                self._key_to_task_id[intent.idempotency_key] = task_id
+                return {"success": True, "action": "existing_task", "task_id": task_id, "idempotency_key": intent.idempotency_key, "mutations": []}
+
+        parent_task_id = self._key_to_task_id.get(intent.parent_key, "") if intent.parent_key else ""
+        parent_ids = [parent_task_id] if parent_task_id else []
+        metadata = dict(intent.metadata or {})
+        payload = safe_event_payload({
+            "board": self.board,
+            "title": intent.title,
+            "assignee": metadata.get("assignee", ""),
+            "body": intent.body,
+            "parents": parent_ids,
+            "idempotency_key": intent.idempotency_key,
+            "origin": intent.origin,
+            "return_to": intent.return_to,
+            "acceptance_criteria": metadata.get("acceptance_criteria", ""),
+            "ack_trigger_agent": metadata.get("ack_trigger_agent", ""),
+            "initial_status": "ready",
+        })
+        try:
+            result = self.client.create_task(**payload)
+        except TypeError:
+            result = self.client.create_task(payload)  # type: ignore[misc]
+        if not isinstance(result, dict):
+            return {"success": False, "error": "client_create_failed", "mutations": []}
+        task_id = _task_id_from_result(result)
+        if not task_id:
+            return {"success": False, "error": "client_missing_task_id", "mutations": []}
+        self._key_to_task_id[intent.idempotency_key] = task_id
+        if parent_task_id:
+            linker = getattr(self.client, "link_tasks", None)
+            if callable(linker):
+                linker(parent_id=parent_task_id, child_id=task_id, board=self.board)
+        return {"success": True, "action": "real_create", "task_id": task_id, "idempotency_key": intent.idempotency_key, "mutations": [{"op": "create_task", "task_id": task_id}]}
+
+    def record_source_receipt(self, receipt: dict[str, Any]) -> None:
+        if not self.source_task_id:
+            return
+        commenter = getattr(self.client, "comment_task", None)
+        if not callable(commenter):
+            return
+        ids = ",".join(str(x) for x in (receipt.get("created_task_ids") or []))
+        body = short_text(
+            "roadmap-autopromote applied "
+            f"transition={receipt.get('transition_id') or ''} "
+            f"template={receipt.get('template_id') or ''} "
+            f"ids={ids} idempotency_key={receipt.get('idempotency_key') or ''}",
+            max_len=480,
+        )
+        try:
+            commenter(task_id=self.source_task_id, body=body, board=self.board)
+        except TypeError:
+            commenter(self.source_task_id, body)
+
+
+def _task_id_from_result(result: dict[str, Any]) -> str:
+    return short_text(str(result.get("task_id") or result.get("id") or result.get("task") or ""))
 
 
 def _coerce_policy(policy: RemediationGraphPolicy | None) -> RemediationGraphPolicy:

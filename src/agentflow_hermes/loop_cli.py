@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 from typing import Any
 
-from .graph_creator import FakeKanbanGraphAdapter
+from .graph_creator import FakeKanbanGraphAdapter, RealKanbanGraphAdapter
 from .live.sanitize import sanitize_string, short_text
 from .loop_supervisor import (
     InMemoryLoopLedger,
@@ -93,6 +94,7 @@ _POLICY_FIELDS = (
     "roadmap_impl_assignee",
     "roadmap_review_assignee",
     "roadmap_ack_trigger_agent",
+    "roadmap_board_adapter_mode",
 )
 
 
@@ -139,6 +141,7 @@ def add_loop_cli_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--roadmap-impl-assignee", default=None)
     parser.add_argument("--roadmap-review-assignee", default=None)
     parser.add_argument("--roadmap-ack-trigger-agent", default=None)
+    parser.add_argument("--roadmap-board-adapter-mode", choices=("fake", "real"), default=None)
 
 
 def _load_fixture(path: str) -> dict[str, Any]:
@@ -280,6 +283,41 @@ def _sanitize_ledger_receipts(raw_receipts: list[Any]) -> tuple[list[dict[str, A
     return valid, dropped
 
 
+def resolve_kanban_board_client() -> Any | None:
+    """Return a real Hermes Kanban board client when available.
+
+    Agentflow has no hard dependency on Hermes internals, so this remains a soft
+    adapter point. Tests monkeypatch this function; production deployments can
+    provide an installed Hermes client exposing create_task, idempotency lookup,
+    and optional comment/link methods.
+    """
+    try:
+        from hermes.kanban import BoardClient  # type: ignore[import-not-found]
+    except Exception:
+        return None
+    try:
+        return BoardClient()
+    except Exception:
+        return None
+
+
+def _select_loop_adapter(policy: LoopPolicy, event: LoopEvent) -> Any | None:
+    apply_gate_open = policy.active_mode == "apply" and policy.apply_enabled is True
+    roadmap_real_requested = policy.roadmap_board_adapter_mode == "real" and policy.roadmap_apply_enabled is True
+    if not apply_gate_open:
+        return None
+    if roadmap_real_requested:
+        client = resolve_kanban_board_client()
+        if client is None:
+            return None
+        return RealKanbanGraphAdapter(
+            client,
+            board=os.environ.get("HERMES_KANBAN_BOARD", ""),
+            source_task_id=event.source_final_id or event.source_task_id,
+        )
+    return FakeKanbanGraphAdapter()
+
+
 def run_loop_evaluate(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
     """Evaluate one loop event and return (exit_code, sanitized report dict).
 
@@ -325,8 +363,7 @@ def run_loop_evaluate(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         return 2, {"success": False, "error": "malformed_ledger_receipts", "detail": f"invalid_receipts:{dropped_receipts}"}
     ledger = InMemoryLoopLedger(receipts=fixture_receipts)
 
-    apply_gate_open = policy.active_mode == "apply" and policy.apply_enabled is True
-    adapter = FakeKanbanGraphAdapter() if apply_gate_open else None
+    adapter = _select_loop_adapter(policy, event)
     roadmap_registry = _build_roadmap_registry(fixture.get("roadmap_registry"))
     roadmap_ledger = InMemoryRoadmapPromotionLedger()
     roadmap_apply_ledger = InMemoryRoadmapApplyLedger()

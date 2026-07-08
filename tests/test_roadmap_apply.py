@@ -6,6 +6,7 @@ from agentflow_hermes.graph_creator import (
     FakeKanbanGraphAdapter,
     GraphIntentCandidate,
     KanbanGraphAdapter,
+    RealKanbanGraphAdapter,
 )
 from agentflow_hermes.roadmap import (
     InMemoryRoadmapApplyLedger,
@@ -141,6 +142,65 @@ def test_valid_armed_event_creates_expected_task_graph():
     assert result["receipt"]["created_task_ids"] == result["created_task_ids"]
     assert result["receipt"]["template_id"] == "template-v1"
     assert result["idempotency_key"]
+
+
+class _RecordingKanbanClient:
+    def __init__(self) -> None:
+        self.created: list[dict[str, Any]] = []
+        self.comments: list[dict[str, Any]] = []
+        self.links: list[dict[str, Any]] = []
+
+    def find_tasks_by_idempotency_key(self, idempotency_key: str, *, board: str = "") -> list[dict[str, Any]]:
+        return [t for t in self.created if t["idempotency_key"] == idempotency_key and t["board"] == board]
+
+    def create_task(self, **kwargs: Any) -> dict[str, Any]:
+        task_id = f"t_real_{len(self.created) + 1}"
+        row = {**kwargs, "task_id": task_id}
+        self.created.append(row)
+        return {"success": True, "task_id": task_id}
+
+    def link_tasks(self, **kwargs: Any) -> None:
+        self.links.append(kwargs)
+
+    def comment_task(self, **kwargs: Any) -> None:
+        self.comments.append(kwargs)
+
+
+def test_real_kanban_adapter_calls_board_client_and_comments_receipt():
+    client = _RecordingKanbanClient()
+    adapter = RealKanbanGraphAdapter(client, board="main", source_task_id="t_final_source")
+
+    result = _apply(_summary(), adapter=adapter)
+
+    assert result["success"] is True
+    assert result["applied"] is True
+    assert result["created_task_ids"] == ["t_real_1", "t_real_2", "t_real_3"]
+    assert len(adapter.create_calls) == 3
+    assert [t["assignee"] for t in client.created] == ["impl-agent", "ccreviewer", "ack-agent"]
+    assert [t["parents"] for t in client.created] == [[], ["t_real_1"], ["t_real_2"]]
+    assert all(t["board"] == "main" for t in client.created)
+    assert client.links == [
+        {"parent_id": "t_real_1", "child_id": "t_real_2", "board": "main"},
+        {"parent_id": "t_real_2", "child_id": "t_real_3", "board": "main"},
+    ]
+    assert len(client.comments) == 1
+    comment = client.comments[0]
+    assert comment["task_id"] == "t_final_source"
+    assert "roadmap-autopromote applied" in comment["body"]
+    assert "template=template-v1" in comment["body"]
+    assert "t_real_1,t_real_2,t_real_3" in comment["body"]
+
+
+def test_real_kanban_adapter_duplicate_go_uses_apply_ledger_no_extra_create():
+    client = _RecordingKanbanClient()
+    apply_ledger = InMemoryRoadmapApplyLedger()
+    first = _apply(_summary(), adapter=RealKanbanGraphAdapter(client, board="main"), apply_ledger=apply_ledger)
+    second = _apply(_summary(), adapter=RealKanbanGraphAdapter(client, board="main"), apply_ledger=apply_ledger, event_id="evt-dup")
+
+    assert first["applied"] is True
+    assert second["duplicate"] is True
+    assert second["created_task_ids"] == first["created_task_ids"]
+    assert len(client.created) == 3
 
 
 def test_duplicate_event_returns_existing_ids_no_duplicate_creates():

@@ -55,6 +55,7 @@ class LoopPolicy:
     roadmap_impl_assignee: str = ""
     roadmap_review_assignee: str = ""
     roadmap_ack_trigger_agent: str = ""
+    roadmap_board_adapter_mode: str = "fake"
 
 
 @dataclass(frozen=True)
@@ -548,6 +549,8 @@ def _coerce_policy(policy: LoopPolicy | None) -> tuple[LoopPolicy, bool]:
     if not isinstance(policy.roadmap_apply_enabled, bool):
         return LoopPolicy(kill_switch=True), True
     if any(not isinstance(v, str) for v in (policy.roadmap_impl_assignee, policy.roadmap_review_assignee, policy.roadmap_ack_trigger_agent)):
+        return LoopPolicy(kill_switch=True), True
+    if policy.roadmap_board_adapter_mode not in {"fake", "real"}:
         return LoopPolicy(kill_switch=True), True
     numeric_values = (
         policy.max_rounds,

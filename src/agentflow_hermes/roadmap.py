@@ -524,6 +524,9 @@ def apply_roadmap_promotion(
         "tasks": created_tasks,
         "receipt": receipt,
     })
+    receipt_recorder = getattr(adapter, "record_source_receipt", None)
+    if callable(receipt_recorder):
+        receipt_recorder(receipt)
 
     return safe_event_payload({
         "success": True,
