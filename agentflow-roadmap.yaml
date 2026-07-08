@@ -1,0 +1,54 @@
+# agentflow-hermes repo-config roadmap GO autopromoter (M17).
+#
+# Consumed by `agentflow-hermes roadmap promote|watch --config agentflow-roadmap.yaml`.
+# `enabled: false` is the kill switch: the watchdog performs no board read or
+# write at all when this is false, regardless of --apply.
+enabled: true
+kill_switch: false
+
+# same_board_only: true means promote/watch only ever read/write this board.
+board: agentflow-hermes
+same_board_only: true
+
+# apply_mode is the repo-level arm for board writes. A real create still also
+# requires the operator to pass --apply on the CLI invocation; both gates must
+# be open before any task is created.
+apply_mode: true
+
+expected_origin: "Discord Devhub / #hermes-main"
+expected_return_to: "Discord Devhub / #hermes-main"
+
+impl_assignee: ccsupervisor
+review_assignee: ccreviewer
+# true means derive the ack agent from review_assignee/trusted_assignees;
+# set a string here instead to name a specific ack agent.
+ack_trigger_agent: true
+trusted_assignees:
+  - ccreviewer
+
+allowed_transitions:
+  - m16->m17.impl_review_fanin
+
+max_chain_depth: 3
+max_promotions_per_roadmap: 6
+promote_cooldown_seconds: 900
+require_review_edge: true
+require_ack_edge: true
+require_trusted_assignee: true
+require_origin_match: true
+require_policy_resolution: true
+
+transitions:
+  m16->m17.impl_review_fanin:
+    roadmap_id: agentflow-hermes.roadmap
+    from_slice: m16
+    to_slice: m17
+    slice_template:
+      - impl
+      - review
+      - fanin
+    policy_refs:
+      - design_opus
+      - implementation_default
+    max_chain_depth: 3
+    version: template-v1

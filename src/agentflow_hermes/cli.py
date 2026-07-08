@@ -12,6 +12,7 @@ from .live.policy import LivePolicy, load_policy, policy_path, save_policy
 from .live.sanitize import short_text
 from .loop_cli import add_loop_cli_args, run_loop_evaluate
 from .maintenance.installer import install_runner, render_install_plan
+from .roadmap_cli import add_roadmap_promote_args, add_roadmap_watch_args, run_roadmap_promote, run_roadmap_watch
 from .maintenance.runner import run_runner_evaluate
 from .maintenance.trust import create_trust_grant, inspect_trust_grants, revoke_trust_grant
 from .maintenance.units import UnitRenderError
@@ -113,6 +114,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     loop_sub = loop.add_subparsers(dest="loop_cmd", required=True)
     loop_evaluate = loop_sub.add_parser("evaluate")
     add_loop_cli_args(loop_evaluate)
+
+    # M17 repo-config roadmap GO autopromoter watchdog.
+    roadmap = sub.add_parser("roadmap")
+    roadmap_sub = roadmap.add_subparsers(dest="roadmap_cmd", required=True)
+    roadmap_promote = roadmap_sub.add_parser("promote")
+    add_roadmap_promote_args(roadmap_promote)
+    roadmap_watch = roadmap_sub.add_parser("watch")
+    add_roadmap_watch_args(roadmap_watch)
 
     # M10 external maintenance runner (proposal/dry-run only from the CLI).
     maintenance = sub.add_parser("maintenance")
@@ -371,6 +380,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if args.cmd == "loop" and args.loop_cmd == "evaluate":
         rc, report = run_loop_evaluate(args)
+        print(_dump(report))
+        return rc
+    if args.cmd == "roadmap" and args.roadmap_cmd == "promote":
+        rc, report = run_roadmap_promote(args)
+        print(_dump(report))
+        return rc
+    if args.cmd == "roadmap" and args.roadmap_cmd == "watch":
+        rc, report = run_roadmap_watch(args)
         print(_dump(report))
         return rc
     if args.cmd == "maintenance" and args.maintenance_cmd == "runner" and args.maintenance_runner_cmd == "evaluate":
