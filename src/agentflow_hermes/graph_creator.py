@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
+import subprocess
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Callable
 
 from .live.sanitize import safe_durable_ref, safe_event_payload, short_text
 from .remediation import plan_remediation
@@ -160,111 +162,152 @@ class FakeKanbanGraphAdapter:
         ]
 
 
-class RealKanbanBoardClient(Protocol):
-    """Minimal same-board client protocol for real roadmap graph writes."""
+KanbanCliRunner = Callable[[list[str]], tuple[int, str, str]]
 
-    def create_task(self, **kwargs: Any) -> dict[str, Any]: ...
+
+def _default_cli_runner(argv: list[str]) -> tuple[int, str, str]:
+    """Invoke the real `hermes` CLI as a subprocess. Never used unless armed."""
+    proc = subprocess.run(argv, capture_output=True, text=True, timeout=30, check=False)
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+_ORIGIN_PLATFORMS = ("discord", "slack", "telegram")
+_ORIGIN_CHAT_RE = re.compile(r"#([A-Za-z0-9_-]+)")
+_ORIGIN_COMPACT_RE = re.compile(
+    r"\b(discord|slack|telegram):([^:\s]+)(?::([^:\s]+))?(?::([^:\s]+))?\b",
+    re.IGNORECASE,
+)
+_ORIGIN_KV_RE = re.compile(r"\b(origin-)?(thread|user)[_-]?id=([^\s,;]+)", re.IGNORECASE)
+
+
+def _map_origin_to_flags(origin: str, return_to: str = "") -> dict[str, str]:
+    """Best-effort mapping of origin/return_to text to CLI origin flags.
+
+    Returns flags only when both a known platform keyword and a chat/channel id
+    are present. Supports compact refs such as ``discord:#hermes-main`` or
+    ``discord:chat:thread:user`` and free text such as
+    ``Discord Devhub / #hermes-main``. Otherwise returns {} so the caller omits
+    origin flags entirely rather than passing raw unsupported text through as
+    kwargs.
+    """
+    text = origin or return_to or ""
+    compact = _ORIGIN_COMPACT_RE.search(text)
+    if compact:
+        flags = {"platform": compact.group(1).lower(), "chat_id": compact.group(2).lstrip("#")}
+        if compact.group(3):
+            flags["thread_id"] = compact.group(3)
+        if compact.group(4):
+            flags["user_id"] = compact.group(4)
+        return flags
+
+    low = text.lower()
+    platform = next((p for p in _ORIGIN_PLATFORMS if p in low), "")
+    if not platform:
+        return {}
+    match = _ORIGIN_CHAT_RE.search(text)
+    if not match:
+        return {}
+    flags = {"platform": platform, "chat_id": match.group(1)}
+    for kv in _ORIGIN_KV_RE.finditer(text):
+        flags[f"{kv.group(2).lower()}_id"] = kv.group(3)
+    return flags
 
 
 class RealKanbanGraphAdapter:
-    """Apply roadmap graph intents to a real same-board Kanban client.
+    """Apply roadmap graph intents via the real `hermes kanban create` CLI.
 
-    This adapter is only constructed by explicit apply-mode configuration. It
+    This adapter is only constructed by explicit apply-mode configuration.
+    There is no importable Hermes board client available at runtime, so this
+    invokes an injectable CLI runner (a subprocess wrapper by default) that
+    shells out to `hermes kanban --board <board> create ... --json`. It
     preserves idempotency, carries template-derived assignees/body/acceptance,
-    links tasks in graph order, and can comment a sanitized receipt on the
-    source task. It has no live-send, active-wake, restart, or cross-board API.
+    and links tasks in graph order via repeated `--parent` flags. It has no
+    live-send, active-wake, restart, or cross-board API.
     """
 
     def __init__(
         self,
-        client: RealKanbanBoardClient,
+        runner: KanbanCliRunner | None = None,
         *,
         board: str = "",
         source_task_id: str = "",
-        dispatch_created_impl: bool = False,
+        created_by: str = "",
+        hermes_bin: str = "hermes",
     ) -> None:
-        self.client = client
+        self.runner = runner or _default_cli_runner
         self.board = short_text(board)
         self.source_task_id = short_text(source_task_id)
-        self.dispatch_created_impl = dispatch_created_impl
+        self.created_by = short_text(created_by)
+        self.hermes_bin = hermes_bin or "hermes"
         self.create_calls: list[GraphIntentCandidate] = []
         self._key_to_task_id: dict[str, str] = {}
 
     def list_existing(self, idempotency_key: str) -> list[dict[str, Any]]:
-        safe_key = short_text(idempotency_key)
-        if not safe_key:
-            return []
-        finder = getattr(self.client, "find_tasks_by_idempotency_key", None)
-        if callable(finder):
-            result = finder(safe_key, board=self.board)
-            rows = result if isinstance(result, list) else []
-            return [dict(x) for x in rows if isinstance(x, dict)]
-        lister = getattr(self.client, "list_tasks", None)
-        if callable(lister):
-            result = lister(board=self.board, idempotency_key=safe_key)
-            rows = result if isinstance(result, list) else []
-            return [dict(x) for x in rows if isinstance(x, dict)]
+        # The Hermes CLI create surface is idempotency-key aware server-side
+        # (a repeat `create` with the same --idempotency-key resolves to the
+        # same task); there is no separate lookup command to call here.
         return []
+
+    def _build_argv(self, intent: GraphIntentCandidate, parent_task_id: str) -> list[str]:
+        metadata = dict(intent.metadata or {})
+        assignee = short_text(str(metadata.get("assignee") or ""))
+        acceptance = str(metadata.get("acceptance_criteria") or "")
+        body = intent.body
+        if acceptance:
+            body = f"{body}\n\nAcceptance criteria:\n{acceptance}" if body else f"Acceptance criteria:\n{acceptance}"
+
+        argv = [
+            self.hermes_bin, "kanban", "--board", self.board, "create", intent.title,
+            "--body", body, "--assignee", assignee,
+        ]
+        if parent_task_id:
+            argv += ["--parent", parent_task_id]
+        argv += ["--idempotency-key", intent.idempotency_key]
+        if self.created_by:
+            argv += ["--created-by", self.created_by]
+
+        origin_flags = _map_origin_to_flags(intent.origin, intent.return_to)
+        if origin_flags:
+            argv += ["--origin-platform", origin_flags["platform"], "--origin-chat-id", origin_flags["chat_id"]]
+            if origin_flags.get("thread_id"):
+                argv += ["--origin-thread-id", origin_flags["thread_id"]]
+            if origin_flags.get("user_id"):
+                argv += ["--origin-user-id", origin_flags["user_id"]]
+
+        ack_agent = str(metadata.get("ack_trigger_agent") or "")
+        if ack_agent:
+            argv += ["--ack-trigger-agent"]
+
+        argv += ["--json"]
+        return argv
 
     def create_graph(self, intent: GraphIntentCandidate) -> dict[str, Any]:
         self.create_calls.append(intent)
-        existing = self.list_existing(intent.idempotency_key)
-        if existing:
-            task_id = _task_id_from_result(existing[0])
-            if task_id:
-                self._key_to_task_id[intent.idempotency_key] = task_id
-                return {"success": True, "action": "existing_task", "task_id": task_id, "idempotency_key": intent.idempotency_key, "mutations": []}
-
         parent_task_id = self._key_to_task_id.get(intent.parent_key, "") if intent.parent_key else ""
-        parent_ids = [parent_task_id] if parent_task_id else []
-        metadata = dict(intent.metadata or {})
-        payload = safe_event_payload({
-            "board": self.board,
-            "title": intent.title,
-            "assignee": metadata.get("assignee", ""),
-            "body": intent.body,
-            "parents": parent_ids,
-            "idempotency_key": intent.idempotency_key,
-            "origin": intent.origin,
-            "return_to": intent.return_to,
-            "acceptance_criteria": metadata.get("acceptance_criteria", ""),
-            "ack_trigger_agent": metadata.get("ack_trigger_agent", ""),
-            "initial_status": "ready",
-        })
+        argv = self._build_argv(intent, parent_task_id)
         try:
-            result = self.client.create_task(**payload)
-        except TypeError:
-            result = self.client.create_task(payload)  # type: ignore[misc]
+            returncode, stdout, _stderr = self.runner(argv)
+        except Exception:
+            return {"success": False, "error": "cli_runner_error", "mutations": []}
+        if returncode != 0:
+            return {"success": False, "error": "cli_runner_failed", "mutations": []}
+        try:
+            result = json.loads(stdout)
+        except (json.JSONDecodeError, ValueError, TypeError):
+            return {"success": False, "error": "cli_invalid_json", "mutations": []}
         if not isinstance(result, dict):
-            return {"success": False, "error": "client_create_failed", "mutations": []}
+            return {"success": False, "error": "cli_invalid_json", "mutations": []}
         task_id = _task_id_from_result(result)
         if not task_id:
-            return {"success": False, "error": "client_missing_task_id", "mutations": []}
+            return {"success": False, "error": "cli_missing_task_id", "mutations": []}
         self._key_to_task_id[intent.idempotency_key] = task_id
-        if parent_task_id:
-            linker = getattr(self.client, "link_tasks", None)
-            if callable(linker):
-                linker(parent_id=parent_task_id, child_id=task_id, board=self.board)
-        return {"success": True, "action": "real_create", "task_id": task_id, "idempotency_key": intent.idempotency_key, "mutations": [{"op": "create_task", "task_id": task_id}]}
-
-    def record_source_receipt(self, receipt: dict[str, Any]) -> None:
-        if not self.source_task_id:
-            return
-        commenter = getattr(self.client, "comment_task", None)
-        if not callable(commenter):
-            return
-        ids = ",".join(str(x) for x in (receipt.get("created_task_ids") or []))
-        body = short_text(
-            "roadmap-autopromote applied "
-            f"transition={receipt.get('transition_id') or ''} "
-            f"template={receipt.get('template_id') or ''} "
-            f"ids={ids} idempotency_key={receipt.get('idempotency_key') or ''}",
-            max_len=480,
-        )
-        try:
-            commenter(task_id=self.source_task_id, body=body, board=self.board)
-        except TypeError:
-            commenter(self.source_task_id, body)
+        return {
+            "success": True,
+            "action": "real_create",
+            "task_id": task_id,
+            "idempotency_key": intent.idempotency_key,
+            "mutations": [{"op": "create_task", "task_id": task_id}],
+        }
 
 
 def _task_id_from_result(result: dict[str, Any]) -> str:

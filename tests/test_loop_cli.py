@@ -71,21 +71,16 @@ def _go_summary(**overrides):
     return "\n".join(lines)
 
 
-class _RecordingKanbanClient:
+class _RecordingCliRunner:
+    """Fake injectable CLI runner recording argv shape, no subprocess spawned."""
+
     def __init__(self) -> None:
-        self.created = []
-        self.comments = []
+        self.calls = []
 
-    def find_tasks_by_idempotency_key(self, idempotency_key, *, board=""):
-        return [t for t in self.created if t["idempotency_key"] == idempotency_key and t["board"] == board]
-
-    def create_task(self, **kwargs):
-        task_id = f"t_cli_real_{len(self.created) + 1}"
-        self.created.append({**kwargs, "task_id": task_id})
-        return {"success": True, "task_id": task_id}
-
-    def comment_task(self, **kwargs):
-        self.comments.append(kwargs)
+    def __call__(self, argv):
+        self.calls.append(list(argv))
+        task_id = f"t_cli_real_{len(self.calls)}"
+        return 0, json.dumps({"success": True, "task_id": task_id}), ""
 
 
 def _event(**kwargs):
@@ -366,8 +361,8 @@ def test_cli_loop_evaluate_apply_with_apply_enabled_uses_fake_adapter(monkeypatc
 
 
 def test_cli_loop_evaluate_real_adapter_mode_calls_board_client(monkeypatch, tmp_path):
-    client = _RecordingKanbanClient()
-    monkeypatch.setattr(loop_cli, "resolve_kanban_board_client", lambda: client)
+    runner = _RecordingCliRunner()
+    monkeypatch.setattr(loop_cli, "resolve_kanban_board_client", lambda: runner)
     monkeypatch.setenv("HERMES_KANBAN_BOARD", "main")
     policy = dict(SAFE_POLICY)
     policy.update({
@@ -394,14 +389,13 @@ def test_cli_loop_evaluate_real_adapter_mode_calls_board_client(monkeypatch, tmp
     roadmap = data["receipt"]["decision_payload"]["roadmap_autopromote"]
     assert roadmap["applied"] is True
     assert roadmap["created_task_ids"] == ["t_cli_real_1", "t_cli_real_2", "t_cli_real_3"]
-    assert len(client.created) == 3
-    assert [t["board"] for t in client.created] == ["main", "main", "main"]
-    assert client.comments and client.comments[0]["task_id"] == "t_final_cli_real"
+    assert len(runner.calls) == 3
+    assert all(argv[:4] == ["hermes", "kanban", "--board", "main"] for argv in runner.calls)
 
 
 def test_cli_loop_evaluate_real_adapter_mode_requires_all_apply_gates(monkeypatch, tmp_path):
-    client = _RecordingKanbanClient()
-    monkeypatch.setattr(loop_cli, "resolve_kanban_board_client", lambda: client)
+    runner = _RecordingCliRunner()
+    monkeypatch.setattr(loop_cli, "resolve_kanban_board_client", lambda: runner)
     policy = dict(SAFE_POLICY)
     policy.update({
         "active_mode": "apply",
@@ -424,7 +418,7 @@ def test_cli_loop_evaluate_real_adapter_mode_requires_all_apply_gates(monkeypatc
     roadmap = data["receipt"]["decision_payload"]["roadmap_autopromote"]
     assert roadmap["applied"] is False
     assert roadmap["created_task_ids"] == []
-    assert client.created == []
+    assert runner.calls == []
 
 
 def test_cli_loop_evaluate_malformed_json_input_fails_closed_nonzero(monkeypatch, tmp_path):

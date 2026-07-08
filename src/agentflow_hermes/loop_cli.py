@@ -3,10 +3,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 from pathlib import Path
 from typing import Any
 
-from .graph_creator import FakeKanbanGraphAdapter, RealKanbanGraphAdapter
+from .graph_creator import FakeKanbanGraphAdapter, RealKanbanGraphAdapter, _default_cli_runner
 from .live.sanitize import sanitize_string, short_text
 from .loop_supervisor import (
     InMemoryLoopLedger,
@@ -284,21 +285,17 @@ def _sanitize_ledger_receipts(raw_receipts: list[Any]) -> tuple[list[dict[str, A
 
 
 def resolve_kanban_board_client() -> Any | None:
-    """Return a real Hermes Kanban board client when available.
+    """Return an injectable Hermes Kanban CLI runner when the `hermes` CLI is available.
 
-    Agentflow has no hard dependency on Hermes internals, so this remains a soft
-    adapter point. Tests monkeypatch this function; production deployments can
-    provide an installed Hermes client exposing create_task, idempotency lookup,
-    and optional comment/link methods.
+    There is no importable Hermes board client to resolve; the actual Hermes
+    surface is the `hermes kanban ... create ... --json` CLI. Agentflow has no
+    hard dependency on Hermes internals, so this remains a soft adapter point:
+    tests monkeypatch this function to inject a fake runner, and production
+    deployments rely on an installed `hermes` binary on PATH.
     """
-    try:
-        from hermes.kanban import BoardClient  # type: ignore[import-not-found]
-    except Exception:
+    if shutil.which("hermes") is None:
         return None
-    try:
-        return BoardClient()
-    except Exception:
-        return None
+    return _default_cli_runner
 
 
 def _select_loop_adapter(policy: LoopPolicy, event: LoopEvent) -> Any | None:
@@ -307,13 +304,14 @@ def _select_loop_adapter(policy: LoopPolicy, event: LoopEvent) -> Any | None:
     if not apply_gate_open:
         return None
     if roadmap_real_requested:
-        client = resolve_kanban_board_client()
-        if client is None:
+        runner = resolve_kanban_board_client()
+        if runner is None:
             return None
         return RealKanbanGraphAdapter(
-            client,
+            runner,
             board=os.environ.get("HERMES_KANBAN_BOARD", ""),
             source_task_id=event.source_final_id or event.source_task_id,
+            created_by=os.environ.get("HERMES_KANBAN_CREATED_BY", ""),
         )
     return FakeKanbanGraphAdapter()
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from agentflow_hermes.graph_creator import (
@@ -144,31 +145,21 @@ def test_valid_armed_event_creates_expected_task_graph():
     assert result["idempotency_key"]
 
 
-class _RecordingKanbanClient:
+class _RecordingCliRunner:
+    """Fake injectable CLI runner recording argv shape, no subprocess spawned."""
+
     def __init__(self) -> None:
-        self.created: list[dict[str, Any]] = []
-        self.comments: list[dict[str, Any]] = []
-        self.links: list[dict[str, Any]] = []
+        self.calls: list[list[str]] = []
 
-    def find_tasks_by_idempotency_key(self, idempotency_key: str, *, board: str = "") -> list[dict[str, Any]]:
-        return [t for t in self.created if t["idempotency_key"] == idempotency_key and t["board"] == board]
-
-    def create_task(self, **kwargs: Any) -> dict[str, Any]:
-        task_id = f"t_real_{len(self.created) + 1}"
-        row = {**kwargs, "task_id": task_id}
-        self.created.append(row)
-        return {"success": True, "task_id": task_id}
-
-    def link_tasks(self, **kwargs: Any) -> None:
-        self.links.append(kwargs)
-
-    def comment_task(self, **kwargs: Any) -> None:
-        self.comments.append(kwargs)
+    def __call__(self, argv: list[str]) -> tuple[int, str, str]:
+        self.calls.append(list(argv))
+        task_id = f"t_real_{len(self.calls)}"
+        return 0, json.dumps({"success": True, "task_id": task_id}), ""
 
 
-def test_real_kanban_adapter_calls_board_client_and_comments_receipt():
-    client = _RecordingKanbanClient()
-    adapter = RealKanbanGraphAdapter(client, board="main", source_task_id="t_final_source")
+def test_real_kanban_adapter_calls_cli_runner_with_exact_argv_shape():
+    runner = _RecordingCliRunner()
+    adapter = RealKanbanGraphAdapter(runner, board="main", source_task_id="t_final_source", created_by="loop-agent")
 
     result = _apply(_summary(), adapter=adapter)
 
@@ -176,31 +167,74 @@ def test_real_kanban_adapter_calls_board_client_and_comments_receipt():
     assert result["applied"] is True
     assert result["created_task_ids"] == ["t_real_1", "t_real_2", "t_real_3"]
     assert len(adapter.create_calls) == 3
-    assert [t["assignee"] for t in client.created] == ["impl-agent", "ccreviewer", "ack-agent"]
-    assert [t["parents"] for t in client.created] == [[], ["t_real_1"], ["t_real_2"]]
-    assert all(t["board"] == "main" for t in client.created)
-    assert client.links == [
-        {"parent_id": "t_real_1", "child_id": "t_real_2", "board": "main"},
-        {"parent_id": "t_real_2", "child_id": "t_real_3", "board": "main"},
+    assert len(runner.calls) == 3
+
+    impl_argv, review_argv, fanin_argv = runner.calls
+
+    assert impl_argv == [
+        "hermes", "kanban", "--board", "main", "create", "m15 impl [m14->m15.impl_review_fanin]",
+        "--body", impl_argv[impl_argv.index("--body") + 1],
+        "--assignee", "impl-agent",
+        "--idempotency-key", impl_argv[impl_argv.index("--idempotency-key") + 1],
+        "--created-by", "loop-agent",
+        "--origin-platform", "discord", "--origin-chat-id", "hermes-main",
+        "--json",
     ]
-    assert len(client.comments) == 1
-    comment = client.comments[0]
-    assert comment["task_id"] == "t_final_source"
-    assert "roadmap-autopromote applied" in comment["body"]
-    assert "template=template-v1" in comment["body"]
-    assert "t_real_1,t_real_2,t_real_3" in comment["body"]
+    assert "--parent" not in impl_argv
+    assert "--initial-status" not in impl_argv
+    assert "ready" not in impl_argv
+    assert "Acceptance criteria:" in impl_argv[impl_argv.index("--body") + 1]
+
+    assert "--parent" in review_argv
+    assert review_argv[review_argv.index("--parent") + 1] == "t_real_1"
+    assert "--assignee" in review_argv and review_argv[review_argv.index("--assignee") + 1] == "ccreviewer"
+    assert "--ack-trigger-agent" not in review_argv
+
+    assert "--parent" in fanin_argv
+    assert fanin_argv[fanin_argv.index("--parent") + 1] == "t_real_2"
+    assert fanin_argv[fanin_argv.index("--assignee") + 1] == "ack-agent"
+    assert "--ack-trigger-agent" in fanin_argv
+
+
+def test_real_kanban_adapter_maps_return_to_origin_thread_and_user_flags():
+    runner = _RecordingCliRunner()
+    adapter = RealKanbanGraphAdapter(runner, board="main")
+    intent = GraphIntentCandidate(
+        kind="impl",
+        blocker="roadmap",
+        title="impl task",
+        idempotency_key="roadmap:test:impl",
+        origin="",
+        return_to="discord:#hermes-main:thread-7:user-9",
+        policy_refs=(),
+        subscription_required=True,
+        supersedes="",
+        metadata={"assignee": "impl-agent", "acceptance_criteria": "prove argv"},
+        body="body",
+    )
+
+    result = adapter.create_graph(intent)
+
+    assert result["success"] is True
+    argv = runner.calls[0]
+    assert argv[argv.index("--origin-platform") + 1] == "discord"
+    assert argv[argv.index("--origin-chat-id") + 1] == "hermes-main"
+    assert argv[argv.index("--origin-thread-id") + 1] == "thread-7"
+    assert argv[argv.index("--origin-user-id") + 1] == "user-9"
+    assert "Acceptance criteria:\nprove argv" in argv[argv.index("--body") + 1]
+    assert "--initial-status" not in argv
 
 
 def test_real_kanban_adapter_duplicate_go_uses_apply_ledger_no_extra_create():
-    client = _RecordingKanbanClient()
+    runner = _RecordingCliRunner()
     apply_ledger = InMemoryRoadmapApplyLedger()
-    first = _apply(_summary(), adapter=RealKanbanGraphAdapter(client, board="main"), apply_ledger=apply_ledger)
-    second = _apply(_summary(), adapter=RealKanbanGraphAdapter(client, board="main"), apply_ledger=apply_ledger, event_id="evt-dup")
+    first = _apply(_summary(), adapter=RealKanbanGraphAdapter(runner, board="main"), apply_ledger=apply_ledger)
+    second = _apply(_summary(), adapter=RealKanbanGraphAdapter(runner, board="main"), apply_ledger=apply_ledger, event_id="evt-dup")
 
     assert first["applied"] is True
     assert second["duplicate"] is True
     assert second["created_task_ids"] == first["created_task_ids"]
-    assert len(client.created) == 3
+    assert len(runner.calls) == 3
 
 
 def test_duplicate_event_returns_existing_ids_no_duplicate_creates():
