@@ -83,10 +83,15 @@ def fetch_task_via_cli(runner: Any, board: str, task_id: str, *, hermes_bin: str
         return {"success": False, "error": "cli_invalid_json"}
     if not isinstance(data, dict):
         return {"success": False, "error": "cli_invalid_json"}
-    task = data.get("task") if isinstance(data.get("task"), dict) else data
+    nested_task = data.get("task")
+    task = nested_task if isinstance(nested_task, dict) else data
     if not isinstance(task, dict):
         return {"success": False, "error": "cli_invalid_json"}
-    return {"success": True, "task": task}
+    top_runs = data.get("runs")
+    runs = top_runs if isinstance(top_runs, list) else task.get("runs")
+    if not isinstance(runs, list):
+        runs = []
+    return {"success": True, "task": task, "runs": runs}
 
 
 def list_final_tasks_via_cli(runner: Any, board: str, *, hermes_bin: str = "hermes") -> list[str]:
@@ -128,9 +133,47 @@ def _task_str(task: dict[str, Any], *keys: str) -> str:
     return ""
 
 
-def loop_event_from_task(task: dict[str, Any], config: RepoRoadmapConfig, *, event_id: str) -> LoopEvent:
+_COMPLETED_RUN_STATUSES = {"completed", "done", "success"}
+
+
+def _latest_completed_run_summary(runs: list[Any]) -> str:
+    candidates: list[tuple[float | None, int, str]] = []
+    for index, run in enumerate(runs):
+        if not isinstance(run, dict):
+            continue
+        status = str(run.get("status") or "").lower()
+        outcome = str(run.get("outcome") or "").lower()
+        if status not in _COMPLETED_RUN_STATUSES and outcome not in _COMPLETED_RUN_STATUSES:
+            continue
+        summary = run.get("summary")
+        if not isinstance(summary, str) or not summary:
+            continue
+        timestamp: float | None = None
+        for key in ("ended_at", "completed_at", "started_at", "id"):
+            value = run.get(key)
+            if isinstance(value, (int, float)):
+                timestamp = float(value)
+                break
+        candidates.append((timestamp, index, summary))
+    if not candidates:
+        return ""
+    timestamped = [candidate for candidate in candidates if candidate[0] is not None]
+    if timestamped:
+        return max(timestamped, key=lambda candidate: candidate[0] or 0.0)[2]
+    # Hermes `show --json` commonly returns the newest run at runs[0]. When no
+    # timestamps are present, preserve that order instead of reversing it.
+    return candidates[0][2]
+
+
+def loop_event_from_task(
+    task: dict[str, Any], config: RepoRoadmapConfig, *, event_id: str, runs: list[Any] | None = None
+) -> LoopEvent:
     task_id = _task_str(task, "id", "task_id")
-    summary = _task_str(task, "result", "summary", "body", "title")
+    summary = (
+        _task_str(task, "result", "summary")
+        or _latest_completed_run_summary(runs or [])
+        or _task_str(task, "body", "title")
+    )
     origin = _task_str(task, "origin") or config.expected_origin
     return_to = _task_str(task, "return_to") or config.expected_return_to
     subscription_status = _task_str(task, "subscription_status") or "unverified"
@@ -209,7 +252,9 @@ def run_roadmap_promote(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
     if not fetched.get("success"):
         return 2, {"success": False, "error": fetched.get("error", "task_fetch_failed")}
 
-    event = loop_event_from_task(fetched["task"], config, event_id=f"roadmap-promote:{args.task}")
+    event = loop_event_from_task(
+        fetched["task"], config, event_id=f"roadmap-promote:{args.task}", runs=fetched.get("runs")
+    )
     policy = config_to_loop_policy(config, apply=args.apply)
     registry = build_registry(config)
     ledger = InMemoryLoopLedger()
@@ -282,7 +327,9 @@ def run_roadmap_watch(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         if not fetched.get("success"):
             results.append({"task": task_id, "success": False, "error": fetched.get("error", "task_fetch_failed")})
             continue
-        event = loop_event_from_task(fetched["task"], config, event_id=f"roadmap-watch:{task_id}")
+        event = loop_event_from_task(
+            fetched["task"], config, event_id=f"roadmap-watch:{task_id}", runs=fetched.get("runs")
+        )
         adapter = _make_adapter(config, runner, args.apply, source_task_id=task_id)
         try:
             decision = evaluate_loop_event(

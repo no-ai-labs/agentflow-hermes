@@ -82,16 +82,19 @@ def _go_summary(**overrides):
 class _RecordingCliRunner:
     """Fake injectable CLI runner recording argv shape, no subprocess spawned."""
 
-    def __init__(self, *, tasks=None, final_tasks=None):
+    def __init__(self, *, tasks=None, final_tasks=None, shows=None):
         self.calls = []
         self.tasks = tasks or {}
         self.final_tasks = final_tasks or []
+        self.shows = shows or {}
         self._create_seq = 0
 
     def __call__(self, argv):
         self.calls.append(list(argv))
         if "show" in argv:
             task_id = argv[argv.index("show") + 1]
+            if task_id in self.shows:
+                return 0, json.dumps(self.shows[task_id]), ""
             task = self.tasks.get(task_id)
             if task is None:
                 return 1, "", "not found"
@@ -135,6 +138,45 @@ def test_roadmap_promote_creates_impl_review_fanin_graph_via_real_adapter(monkey
     create_calls = [c for c in runner.calls if "create" in c]
     assert len(create_calls) == 3
     assert all(c[:4] == ["hermes", "kanban", "--board", "agentflow-hermes"] for c in create_calls)
+
+
+def test_roadmap_promote_reads_summary_from_latest_completed_run_when_task_summary_null(monkeypatch, tmp_path):
+    # Mirrors real `hermes kanban show --json` output: task.result/task.summary are
+    # null for done tasks, and the actual GO report lives in runs[].summary instead.
+    task = _task(id="t_212ab12f", result=None, summary=None)
+    show_payload = {
+        "task": task,
+        "runs": [
+            {
+                "id": 158,
+                "status": "done",
+                "outcome": "completed",
+                "ended_at": 1783501411,
+                "summary": _go_summary(),
+            },
+            {
+                "id": 157,
+                "status": "done",
+                "outcome": "completed",
+                "ended_at": 1783500000,
+                "summary": "Verdict: BLOCK — earlier attempt",
+            },
+        ],
+    }
+    runner = _RecordingCliRunner(shows={"t_212ab12f": show_payload})
+    monkeypatch.setattr(roadmap_cli, "resolve_kanban_board_client", lambda: runner)
+    config_path = _write_config(tmp_path)
+
+    rc, data = _run(["roadmap", "promote", "--config", config_path, "--task", "t_212ab12f"], monkeypatch, tmp_path)
+
+    assert rc == 0
+    assert data["action"] == "stabilize"
+    assert data["verdict"] == "GO"
+    roadmap = data["receipt"]["decision_payload"]["roadmap_autopromote"]
+    assert roadmap["action"] == "propose"
+    assert roadmap["applied"] is False
+    assert roadmap["created_task_ids"] == []
+    assert not any("create" in c for c in runner.calls)
 
 
 def test_roadmap_promote_without_apply_is_request_only_no_create(monkeypatch, tmp_path):
