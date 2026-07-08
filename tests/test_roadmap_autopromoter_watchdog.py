@@ -179,6 +179,56 @@ def test_roadmap_promote_reads_summary_from_latest_completed_run_when_task_summa
     assert not any("create" in c for c in runner.calls)
 
 
+def test_roadmap_promote_prefers_run_summary_over_short_task_result(monkeypatch, tmp_path):
+    # Mirrors real `hermes kanban show --json` output where task.result holds a
+    # short verdict string (not null) but the rich GO report with the required
+    # markers lives in runs[0].summary. The run summary must win so promote
+    # doesn't fail with missing_next_slice.
+    task = _task(
+        id="t_124e64db",
+        result="Verdict: GO",
+        subscription_status=None,
+        policy_resolution_ref=None,
+    )
+    show_payload = {
+        "task": task,
+        "runs": [
+            {
+                "id": 200,
+                "status": "done",
+                "outcome": "completed",
+                "ended_at": 1783501500,
+                "summary": _go_summary()
+                + "\nSubscription-Status: verified\nPolicy-Resolution-Ref: repo-config:agentflow-roadmap.yaml",
+            }
+        ],
+    }
+    runner = _RecordingCliRunner(shows={"t_124e64db": show_payload})
+    monkeypatch.setattr(roadmap_cli, "resolve_kanban_board_client", lambda: runner)
+    config_path = _write_config(tmp_path)
+
+    rc, data = _run(["roadmap", "promote", "--config", config_path, "--task", "t_124e64db"], monkeypatch, tmp_path)
+
+    assert rc == 0
+    assert data["action"] == "stabilize"
+    assert data["verdict"] == "GO"
+    roadmap = data["receipt"]["decision_payload"]["roadmap_autopromote"]
+    assert roadmap["action"] == "propose"
+    assert roadmap.get("reason") != "missing_next_slice"
+    assert roadmap["applied"] is False
+    assert roadmap["created_task_ids"] == []
+    assert not any("create" in c for c in runner.calls)
+
+    rc_apply, data_apply = _run(
+        ["roadmap", "promote", "--config", config_path, "--task", "t_124e64db", "--apply"], monkeypatch, tmp_path
+    )
+    assert rc_apply == 0
+    roadmap_apply = data_apply["receipt"]["decision_payload"]["roadmap_autopromote"]
+    assert roadmap_apply["action"] == "apply"
+    assert roadmap_apply["applied"] is True
+    assert roadmap_apply.get("reason") != "missing_next_slice"
+
+
 def test_roadmap_promote_without_apply_is_request_only_no_create(monkeypatch, tmp_path):
     runner = _RecordingCliRunner(tasks={"t_final_1": _task()})
     monkeypatch.setattr(roadmap_cli, "resolve_kanban_board_client", lambda: runner)

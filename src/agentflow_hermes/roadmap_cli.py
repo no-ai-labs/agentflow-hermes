@@ -165,19 +165,29 @@ def _latest_completed_run_summary(runs: list[Any]) -> str:
     return candidates[0][2]
 
 
+def _summary_marker(text: str, marker: str) -> str:
+    wanted = marker.strip().lower()
+    for line in (text or "").splitlines():
+        key, sep, value = line.partition(":")
+        if sep and key.strip().lower() == wanted:
+            return value.strip()
+    return ""
+
+
 def loop_event_from_task(
     task: dict[str, Any], config: RepoRoadmapConfig, *, event_id: str, runs: list[Any] | None = None
 ) -> LoopEvent:
     task_id = _task_str(task, "id", "task_id")
+    run_summary = _latest_completed_run_summary(runs or []) or _task_str(task, "latest_summary")
     summary = (
-        _task_str(task, "result", "summary")
-        or _latest_completed_run_summary(runs or [])
+        run_summary
+        or _task_str(task, "result", "summary")
         or _task_str(task, "body", "title")
     )
     origin = _task_str(task, "origin") or config.expected_origin
     return_to = _task_str(task, "return_to") or config.expected_return_to
-    subscription_status = _task_str(task, "subscription_status") or "unverified"
-    policy_resolution_ref = _task_str(task, "policy_resolution_ref")
+    subscription_status = _task_str(task, "subscription_status") or _summary_marker(summary, "Subscription-Status") or "unverified"
+    policy_resolution_ref = _task_str(task, "policy_resolution_ref") or _summary_marker(summary, "Policy-Resolution-Ref")
     assignee = _task_str(task, "assignee")
     return LoopEvent(
         event_id=event_id,
