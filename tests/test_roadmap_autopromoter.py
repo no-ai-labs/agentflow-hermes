@@ -1,11 +1,15 @@
 from __future__ import annotations
 
-from agentflow_hermes.graph_creator import FakeKanbanGraphAdapter
+from typing import Any
+
+from agentflow_hermes.graph_creator import FakeKanbanGraphAdapter, GraphIntentCandidate
 from agentflow_hermes.roadmap import (
+    InMemoryRoadmapApplyLedger,
     InMemoryRoadmapPromotionLedger,
     RoadmapPromotionPolicy,
     RoadmapTransition,
     RoadmapTransitionRegistry,
+    apply_roadmap_promotion,
     propose_roadmap_promotion,
 )
 
@@ -82,6 +86,53 @@ def _propose(summary: str, *, ledger=None, policy=None, adapter=None, **kwargs):
         adapter=adapter,
         **kwargs,
     )
+
+
+def _apply_policy(**kwargs) -> RoadmapPromotionPolicy:
+    defaults = {
+        "apply_enabled": True,
+        "impl_assignee": "impl-agent",
+        "review_assignee": "ccreviewer",
+        "ack_trigger_agent": "ack-agent",
+    }
+    defaults.update(kwargs)
+    return _policy(**defaults)
+
+
+def _apply(summary: str, *, ledger=None, apply_ledger=None, policy=None, adapter=None, **kwargs):
+    return apply_roadmap_promotion(
+        summary,
+        event_id=kwargs.pop("event_id", "evt-1"),
+        source_final_ref=kwargs.pop("source_final_ref", "t_final"),
+        source_assignee=kwargs.pop("source_assignee", "ccreviewer"),
+        origin=kwargs.pop("origin", "Discord Devhub / #hermes-main"),
+        return_to=kwargs.pop("return_to", "Discord Devhub / #hermes-main"),
+        subscription_status=kwargs.pop("subscription_status", "verified"),
+        policy_resolution_ref=kwargs.pop("policy_resolution_ref", "policy:model.implementation_default@v1"),
+        chain_depth=kwargs.pop("chain_depth", 0),
+        occurred_at=kwargs.pop("occurred_at", 1000.0),
+        registry=_registry(),
+        ledger=ledger or InMemoryRoadmapPromotionLedger(),
+        apply_ledger=apply_ledger or InMemoryRoadmapApplyLedger(),
+        policy=policy or _apply_policy(),
+        adapter=adapter,
+        **kwargs,
+    )
+
+
+class _PartialFailureAdapter:
+    """Adapter that creates the first candidate then fails every call after."""
+
+    def __init__(self, *, fail_after: int = 1) -> None:
+        self.fail_after = fail_after
+        self.create_calls: list[GraphIntentCandidate] = []
+
+    def create_graph(self, intent: GraphIntentCandidate) -> dict[str, Any]:
+        self.create_calls.append(intent)
+        if len(self.create_calls) > self.fail_after:
+            return {"success": False, "error": "adapter_partial_failure", "mutations": []}
+        task_id = "task:" + intent.idempotency_key
+        return {"success": True, "action": "partial", "task_id": task_id, "mutations": []}
 
 
 def test_final_go_auto_continue_false_is_refused_no_candidates():
@@ -188,3 +239,112 @@ def test_receipt_sanitizes_raw_paths_and_secrets():
     assert "/home/duckran" not in receipt_text
     assert "API_KEY" not in receipt_text
     assert "ref:sha256:" in receipt_text
+
+
+def test_failed_partial_apply_does_not_poison_shared_promotion_ledger():
+    """A failed adapter write must not commit a receipt to the *real* promotion
+    ledger. Regression for the M14b apply path calling propose_roadmap_promotion
+    with the real ledger before adapter writes succeed (poisons same-event
+    retries as duplicate_event and pollutes depth/repeat counters)."""
+    ledger = InMemoryRoadmapPromotionLedger()
+    apply_ledger = InMemoryRoadmapApplyLedger()
+    adapter = _PartialFailureAdapter(fail_after=1)
+
+    result = _apply(_summary(), ledger=ledger, apply_ledger=apply_ledger, adapter=adapter)
+
+    assert result["success"] is False
+    assert result["applied"] is False
+    assert result["reason"] == "adapter_create_failed"
+    # The real, shared promotion ledger must remain untouched by the failed attempt.
+    assert ledger.receipts == []
+    key = result["idempotency_key"]
+    assert not apply_ledger.has(key)
+
+
+def test_same_event_retry_after_partial_failure_succeeds_with_valid_adapter():
+    ledger = InMemoryRoadmapPromotionLedger()
+    apply_ledger = InMemoryRoadmapApplyLedger()
+    failing_adapter = _PartialFailureAdapter(fail_after=1)
+
+    failed = _apply(_summary(), ledger=ledger, apply_ledger=apply_ledger, adapter=failing_adapter)
+    assert failed["applied"] is False
+
+    working_adapter = FakeKanbanGraphAdapter()
+    retry = _apply(_summary(), ledger=ledger, apply_ledger=apply_ledger, adapter=working_adapter)
+
+    assert retry["success"] is True
+    assert retry["applied"] is True
+    assert retry["reason"] == "roadmap_graph_applied"
+    assert len(retry["created_task_ids"]) == 3
+    assert len(working_adapter.create_calls) == 3
+    # Exactly one promotion receipt committed for the eventually-successful apply.
+    assert len(ledger.receipts) == 1
+
+
+def test_failed_event_then_different_event_does_not_advance_depth_or_repeat_counters():
+    ledger = InMemoryRoadmapPromotionLedger()
+    apply_ledger = InMemoryRoadmapApplyLedger()
+    failing_adapter = _PartialFailureAdapter(fail_after=0)
+
+    failed = _apply(
+        _summary(),
+        ledger=ledger,
+        apply_ledger=apply_ledger,
+        adapter=failing_adapter,
+        event_id="evt-fail",
+        source_final_ref="t_final_fail",
+    )
+    assert failed["applied"] is False
+    assert ledger.receipts == []
+    assert ledger.current_chain_depth("hermes.live-migration") == 0
+    assert ledger.count_promotions("hermes.live-migration") == 0
+
+    working_adapter = FakeKanbanGraphAdapter()
+    different = _apply(
+        _summary(),
+        ledger=ledger,
+        apply_ledger=InMemoryRoadmapApplyLedger(),
+        adapter=working_adapter,
+        event_id="evt-other",
+        source_final_ref="t_final_other",
+    )
+    assert different["applied"] is True
+    # The other event's promotion is depth 1, unaffected by the earlier failure.
+    assert different["chain_depth"] == 1
+    assert ledger.current_chain_depth("hermes.live-migration") == 1
+    assert ledger.count_promotions("hermes.live-migration") == 1
+
+
+def test_valid_apply_records_both_ledgers_and_duplicate_skips_adapter():
+    ledger = InMemoryRoadmapPromotionLedger()
+    apply_ledger = InMemoryRoadmapApplyLedger()
+    adapter = FakeKanbanGraphAdapter()
+
+    first = _apply(_summary(), ledger=ledger, apply_ledger=apply_ledger, adapter=adapter)
+    assert first["applied"] is True
+    assert len(ledger.receipts) == 1
+    key = first["idempotency_key"]
+    assert apply_ledger.has(key)
+
+    second = _apply(_summary(), ledger=ledger, apply_ledger=apply_ledger, adapter=adapter)
+    assert second["applied"] is False
+    assert second["duplicate"] is True
+    assert second["created_task_ids"] == first["created_task_ids"]
+    # No second board write, and no extra promotion receipt.
+    assert len(adapter.create_calls) == 3
+    assert len(ledger.receipts) == 1
+
+
+def test_apply_request_only_behavior_unchanged_by_shadow_ledger():
+    ledger = InMemoryRoadmapPromotionLedger()
+    adapter = FakeKanbanGraphAdapter()
+
+    result = _apply(_summary(), ledger=ledger, policy=_apply_policy(apply_enabled=False), adapter=adapter)
+
+    assert result["applied"] is False
+    assert result["apply_enabled"] is False
+    assert result["action"] == "propose"
+    assert len(adapter.create_calls) == 0
+    # A non-applying proposal (apply disabled) is still recorded, matching the
+    # pre-existing request-only recording semantics.
+    assert len(ledger.receipts) == 1

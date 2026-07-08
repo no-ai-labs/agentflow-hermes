@@ -395,6 +395,16 @@ def apply_roadmap_promotion(
     ledger = ledger or InMemoryRoadmapPromotionLedger()
     apply_ledger = apply_ledger or InMemoryRoadmapApplyLedger()
 
+    # A fresh proposal is evaluated against a shadow ledger seeded from the real
+    # one, so duplicate/depth/repeat/cooldown checks see prior state exactly as
+    # they would with the real ledger. The shadow's new receipt is only merged
+    # into the real ledger once we know no apply-mode write can fail it: either
+    # apply is not armed (request-only semantics), or every adapter create_graph
+    # succeeds.
+    # This prevents a failed/partial apply from poisoning the promotion ledger
+    # (same-event retries wrongly resolving to duplicate_event, or a different
+    # event wrongly inheriting advanced depth/repeat counters).
+    shadow_ledger = InMemoryRoadmapPromotionLedger(receipts=list(ledger.receipts))
     proposal = propose_roadmap_promotion(
         summary,
         event_id=event_id,
@@ -407,10 +417,14 @@ def apply_roadmap_promotion(
         chain_depth=chain_depth,
         occurred_at=occurred_at,
         registry=registry,
-        ledger=ledger,
+        ledger=shadow_ledger,
         policy=policy,
         adapter=None,
     )
+
+    def _commit_proposal_receipt() -> None:
+        new_receipts = shadow_ledger.receipts[len(ledger.receipts):]
+        ledger.receipts.extend(new_receipts)
 
     key = _apply_key_from_proposal(proposal)
 
@@ -420,8 +434,10 @@ def apply_roadmap_promotion(
 
     # Request-only unless every gate passed (fresh propose) AND apply is armed.
     if proposal.get("action") != "propose":
+        _commit_proposal_receipt()
         return _proposal_only_result(proposal, apply_enabled=effective_policy.apply_enabled)
     if not effective_policy.apply_enabled:
+        _commit_proposal_receipt()
         return _proposal_only_result(proposal, apply_enabled=False, reason="apply_disabled")
     if registry is None or proposal.get("transition_id") not in registry.transitions:
         return _proposal_only_result(proposal, apply_enabled=True, reason="unknown_transition")
@@ -501,6 +517,7 @@ def apply_roadmap_promotion(
         "created_at": now,
     })
 
+    _commit_proposal_receipt()
     apply_ledger.record(key, {
         "idempotency_key": key,
         "created_task_ids": created_task_ids,
