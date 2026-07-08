@@ -14,6 +14,7 @@ from .loop_supervisor import (
     build_loop_report,
     evaluate_loop_event,
 )
+from .roadmap import InMemoryRoadmapApplyLedger, InMemoryRoadmapPromotionLedger, RoadmapTransition, RoadmapTransitionRegistry
 
 _EVENT_FIELDS = (
     "event_id",
@@ -85,6 +86,13 @@ _POLICY_FIELDS = (
     "request_only_by_default",
     "expected_origin",
     "expected_return_to",
+    "roadmap_auto_continue",
+    "roadmap_allowlisted_transitions",
+    "roadmap_trusted_assignees",
+    "roadmap_apply_enabled",
+    "roadmap_impl_assignee",
+    "roadmap_review_assignee",
+    "roadmap_ack_trigger_agent",
 )
 
 
@@ -123,6 +131,14 @@ def add_loop_cli_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--require-policy-resolution", dest="require_policy_resolution", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--expected-origin", default=None)
     parser.add_argument("--expected-return-to", default=None)
+
+    parser.add_argument("--roadmap-auto-continue", dest="roadmap_auto_continue", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--roadmap-allowlisted-transitions", default=None, help="comma-separated roadmap transition ids")
+    parser.add_argument("--roadmap-trusted-assignees", default=None, help="comma-separated trusted assignees")
+    parser.add_argument("--roadmap-apply-enabled", dest="roadmap_apply_enabled", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--roadmap-impl-assignee", default=None)
+    parser.add_argument("--roadmap-review-assignee", default=None)
+    parser.add_argument("--roadmap-ack-trigger-agent", default=None)
 
 
 def _load_fixture(path: str) -> dict[str, Any]:
@@ -167,7 +183,48 @@ def _build_policy_kwargs(args: argparse.Namespace, fixture_policy: dict[str, Any
         kwargs["allowlisted_blockers"] = tuple(b.strip() for b in blockers.split(",") if b.strip())
     elif isinstance(blockers, list):
         kwargs["allowlisted_blockers"] = tuple(blockers)
+    transitions = kwargs.get("roadmap_allowlisted_transitions")
+    if isinstance(transitions, str):
+        kwargs["roadmap_allowlisted_transitions"] = tuple(t.strip() for t in transitions.split(",") if t.strip())
+    elif isinstance(transitions, list):
+        kwargs["roadmap_allowlisted_transitions"] = tuple(transitions)
+    assignees = kwargs.get("roadmap_trusted_assignees")
+    if isinstance(assignees, str):
+        kwargs["roadmap_trusted_assignees"] = tuple(a.strip() for a in assignees.split(",") if a.strip())
+    elif isinstance(assignees, list):
+        kwargs["roadmap_trusted_assignees"] = tuple(assignees)
     return kwargs
+
+
+def _build_roadmap_registry(raw: Any) -> RoadmapTransitionRegistry | None:
+    if not isinstance(raw, dict):
+        return None
+    transitions_raw = raw.get("transitions")
+    if not isinstance(transitions_raw, dict):
+        return None
+    transitions: dict[str, RoadmapTransition] = {}
+    try:
+        for key, value in transitions_raw.items():
+            if not isinstance(value, dict):
+                return None
+            transition = RoadmapTransition(
+                transition_id=str(value.get("transition_id") or key),
+                roadmap_id=str(value.get("roadmap_id") or ""),
+                from_slice=str(value.get("from_slice") or ""),
+                to_slice=str(value.get("to_slice") or ""),
+                slice_template=tuple(str(x) for x in value.get("slice_template") or ()),
+                policy_refs=tuple(str(x) for x in value.get("policy_refs") or ()),
+                max_chain_depth=int(value.get("max_chain_depth", 3)),
+                version=str(value.get("version") or ""),
+            )
+            transitions[key] = transition
+        return RoadmapTransitionRegistry(
+            version=str(raw.get("version") or "fixture"),
+            source_ref=str(raw.get("source_ref") or "fixture"),
+            transitions=transitions,
+        )
+    except (TypeError, ValueError):
+        return None
 
 
 def _validate_event_kwargs(kwargs: dict[str, Any]) -> str | None:
@@ -270,9 +327,20 @@ def run_loop_evaluate(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
 
     apply_gate_open = policy.active_mode == "apply" and policy.apply_enabled is True
     adapter = FakeKanbanGraphAdapter() if apply_gate_open else None
+    roadmap_registry = _build_roadmap_registry(fixture.get("roadmap_registry"))
+    roadmap_ledger = InMemoryRoadmapPromotionLedger()
+    roadmap_apply_ledger = InMemoryRoadmapApplyLedger()
 
     try:
-        decision = evaluate_loop_event(event, ledger, policy, adapter=adapter)
+        decision = evaluate_loop_event(
+            event,
+            ledger,
+            policy,
+            adapter=adapter,
+            roadmap_registry=roadmap_registry,
+            roadmap_ledger=roadmap_ledger,
+            roadmap_apply_ledger=roadmap_apply_ledger,
+        )
         report = build_loop_report(decision)
     except Exception as exc:  # fail closed: never leak a raw traceback to CLI output
         return 2, {"success": False, "error": "evaluation_failed", "detail": sanitize_string(str(exc))}

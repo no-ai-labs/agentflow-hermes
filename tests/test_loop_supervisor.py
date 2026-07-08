@@ -5,6 +5,7 @@ import json
 from agentflow_hermes.graph_creator import FakeKanbanGraphAdapter, propose_next_slice_graph
 from agentflow_hermes.loop_supervisor import InMemoryLoopLedger, LoopEvent, LoopPolicy, evaluate_loop_event
 from agentflow_hermes.roadmap import InMemoryRoadmapPromotionLedger, RoadmapPromotionPolicy, RoadmapTransition, RoadmapTransitionRegistry
+from agentflow_hermes.roadmap import InMemoryRoadmapApplyLedger
 
 
 SAFE_POLICY = LoopPolicy(
@@ -167,6 +168,105 @@ def test_loop_go_autopromote_refusals_are_machine_readable_noop_no_candidates():
         assert proposal["reason"] == reason
         assert decision.candidates == ()
         assert proposal["mutations"] == []
+
+
+def test_loop_go_autopromote_apply_creates_next_graph_and_receipt():
+    adapter = FakeKanbanGraphAdapter()
+    roadmap_ledger = InMemoryRoadmapPromotionLedger()
+    apply_ledger = InMemoryRoadmapApplyLedger()
+    policy = _roadmap_policy(
+        active_mode="apply",
+        apply_enabled=True,
+        roadmap_apply_enabled=True,
+        roadmap_impl_assignee="impl-agent",
+        roadmap_review_assignee="ccreviewer",
+        roadmap_ack_trigger_agent="ack-agent",
+    )
+
+    decision = evaluate_loop_event(
+        _event(
+            verdict="GO",
+            summary=_go_summary() + "\nSecret: API_KEY=abc123 at /home/alice/private/final",
+            source_final_id="/home/alice/private/final API_KEY=abc123",
+            source_assignee="ccreviewer",
+        ),
+        InMemoryLoopLedger(),
+        policy,
+        adapter=adapter,
+        roadmap_registry=_roadmap_registry(),
+        roadmap_ledger=roadmap_ledger,
+        roadmap_apply_ledger=apply_ledger,
+    )
+
+    result = decision.metadata["roadmap_autopromote"]
+    assert decision.action == "stabilize"
+    assert result["action"] == "apply"
+    assert result["applied"] is True
+    assert result["dry_run"] is False
+    assert result["adapter_attempts"] == 3
+    assert [t["kind"] for t in result["tasks"]] == ["impl", "review", "fanin"]
+    assert [t["assignee"] for t in result["tasks"]] == ["impl-agent", "ccreviewer", "ack-agent"]
+    assert result["tasks"][1]["parent_task_id"] == result["tasks"][0]["task_id"]
+    assert result["tasks"][2]["parent_task_id"] == result["tasks"][1]["task_id"]
+    assert result["tasks"][2]["ack_trigger_agent"] == "ack-agent"
+    assert all(t["origin"] == "discord:#hermes-main" and t["return_to"] == "discord:#hermes-main" for t in result["tasks"])
+    assert all(t["acceptance_criteria"] for t in result["tasks"])
+    assert result["created_task_ids"] == [t["task_id"] for t in result["tasks"]]
+    receipt_blob = json.dumps({"receipt": decision.receipt, "roadmap": result})
+    assert "roadmap-autopromote applied" in receipt_blob
+    assert "/home/alice" not in receipt_blob
+    assert "API_KEY" not in receipt_blob
+    assert "abc123" not in receipt_blob
+
+
+def test_loop_go_autopromote_duplicate_event_returns_existing_ids_no_create():
+    adapter = FakeKanbanGraphAdapter()
+    roadmap_ledger = InMemoryRoadmapPromotionLedger()
+    apply_ledger = InMemoryRoadmapApplyLedger()
+    loop_ledger = InMemoryLoopLedger()
+    policy = _roadmap_policy(
+        active_mode="apply",
+        apply_enabled=True,
+        roadmap_apply_enabled=True,
+        roadmap_impl_assignee="impl-agent",
+        roadmap_review_assignee="ccreviewer",
+        roadmap_ack_trigger_agent="ack-agent",
+    )
+    event = _event(verdict="GO", summary=_go_summary(), source_final_id="t_final_dup", source_assignee="ccreviewer")
+
+    first = evaluate_loop_event(event, loop_ledger, policy, adapter=adapter, roadmap_registry=_roadmap_registry(), roadmap_ledger=roadmap_ledger, roadmap_apply_ledger=apply_ledger)
+    second = evaluate_loop_event(event, loop_ledger, policy, adapter=adapter, roadmap_registry=_roadmap_registry(), roadmap_ledger=roadmap_ledger, roadmap_apply_ledger=apply_ledger)
+
+    created = first.metadata["roadmap_autopromote"]["created_task_ids"]
+    prior = second.metadata["prior_decision"]["roadmap_autopromote"]
+    assert first.metadata["roadmap_autopromote"]["applied"] is True
+    assert second.reason == "duplicate_event"
+    assert prior["created_task_ids"] == created
+    assert len(adapter.create_calls) == 3
+
+
+def test_loop_go_autopromote_apply_refusals_create_nothing():
+    cases = [
+        (_go_summary(verdict="BLOCK"), "not_go"),
+        (_go_summary(next_slice=None), "missing_next_slice"),
+        (_go_summary(auto="false"), "autopromote_disabled"),
+        (_go_summary(transition="m14->m16.freeform"), "unknown_transition"),
+    ]
+    for idx, (summary, reason) in enumerate(cases):
+        adapter = FakeKanbanGraphAdapter()
+        decision = evaluate_loop_event(
+            _event(event_id=f"evt-roadmap-apply-refuse-{idx}", verdict="GO", summary=summary, source_final_id=f"t_final_refuse_{idx}", source_assignee="ccreviewer"),
+            InMemoryLoopLedger(),
+            _roadmap_policy(active_mode="apply", apply_enabled=True, roadmap_apply_enabled=True),
+            adapter=adapter,
+            roadmap_registry=_roadmap_registry(),
+            roadmap_ledger=InMemoryRoadmapPromotionLedger(),
+        )
+        result = decision.metadata["roadmap_autopromote"]
+        assert result["applied"] is False
+        assert result["created_task_ids"] == []
+        assert result["reason"] == reason
+        assert len(adapter.create_calls) == 0
 
 
 def test_graph_creator_propose_next_slice_graph_is_request_only_no_mutations():

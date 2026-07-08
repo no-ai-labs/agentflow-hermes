@@ -37,6 +37,39 @@ SAFE_POLICY = {
 }
 
 
+def _roadmap_registry_fixture():
+    return {
+        "version": "test-v1",
+        "source_ref": "test-registry",
+        "transitions": {
+            "m14->m15.impl_review_fanin": {
+                "transition_id": "m14->m15.impl_review_fanin",
+                "roadmap_id": "hermes.live-migration",
+                "from_slice": "m14",
+                "to_slice": "m15",
+                "slice_template": ["impl", "review", "fanin"],
+                "policy_refs": ["design_opus", "implementation_default"],
+                "max_chain_depth": 2,
+                "version": "template-v1",
+            }
+        },
+    }
+
+
+def _go_summary(**overrides):
+    lines = [
+        f"Verdict: {overrides.get('verdict', 'GO')}",
+        "Origin/return_to: discord:#hermes-main",
+        "Return-To: discord:#hermes-main",
+        f"Auto-Continue: {overrides.get('auto', 'true')}",
+        f"Roadmap-Transition: {overrides.get('transition', 'm14->m15.impl_review_fanin')}",
+    ]
+    if "next_slice" not in overrides or overrides["next_slice"] is not None:
+        lines.append(f"Next-Slice: {overrides.get('next_slice', 'm15')}")
+    lines.extend(["Review-Edge: verified", "ACK-Edge: verified", "Parent-GO: verified"])
+    return "\n".join(lines)
+
+
 def _event(**kwargs):
     defaults = {
         "event_id": "evt-1",
@@ -81,6 +114,38 @@ def test_cli_loop_evaluate_go_returns_stop_stable(monkeypatch, tmp_path):
     assert data["dry_run"] is True
     assert data["applied"] is False
     assert data["mutations"] == []
+
+
+def test_cli_loop_evaluate_go_roadmap_apply_fixture_creates_fake_graph(monkeypatch, tmp_path):
+    policy = dict(SAFE_POLICY)
+    policy.update({
+        "active_mode": "apply",
+        "apply_enabled": True,
+        "roadmap_auto_continue": True,
+        "roadmap_allowlisted_transitions": ["m14->m15.impl_review_fanin"],
+        "roadmap_trusted_assignees": ["ccreviewer"],
+        "roadmap_apply_enabled": True,
+        "roadmap_impl_assignee": "impl-agent",
+        "roadmap_review_assignee": "ccreviewer",
+        "roadmap_ack_trigger_agent": "ack-agent",
+    })
+    fixture = _write_fixture(tmp_path, {
+        "event": _event(verdict="GO", summary=_go_summary(), source_final_id="t_final_cli", source_assignee="ccreviewer"),
+        "policy": policy,
+        "roadmap_registry": _roadmap_registry_fixture(),
+    })
+    rc, data = _run(["loop", "evaluate", "--input-file", fixture], monkeypatch, tmp_path)
+
+    assert rc == 0
+    assert data["action"] == "stabilize"
+    receipt = data["receipt"]
+    assert isinstance(receipt, dict)
+    roadmap = receipt["decision_payload"]["roadmap_autopromote"]
+    assert isinstance(roadmap, dict)
+    assert roadmap["action"] == "apply"
+    assert roadmap["applied"] is True
+    assert len(roadmap["created_task_ids"]) == 3
+    assert "roadmap-autopromote applied" in roadmap["source_comment"]
 
 
 def test_cli_loop_evaluate_need_more_escalates_no_auto_create(monkeypatch, tmp_path):

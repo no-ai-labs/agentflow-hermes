@@ -7,7 +7,12 @@ from typing import Any, Callable, Protocol
 from .graph_creator import RemediationGraphPolicy, propose_next_slice_graph, propose_remediation_graph, resolve_stale_final_candidate
 from .live.sanitize import safe_durable_ref, safe_event_payload, short_text
 from .remediation import parse_verdict_summary
-from .roadmap import InMemoryRoadmapPromotionLedger, RoadmapPromotionPolicy
+from .roadmap import (
+    InMemoryRoadmapApplyLedger,
+    InMemoryRoadmapPromotionLedger,
+    RoadmapPromotionPolicy,
+    apply_roadmap_promotion,
+)
 
 
 _VALID_MODES = {"disabled", "observe_only", "request_only", "apply"}
@@ -43,6 +48,13 @@ class LoopPolicy:
     roadmap_require_trusted_assignee: bool = True
     roadmap_trusted_assignees: tuple[str, ...] = ()
     roadmap_require_policy_resolution: bool = True
+    # M15 guarded roadmap-apply config. apply is armed only when the loop apply
+    # gate is open (active_mode="apply" AND apply_enabled) AND roadmap_apply_enabled
+    # is True; otherwise the GO path stays request-only.
+    roadmap_apply_enabled: bool = False
+    roadmap_impl_assignee: str = ""
+    roadmap_review_assignee: str = ""
+    roadmap_ack_trigger_agent: str = ""
 
 
 @dataclass(frozen=True)
@@ -207,6 +219,7 @@ def evaluate_loop_event(
     adapter: Any = None,
     roadmap_registry: Any = None,
     roadmap_ledger: Any = None,
+    roadmap_apply_ledger: Any = None,
     roadmap_promoter: GraphCreator | None = None,
 ) -> LoopDecision:
     """Evaluate one loop event and return a dry-run/request-only decision.
@@ -252,7 +265,9 @@ def evaluate_loop_event(
             now,
             registry=roadmap_registry,
             roadmap_ledger=roadmap_ledger,
+            apply_ledger=roadmap_apply_ledger,
             promoter=roadmap_promoter,
+            adapter=effective_adapter,
         )
         return _record(ledger, decision, ev)
     if verdict == "NEED_MORE":
@@ -345,15 +360,24 @@ def _attach_roadmap_autopromote(
     *,
     registry: Any,
     roadmap_ledger: Any,
+    apply_ledger: Any,
     promoter: GraphCreator | None,
+    adapter: Any,
 ) -> LoopDecision:
-    """Attach request-only next-slice proposal metadata/candidates to GO."""
+    """Attach next-slice roadmap metadata/candidates to a GO decision.
+
+    Request-only by default: proposal metadata and candidate JSON only, no board
+    writes. When the loop apply gate is open (``adapter`` is the apply-gated
+    adapter) AND ``roadmap_apply_enabled`` is set, delegate to
+    ``apply_roadmap_promotion`` so an eligible GO creates the impl/review/fanin
+    graph via the (fake/injected) adapter with idempotent apply-ledger dedup.
+    """
     if not policy.roadmap_auto_continue:
         return decision
 
-    promote = promoter or propose_next_slice_graph
-    result = promote(
-        event.summary or "",
+    roadmap_policy = _roadmap_policy(policy)
+    apply_armed = roadmap_policy.apply_enabled and adapter is not None
+    common = dict(
         event_id=event.event_id,
         source_final_ref=event.source_final_id or event.source_task_id or event.source_graph_id,
         source_assignee=event.source_assignee,
@@ -365,13 +389,23 @@ def _attach_roadmap_autopromote(
         occurred_at=now,
         registry=registry,
         ledger=roadmap_ledger or InMemoryRoadmapPromotionLedger(),
-        policy=_roadmap_policy(policy),
-        adapter=None,
+        policy=roadmap_policy,
     )
+    if apply_armed:
+        result = apply_roadmap_promotion(
+            event.summary or "",
+            apply_ledger=apply_ledger or InMemoryRoadmapApplyLedger(),
+            adapter=adapter,
+            **common,
+        )
+    else:
+        promote = promoter or propose_next_slice_graph
+        result = promote(event.summary or "", adapter=None, **common)
     safe_result = _safe_next_slice_result(result)
     metadata = dict(decision.metadata)
     metadata["roadmap_autopromote"] = safe_result
-    candidates = tuple(result.get("candidates") or ()) if result.get("action") == "propose" else ()
+    receipt = _with_roadmap_receipt(decision.receipt, safe_result)
+    candidates = tuple(result.get("candidates") or ()) if result.get("action") in {"propose", "apply"} else ()
     return LoopDecision(
         action=decision.action,
         reason=decision.reason,
@@ -384,8 +418,46 @@ def _attach_roadmap_autopromote(
         candidate=decision.candidate,
         mutations=(),
         metadata=safe_event_payload(metadata),
-        receipt=decision.receipt,
+        receipt=receipt,
     )
+
+
+def _with_roadmap_receipt(receipt: dict[str, Any], roadmap_result: dict[str, Any]) -> dict[str, Any]:
+    """Persist compact roadmap autopromote data for duplicate-event receipts.
+
+    The loop duplicate-event fast path returns ``decision_payload`` from the
+    stored receipt, so successful M15 applies must store sanitized created ids
+    there. Keep it comment-shaped and compact; never embed raw summaries.
+    """
+    updated = dict(receipt)
+    payload = dict(updated.get("decision_payload") or {})
+    payload["roadmap_autopromote"] = safe_event_payload({
+        "action": roadmap_result.get("action", ""),
+        "reason": roadmap_result.get("reason", ""),
+        "transition_id": roadmap_result.get("transition_id", ""),
+        "roadmap_id": roadmap_result.get("roadmap_id", ""),
+        "template_id": roadmap_result.get("template_id", ""),
+        "idempotency_key": roadmap_result.get("idempotency_key", ""),
+        "applied": bool(roadmap_result.get("applied", False)),
+        "duplicate": bool(roadmap_result.get("duplicate", False)),
+        "created_task_ids": roadmap_result.get("created_task_ids") or [],
+        "receipt": roadmap_result.get("receipt") or {},
+        "source_comment": _roadmap_source_comment(roadmap_result),
+    })
+    updated["decision_payload"] = payload
+    return safe_event_payload(updated)
+
+
+def _roadmap_source_comment(roadmap_result: dict[str, Any]) -> str:
+    ids = roadmap_result.get("created_task_ids") or []
+    transition = short_text(str(roadmap_result.get("transition_id") or ""))
+    key = short_text(str(roadmap_result.get("idempotency_key") or ""))
+    if roadmap_result.get("applied"):
+        return short_text(f"roadmap-autopromote applied transition={transition} ids={','.join(str(x) for x in ids)} idempotency_key={key}")
+    if roadmap_result.get("duplicate"):
+        return short_text(f"roadmap-autopromote duplicate transition={transition} ids={','.join(str(x) for x in ids)} idempotency_key={key}")
+    reason = short_text(str(roadmap_result.get("reason") or ""))
+    return short_text(f"roadmap-autopromote no-create transition={transition} reason={reason} idempotency_key={key}")
 
 
 def _evaluate_supersession(ev: LoopEvent, ledger: LoopLedger, policy: LoopPolicy, now: float, *, adapter: Any) -> LoopDecision:
@@ -473,6 +545,10 @@ def _coerce_policy(policy: LoopPolicy | None) -> tuple[LoopPolicy, bool]:
         return LoopPolicy(kill_switch=True), True
     if not isinstance(policy.roadmap_trusted_assignees, tuple) or not all(isinstance(a, str) for a in policy.roadmap_trusted_assignees):
         return LoopPolicy(kill_switch=True), True
+    if not isinstance(policy.roadmap_apply_enabled, bool):
+        return LoopPolicy(kill_switch=True), True
+    if any(not isinstance(v, str) for v in (policy.roadmap_impl_assignee, policy.roadmap_review_assignee, policy.roadmap_ack_trigger_agent)):
+        return LoopPolicy(kill_switch=True), True
     numeric_values = (
         policy.max_rounds,
         policy.max_same_blocker,
@@ -531,10 +607,19 @@ def _roadmap_policy(policy: LoopPolicy) -> RoadmapPromotionPolicy:
         expected_origin=policy.expected_origin,
         expected_return_to=policy.expected_return_to,
         require_policy_resolution=policy.roadmap_require_policy_resolution,
+        # apply is only armed when the loop apply gate is open too.
+        apply_enabled=policy.roadmap_apply_enabled and _apply_effectively_enabled(policy),
+        impl_assignee=policy.roadmap_impl_assignee,
+        review_assignee=policy.roadmap_review_assignee,
+        ack_trigger_agent=policy.roadmap_ack_trigger_agent,
     )
 
 
 def _safe_next_slice_result(result: dict[str, Any]) -> dict[str, Any]:
+    # M15: covers both request-only proposals and guarded apply results. The
+    # receipt is the sanitized apply/propose receipt (no secrets/raw paths) so
+    # the source GO decision carries a comment-shaped audit trail.
+    applied = bool(result.get("applied", False))
     return safe_event_payload({
         "success": bool(result.get("success")),
         "action": str(result.get("action") or ""),
@@ -542,14 +627,22 @@ def _safe_next_slice_result(result: dict[str, Any]) -> dict[str, Any]:
         "verdict": str(result.get("verdict") or ""),
         "transition_id": str(result.get("transition_id") or ""),
         "roadmap_id": str(result.get("roadmap_id") or ""),
+        "template_id": str(result.get("template_id") or ""),
         "chain_depth": int(result.get("chain_depth") or 0),
         "idempotency_key": str(result.get("idempotency_key") or ""),
         "request_only": bool(result.get("request_only", True)),
-        "dry_run": bool(result.get("dry_run", True)),
+        "dry_run": bool(result.get("dry_run", not applied)),
+        "applied": applied,
+        "apply_enabled": bool(result.get("apply_enabled", False)),
+        "duplicate": bool(result.get("duplicate", False)),
+        "apply_reason": str(result.get("apply_reason") or ""),
         "candidate_count": len(result.get("candidates") or []),
         "candidates": result.get("candidates") or [],
-        "mutations": [],
-        "adapter_attempts": 0,
+        "created_task_ids": result.get("created_task_ids") or [],
+        "tasks": result.get("tasks") or [],
+        "mutations": result.get("mutations") or [],
+        "receipt": result.get("receipt") or {},
+        "adapter_attempts": int(result.get("adapter_attempts") or len(result.get("mutations") or [])),
     })
 
 
