@@ -449,7 +449,19 @@ def apply_roadmap_promotion(
             "ack_trigger_agent": ack_agent,
         })
         result = adapter.create_graph(enriched)
+        # Fail closed: an adapter that refuses (apply_disabled), errors, or returns
+        # no usable task id must NOT produce applied=True and must NOT record the
+        # idempotency ledger. Otherwise a partial/failed apply poisons future
+        # retries and reports a graph that was never committed.
+        if not isinstance(result, dict) or result.get("success") is not True:
+            return _apply_failed_result(
+                proposal, key, "adapter_create_failed", created_task_ids, transition,
+            )
         task_id = str(result.get("task_id") or "")
+        if not task_id:
+            return _apply_failed_result(
+                proposal, key, "missing_task_id", created_task_ids, transition,
+            )
         key_to_task_id[candidate.idempotency_key] = task_id
         parent_task_id = key_to_task_id.get(candidate.parent_key, "") if candidate.parent_key else ""
         record = {
@@ -570,6 +582,42 @@ def _proposal_only_result(proposal: dict[str, Any], *, apply_enabled: bool, reas
     if reason:
         payload["apply_reason"] = reason
     return safe_event_payload(payload)
+
+
+def _apply_failed_result(
+    proposal: dict[str, Any],
+    key: str,
+    reason: str,
+    uncommitted_task_ids: list[str],
+    transition: RoadmapTransition,
+) -> dict[str, Any]:
+    """Fail-closed apply result. No idempotency ledger is recorded by the caller.
+
+    Any task ids the adapter handed back before the failure are surfaced under
+    ``uncommitted_task_ids`` so an operator can reconcile the board, but they are
+    explicitly NOT recorded as an applied/committed graph: ``created_task_ids`` is
+    empty and ``mutations`` is empty so a later retry is not deduped against a
+    partial write.
+    """
+    return safe_event_payload({
+        "success": False,
+        "action": "apply",
+        "applied": False,
+        "reason": reason,
+        "apply_reason": reason,
+        "apply_enabled": True,
+        "request_only": False,
+        "dry_run": False,
+        "transition_id": transition.transition_id,
+        "roadmap_id": transition.roadmap_id,
+        "idempotency_key": key,
+        "created_task_ids": [],
+        "uncommitted_task_ids": list(uncommitted_task_ids),
+        "tasks": [],
+        "candidates": proposal.get("candidates", []),
+        "mutations": [],
+        "receipt": {},
+    })
 
 
 def _duplicate_apply_result(proposal: dict[str, Any], existing: dict[str, Any], key: str) -> dict[str, Any]:

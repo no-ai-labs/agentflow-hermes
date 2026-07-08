@@ -1,6 +1,12 @@
 from __future__ import annotations
 
-from agentflow_hermes.graph_creator import FakeKanbanGraphAdapter
+from typing import Any
+
+from agentflow_hermes.graph_creator import (
+    FakeKanbanGraphAdapter,
+    GraphIntentCandidate,
+    KanbanGraphAdapter,
+)
 from agentflow_hermes.roadmap import (
     InMemoryRoadmapApplyLedger,
     InMemoryRoadmapPromotionLedger,
@@ -253,6 +259,96 @@ def test_depth_repeat_and_cooldown_caps_refuse_apply():
     assert capped["applied"] is False
     assert capped["apply_reason"] == "max_apply_tasks_per_graph"
     assert len(attempt_adapter.create_calls) == 0
+
+
+class _NoTaskIdAdapter:
+    """Adapter that reports success without ever returning a usable task_id."""
+
+    def __init__(self) -> None:
+        self.create_calls: list[GraphIntentCandidate] = []
+
+    def create_graph(self, intent: GraphIntentCandidate) -> dict[str, Any]:
+        self.create_calls.append(intent)
+        return {"success": True, "action": "no_task_id", "task_id": "", "mutations": []}
+
+
+class _PartialFailureAdapter:
+    """Adapter that creates the first candidate then fails every call after."""
+
+    def __init__(self, *, fail_after: int = 1) -> None:
+        self.fail_after = fail_after
+        self.create_calls: list[GraphIntentCandidate] = []
+
+    def create_graph(self, intent: GraphIntentCandidate) -> dict[str, Any]:
+        self.create_calls.append(intent)
+        if len(self.create_calls) > self.fail_after:
+            return {"success": False, "error": "adapter_partial_failure", "mutations": []}
+        task_id = "task:" + intent.idempotency_key
+        return {"success": True, "action": "partial", "task_id": task_id, "mutations": []}
+
+
+def test_kanban_adapter_apply_disabled_refuses_no_ledger_poison():
+    adapter = KanbanGraphAdapter(apply_enabled=False)
+    apply_ledger = InMemoryRoadmapApplyLedger()
+
+    result = _apply(_summary(), adapter=adapter, apply_ledger=apply_ledger)
+
+    assert result["success"] is False
+    assert result["applied"] is False
+    assert result["reason"] == "adapter_create_failed"
+    assert result["created_task_ids"] == []
+    assert result["mutations"] == []
+    key = result["idempotency_key"]
+    assert not apply_ledger.has(key)
+
+    # A retry with a working adapter must not be treated as a duplicate.
+    retry_adapter = FakeKanbanGraphAdapter()
+    retry = _apply(_summary(), adapter=retry_adapter, apply_ledger=apply_ledger, event_id="evt-retry")
+    assert retry["applied"] is True
+    assert len(retry["created_task_ids"]) == 3
+
+
+def test_adapter_success_without_task_id_fails_closed_no_ledger_poison():
+    adapter = _NoTaskIdAdapter()
+    apply_ledger = InMemoryRoadmapApplyLedger()
+
+    result = _apply(_summary(), adapter=adapter, apply_ledger=apply_ledger)
+
+    assert result["success"] is False
+    assert result["applied"] is False
+    assert result["reason"] == "missing_task_id"
+    assert result["created_task_ids"] == []
+    assert result["mutations"] == []
+    key = result["idempotency_key"]
+    assert not apply_ledger.has(key)
+
+    retry_adapter = FakeKanbanGraphAdapter()
+    retry = _apply(_summary(), adapter=retry_adapter, apply_ledger=apply_ledger, event_id="evt-retry")
+    assert retry["applied"] is True
+    assert len(retry["created_task_ids"]) == 3
+
+
+def test_partial_failure_after_first_create_fails_closed_no_ledger_poison():
+    adapter = _PartialFailureAdapter(fail_after=1)
+    apply_ledger = InMemoryRoadmapApplyLedger()
+
+    result = _apply(_summary(), adapter=adapter, apply_ledger=apply_ledger)
+
+    assert result["success"] is False
+    assert result["applied"] is False
+    assert result["reason"] == "adapter_create_failed"
+    assert result["created_task_ids"] == []
+    assert result["mutations"] == []
+    # The first create did happen on the adapter side but is surfaced only as
+    # an uncommitted id, never as a committed/idempotency-recorded graph.
+    assert len(result["uncommitted_task_ids"]) == 1
+    key = result["idempotency_key"]
+    assert not apply_ledger.has(key)
+
+    retry_adapter = FakeKanbanGraphAdapter()
+    retry = _apply(_summary(), adapter=retry_adapter, apply_ledger=apply_ledger, event_id="evt-retry")
+    assert retry["applied"] is True
+    assert len(retry["created_task_ids"]) == 3
 
 
 def test_apply_receipt_sanitizes_raw_paths_and_secrets():
