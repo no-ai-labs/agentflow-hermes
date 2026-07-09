@@ -70,10 +70,10 @@ final fan-in GO report
         ▼
 parse_verdict_summary ─► GO + explicit next_slice directive?
         │                         │ no → noop/refuse (see §6)
-        ▼ yes                     
+        ▼ yes
 RoadmapAutopromoter ─► RoadmapTransition allowlist lookup (template id)
         │                         │ miss → refuse (unknown_transition)
-        ▼                         
+        ▼
 gate chain (trust, origin/ACK, PolicyRef, depth/repeat/cooldown, idempotency)
         │
         ▼

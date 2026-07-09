@@ -1,6 +1,6 @@
 [project]
 name = "agentflow-hermes"
-version = "0.1.0"
+version = "0.2.0"
 description = "AgentFlow add-on for Hermes Agent: durable handoffs, ACK receipts, and supervisor queues."
 readme = "README.md"
 requires-python = ">=3.10"

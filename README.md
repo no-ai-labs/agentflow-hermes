@@ -162,11 +162,13 @@ agentflow-hermes roadmap init-config --output contextops-roadmap.yaml \
 # #research:
 agentflow-hermes roadmap init-config --output research-roadmap.yaml \
   --board research --origin 'Discord Devhub / #research' \
+  --template-preset research-loop \
   --transition 'r1->r2.impl_review_fanin' --from r1 --to r2
 
 # #oracle / #shaman-style advisory boards (review-heavy):
 agentflow-hermes roadmap init-config --output oracle-roadmap.yaml \
   --board oracle --origin 'Discord Devhub / #oracle' \
+  --template-preset shaman-loop \
   --transition 's1->s2.impl_review_fanin' --from s1 --to s2 \
   --impl-assignee ccsupervisor --review-assignee ccreviewer
 ```
