@@ -120,10 +120,178 @@ def test_watchdog_board_scoped_dry_run_only_scans_new_oracle_events(tmp_path):
     assert "last_seen_event_id" not in data
 
 
+def _create_ack_db(path: Path) -> None:
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE kanban_notify_subs (
+            task_id       TEXT NOT NULL,
+            platform      TEXT NOT NULL,
+            chat_id       TEXT NOT NULL,
+            thread_id     TEXT NOT NULL DEFAULT '',
+            user_id       TEXT,
+            notifier_profile TEXT,
+            trigger_agent INTEGER NOT NULL DEFAULT 0,
+            created_at    INTEGER NOT NULL,
+            last_event_id INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (task_id, platform, chat_id, thread_id)
+        );
+        CREATE TABLE ack_subscription (
+            id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id                TEXT NOT NULL,
+            subscription_id        INTEGER,
+            platform               TEXT,
+            chat_id                TEXT,
+            thread_id              TEXT,
+            notifier_profile       TEXT,
+            desired_delivery_mode  TEXT,
+            active_wake_required   INTEGER NOT NULL DEFAULT 0,
+            operator_receipt_required INTEGER NOT NULL DEFAULT 0,
+            created_at             INTEGER NOT NULL
+        );
+        CREATE TABLE ack_active_wake (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id         TEXT NOT NULL,
+            subscription_id INTEGER,
+            triggered_agent INTEGER NOT NULL DEFAULT 0,
+            trigger_error   TEXT,
+            correlation_id  TEXT,
+            created_at      INTEGER NOT NULL,
+            status TEXT, accepted_by_session INTEGER NOT NULL DEFAULT 0,
+            started_by_session INTEGER NOT NULL DEFAULT 0, target_session_key TEXT
+        );
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_adapter_materialize_creates_durable_ack_rows(tmp_path, monkeypatch):
+    adapter = _load_module("m24b_adapter_ack", ADAPTER_PATH)
+    monkeypatch.setattr(adapter, "NOTIFY_CHATS", "discord:1500539609413849200,discord:1497895797579190357")
+    state = tmp_path / "map.json"
+    db = tmp_path / "kanban.db"
+    _create_ack_db(db)
+    created = {"fix": "t_fix_canary", "review": "t_review_canary"}
+
+    def fake_run(cmd: list[str]):
+        if "create" in cmd:
+            title = cmd[cmd.index("create") + 1]
+            return {"id": created["review" if "Review" in title else "fix"]}
+        return {"ok": True}
+
+    fix = {
+        "idempotency_key": "kanban-auto-remediation:auto_remediation_fix:oracle-lab:t_src:kanban-event-1:abc",
+        "title": "[auto-remediation] Fix BLOCK for oracle-lab:t_src:kanban-event-1",
+        "body": "Next action: Fix oracle-lab canary ACK edge.",
+        "assignee": "ccsupervisor",
+        "workspace_kind": "dir",
+        "workspace_path": "/home/duckran/oracle-lab",
+        "origin_ref": "discord:#shaman:1500539609413849200",
+        "return_to_ref": "discord:#shaman:1500539609413849200",
+    }
+    review = {
+        **fix,
+        "idempotency_key": "kanban-auto-remediation:auto_remediation_review:oracle-lab:t_src:kanban-event-1:def",
+        "parent_idempotency_key": fix["idempotency_key"],
+        "title": "[auto-remediation] Review fix for oracle-lab:t_src:kanban-event-1",
+        "assignee": "ccreviewer",
+    }
+
+    code1, _ = adapter.materialize(fix, board="oracle-lab", state_path=state, run=fake_run, db_path=db)
+    code2, _ = adapter.materialize(review, board="oracle-lab", state_path=state, run=fake_run, db_path=db)
+
+    assert (code1, code2) == (0, 0)
+    conn = sqlite3.connect(db)
+    notify_rows = conn.execute("SELECT task_id, trigger_agent FROM kanban_notify_subs").fetchall()
+    ack_sub_rows = conn.execute("SELECT task_id, active_wake_required, desired_delivery_mode FROM ack_subscription").fetchall()
+    ack_wake_rows = conn.execute("SELECT task_id, triggered_agent, status, correlation_id, subscription_id FROM ack_active_wake").fetchall()
+    conn.close()
+
+    assert len(notify_rows) == 4  # 2 targets x 2 cards
+    assert all(trigger_agent == 1 for _, trigger_agent in notify_rows)
+    assert len(ack_sub_rows) == 4
+    assert all(active_wake_required == 1 for _, active_wake_required, _ in ack_sub_rows)
+    assert all(mode == "passive+active_wake" for _, _, mode in ack_sub_rows)
+    assert len(ack_wake_rows) == 4
+    assert all(triggered_agent == 0 for _, triggered_agent, _, _, _ in ack_wake_rows)
+    assert all(status in ("pending", "queued") for _, _, status, _, _ in ack_wake_rows)
+    assert all(correlation_id for _, _, _, correlation_id, _ in ack_wake_rows)
+    assert all(subscription_id is not None for _, _, _, _, subscription_id in ack_wake_rows)
+    task_ids = {row[0] for row in notify_rows}
+    assert task_ids == {"t_fix_canary", "t_review_canary"}
+
+
+def test_adapter_materialize_rerun_does_not_duplicate_durable_ack_rows(tmp_path, monkeypatch):
+    adapter = _load_module("m24b_adapter_ack_rerun", ADAPTER_PATH)
+    monkeypatch.setattr(adapter, "NOTIFY_CHATS", "discord:1500539609413849200,discord:1497895797579190357")
+    state = tmp_path / "map.json"
+    db = tmp_path / "kanban.db"
+    _create_ack_db(db)
+
+    def fake_run(cmd: list[str]):
+        if "create" in cmd:
+            return {"id": "t_fix_canary"}
+        return {"ok": True}
+
+    fix = {
+        "idempotency_key": "kanban-auto-remediation:auto_remediation_fix:oracle-lab:t_src:kanban-event-1:abc",
+        "title": "[auto-remediation] Fix BLOCK for oracle-lab:t_src:kanban-event-1",
+        "body": "Next action: Fix oracle-lab canary ACK edge.",
+        "assignee": "ccsupervisor",
+        "workspace_kind": "dir",
+        "workspace_path": "/home/duckran/oracle-lab",
+        "origin_ref": "discord:#shaman:1500539609413849200",
+        "return_to_ref": "discord:#shaman:1500539609413849200",
+    }
+
+    code1, result1 = adapter.materialize(fix, board="oracle-lab", state_path=state, run=fake_run, db_path=db)
+    code2, result2 = adapter.materialize(fix, board="oracle-lab", state_path=state, run=fake_run, db_path=db)
+    code3, result3 = adapter.materialize(fix, board="oracle-lab", state_path=state, run=fake_run, db_path=db)
+
+    assert (code1, code2, code3) == (0, 0, 0)
+    assert result1["action"] == "created"
+    assert result2["action"] == "deduped"
+    assert result3["action"] == "deduped"
+
+    conn = sqlite3.connect(db)
+    notify_count = conn.execute("SELECT COUNT(*) FROM kanban_notify_subs").fetchone()[0]
+    ack_sub_count = conn.execute("SELECT COUNT(*) FROM ack_subscription").fetchone()[0]
+    ack_wake_count = conn.execute("SELECT COUNT(*) FROM ack_active_wake").fetchone()[0]
+    conn.close()
+
+    assert notify_count == 2
+    assert ack_sub_count == 2
+    assert ack_wake_count == 2
+
+
+def test_adapter_materialize_rejects_unsupported_board_with_ack_db(tmp_path):
+    adapter = _load_module("m24b_adapter_ack_board", ADAPTER_PATH)
+    state = tmp_path / "map.json"
+    db = tmp_path / "kanban.db"
+    _create_ack_db(db)
+
+    code, result = adapter.materialize(
+        {"idempotency_key": "kanban-auto-remediation:x"},
+        board="other-board",
+        state_path=state,
+        run=lambda cmd: {"ok": True},
+        db_path=db,
+    )
+
+    assert code == 2
+    assert result["action"] == "unsupported_board"
+    conn = sqlite3.connect(db)
+    assert conn.execute("SELECT COUNT(*) FROM ack_subscription").fetchone()[0] == 0
+    conn.close()
+
+
 def test_adapter_uses_explicit_board_notify_subscribe_and_idempotent_mapping(tmp_path, monkeypatch):
     adapter = _load_module("m24b_adapter", ADAPTER_PATH)
     monkeypatch.setattr(adapter, "NOTIFY_CHATS", "discord:1500539609413849200,discord:1497895797579190357")
     state = tmp_path / "map.json"
+    db = tmp_path / "kanban.db"
+    _create_ack_db(db)
     calls: list[list[str]] = []
     created = {"fix": "t_fix_canary", "review": "t_review_canary"}
 
@@ -152,9 +320,9 @@ def test_adapter_uses_explicit_board_notify_subscribe_and_idempotent_mapping(tmp
         "assignee": "ccreviewer",
     }
 
-    code1, result1 = adapter.materialize(fix, board="oracle-lab", state_path=state, run=fake_run)
-    code2, result2 = adapter.materialize(review, board="oracle-lab", state_path=state, run=fake_run)
-    code3, result3 = adapter.materialize(review, board="oracle-lab", state_path=state, run=fake_run)
+    code1, result1 = adapter.materialize(fix, board="oracle-lab", state_path=state, run=fake_run, db_path=db)
+    code2, result2 = adapter.materialize(review, board="oracle-lab", state_path=state, run=fake_run, db_path=db)
+    code3, result3 = adapter.materialize(review, board="oracle-lab", state_path=state, run=fake_run, db_path=db)
 
     assert (code1, code2, code3) == (0, 0, 0)
     assert result1["id"] == "t_fix_canary"
