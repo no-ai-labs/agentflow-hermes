@@ -2,6 +2,36 @@
 
 AgentFlow-Hermes is a Hermes add-on/CLI that turns board `GO`/`BLOCK` signals into durable, multi-agent task graphs — with ACK receipts, review gates, and automatic roadmap continuation. It watches Kanban events; it does not scrape Discord channel history.
 
+## 한국어 요약
+
+AgentFlow-Hermes는 Hermes Agent 위에서 동작하는 **작업 흐름 제어 플러그인 + CLI**입니다. 사람이 Discord/Kanban 완료 메시지를 보고 다음 작업을 손으로 이어 붙이던 과정을, Kanban 보드 이벤트와 설정 파일을 기준으로 자동화합니다.
+
+핵심 목적은 간단합니다:
+
+- `GO`가 뜬 작업에서 다음 구현/리뷰/fan-in 그래프를 안정적으로 생성합니다.
+- `BLOCK`/리뷰 결과/최종 ACK를 durable하게 남겨서 재시작이나 context compaction 뒤에도 흐름이 끊기지 않게 합니다.
+- 같은 이벤트를 여러 번 처리해도 중복 작업을 만들지 않도록 receipts/idempotency ledger를 사용합니다.
+- `#research`, `#shaman`, `#hermes-main`처럼 채널/보드마다 다른 작업 템플릿을 씁니다.
+- 기본은 항상 dry-run/request-only이며, 실제 보드 쓰기나 GitHub release 같은 side effect는 명시적인 config gate와 CLI `--apply`가 둘 다 있어야 실행됩니다.
+
+즉 AgentFlow는 “채팅 기록을 읽는 봇”이 아니라, **Kanban 보드를 source of truth로 삼아 다음 agent workflow를 이어 주는 control-plane**입니다.
+
+### 한국어 빠른 사용 흐름
+
+1. Hermes 런타임 환경에 패키지를 설치하고 플러그인을 켭니다.
+2. `agentflow-hermes roadmap init-config`로 보드별 roadmap config를 만듭니다.
+3. `roadmap promote`로 특정 final `GO` task를 request-only로 smoke합니다.
+4. 안전하면 `apply_mode: true` + `--apply`로 실제 다음 Kanban graph 생성을 허용합니다.
+5. 여러 채널/보드는 `roadmap register-watchdog`로 registry에 등록해 watchdog이 주기적으로 처리하게 합니다.
+
+예시 템플릿:
+
+- `research-loop`: `scout -> evidence -> scorecard -> review -> brief`
+- `shaman-loop`: `design -> impl -> browser_e2e -> review -> fanin`
+- 기본값: `impl -> review -> fanin`
+
+자세한 명령어와 안전 경계는 아래 영어 섹션에 함께 정리되어 있습니다.
+
 ## What is AgentFlow-Hermes?
 
 A small Python CLI plus a Hermes plugin/toolset that:
