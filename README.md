@@ -1,16 +1,45 @@
-# AgentFlow for Hermes
+# AgentFlow for Hermes (v0.2.0)
 
-Durable multi-agent handoffs, ACK receipts, and supervisor queues for [Hermes Agent](https://hermes-agent.nousresearch.com/docs).
+AgentFlow-Hermes is a Hermes add-on/CLI that turns board `GO`/`BLOCK` signals into durable, multi-agent task graphs — with ACK receipts, review gates, and automatic roadmap continuation. It watches Kanban events; it does not scrape Discord channel history.
 
-This repository packages AgentFlow as a Hermes add-on: a small Python CLI plus a Hermes plugin/toolset. It is designed to work even when upstream Hermes primitives are still under review.
+## What is AgentFlow-Hermes?
 
-## Install concept
+A small Python CLI plus a Hermes plugin/toolset that:
 
-The Hermes plugin is a thin adapter. Install the `agentflow-hermes` engine package into the same Python environment that runs Hermes/gateway first, then install/enable the plugin:
+- Builds and continues multi-agent task graphs (impl → review → fan-in, and channel-specific variants) from a single source Kanban task.
+- Requires an explicit ACK (`[JOB ACK]` block) before a job is considered done, and returns a final ACK to the origin lane.
+- Watches for a final `GO` on a board task and, on request, promotes the next slice — it never reads Discord channel history to infer state.
+- Is dry-run/request-only by default everywhere: no board write, no live message send, no systemctl, no money side effects, unless you explicitly arm each gate.
+
+## Why it exists
+
+Before AgentFlow, a human had to notice a `GO`/`BLOCK` message on a board task and manually create the next slice's tasks — implementation, review, fan-in — by hand, every time, for every channel. That doesn't survive process restarts, context compaction, or someone being offline.
+
+AgentFlow replaces that manual step with durable, board-driven continuation:
+
+- The board (not a chat transcript or an agent's memory) is the source of truth for "what's the next slice."
+- A receipts ledger makes promotion idempotent — re-running the same watch/promote command over the same task creates zero duplicate tasks.
+- Work survives restarts and context compaction because state lives in the config + receipts file, not in an agent's context window.
+- The final ACK is returned to the task's own `origin`/`return_to` lane, not wherever the promotion happened to run.
+
+## Core capabilities
+
+- **CLI/plugin split**: `agentflow-hermes` is a standalone, testable engine CLI; the Hermes plugin is a thin adapter that exposes the same operations as Hermes tools (`agentflow_enqueue`, `agentflow_status`, etc.).
+- **`init` / `doctor` / `status`**: bootstrap local state and check environment health before you rely on the CLI.
+- **Roadmap GO autopromoter** (`roadmap promote` / `roadmap watch`): request-only by default; board writes require both `apply_mode: true` in the config *and* `--apply` on the command line. A receipts ledger prevents duplicate task creation across repeated runs.
+- **Real Kanban adapter**: promotion creates the next slice's graph on the *same* board as the source task (`same_board_only`) — there is no cross-board write path.
+- **Watchdog registry**: `roadmap register-watchdog` / `unregister-watchdog` track which configs a cron/watchdog process should poll, across any number of boards/channels.
+- **Channel template presets**: pick a task-graph shape per channel — legacy `impl-review-fanin`, `research-loop`, or `shaman-loop` (see Examples below).
+- **Safety defaults everywhere**: no live `send_message`, no Discord channel scraping, no `systemctl` writes, no money side effects; writes are gated behind config flags and CLI flags together, and dry-run/request-only is always the default path.
+- **GitHub release trigger (M20)**: a bounded, dry-run-first trigger (merged in commit `85c3ee8`) that can turn a final reviewed `GO` summary into a tag + push + `gh release create`. It is not wired into any default-on automation — see below.
+
+## Quick start
+
+Install the engine package from the `v0.2.0` tag into the same Python environment that runs Hermes/gateway, then install/enable the plugin:
 
 ```bash
 # Inside the Hermes runtime environment, not an isolated uv tool env:
-uv pip install 'agentflow-hermes @ git+https://github.com/no-ai-labs/agentflow-hermes.git'
+uv pip install 'agentflow-hermes @ git+https://github.com/no-ai-labs/agentflow-hermes.git@v0.2.0'
 hermes plugins install no-ai-labs/agentflow-hermes#plugins/hermes-agentflow
 hermes plugins enable agentflow
 agentflow-hermes init
@@ -23,171 +52,88 @@ hermes gateway restart
 For local CLI development:
 
 ```bash
-uv run agentflow-hermes doctor
 uv run agentflow-hermes init
+uv run agentflow-hermes doctor
+uv run agentflow-hermes status
 uv run agentflow-hermes enqueue --title "Review PR" --target "discord:#review" --origin-return "discord:#hermes-main"
 ```
 
-## Current status
-
-M0 skeleton:
-
-- SQLite-backed local job/event store
-- CLI: `init`, `enqueue`, `status`, `ack ingest`, `dispatch-dry-run`, `doctor`
-- Hermes plugin registering the `agentflow` toolset
-- Dry-run first; live dispatch is intentionally out of scope for M0
-
-## Roadmap GO autopromoter watchdog (M17)
-
-`agentflow-hermes roadmap` drives the existing M15/M16 promotion/apply path from a
-committed repo config file instead of a one-off fixture. It never reimplements
-graph creation — it builds a `LoopEvent`/`LoopPolicy`/transition registry from the
-config and a fetched board task, then calls the same `evaluate_loop_event` used by
-`agentflow-hermes loop evaluate`.
+Scaffold a roadmap config for a board/channel (request-only by default — `apply_mode: false`):
 
 ```bash
-# Promote one final GO task by id (request-only; no board write without --apply):
-agentflow-hermes roadmap promote --config agentflow-roadmap.yaml --task t_final_123
-
-# Same, with the board write armed (still requires apply_mode: true in the config):
-agentflow-hermes roadmap promote --config agentflow-roadmap.yaml --task t_final_123 --apply
-
-# Scan completed tasks on the configured board, let the existing GO gates reject
-# ineligible rows, and promote eligible final GO tasks once. Keep receipts in a
-# durable repo-local path for cron/watchdog idempotency across process runs:
-agentflow-hermes roadmap watch --config agentflow-roadmap.yaml --once --apply --receipts-file .agentflow-roadmap-receipts.json
-```
-
-Enabling it for a repo:
-
-1. Copy `agentflow-roadmap.yaml` (or write your own) and set `enabled: true`,
-   `board`, `apply_mode`, `allowed_transitions`, `transitions`, and the default
-   `impl_assignee`/`review_assignee`/`ack_trigger_agent`.
-2. `enabled: false` is the kill switch — with it off, `roadmap promote`/`roadmap
-   watch` perform no board read or write at all, even with `--apply`.
-3. `board`/`same_board_only: true` means the same board is used for both reading
-   the source task and creating the impl/review/fanin graph; there is no
-   cross-board write path.
-4. Repeated `promote`/`watch --once` runs over the same task(s) with the same
-   `--receipts-file` create 0 new tasks — the apply ledger dedups by
-   idempotency key before any adapter create is attempted. The real Kanban
-   adapter also passes the same idempotency keys to `hermes kanban create`.
-
-### Add a new board/channel in 3 commands
-
-`roadmap init-config` scaffolds a committed config from flags, and
-`roadmap register-watchdog` records its path in a JSON registry the existing
-no-agent cron script iterates. The generated config defaults to `apply_mode:
-false` (proposes, never writes a board) until you explicitly arm it with
-`--apply-mode` or edit the file — and the cron script still needs `--apply` at
-run time, so both gates stay closed by default.
-
-```bash
-# 1. Scaffold a config for the board (request-only by default):
 agentflow-hermes roadmap init-config \
-  --output ~/roadmaps/contextops-roadmap.yaml \
-  --board contextops --origin 'Discord Devhub / #contextops' \
-  --transition 'm1->m2.impl_review_fanin' --from m1 --to m2
-
-# 2. Smoke the generated config in request-only mode (no board write):
-agentflow-hermes roadmap promote \
-  --config ~/roadmaps/contextops-roadmap.yaml --task <some-final-go-task-id>
-
-# Optional: review/edit the file, then arm writes when ready by re-running
-# step 1 with --apply-mode --force, or edit apply_mode: true.
-
-# 3. Register it so the cron watchdog picks it up:
-agentflow-hermes roadmap register-watchdog \
-  --config ~/roadmaps/contextops-roadmap.yaml \
-  --registry ~/.hermes/agentflow/roadmap-watchdog-configs.json
-```
-
-Register is idempotent — running it again reports `already_registered: true`
-and adds no duplicate entry. The registry is plain JSON the cron script reads:
-
-```json
-{
-  "version": 1,
-  "configs": [
-    {
-      "name": "contextops",
-      "config": "/home/you/roadmaps/contextops-roadmap.yaml",
-      "workdir": "/home/you/roadmaps",
-      "receipts_file": "/home/you/roadmaps/.agentflow-roadmap-receipts.json",
-      "board": "contextops",
-      "enabled": true
-    }
-  ]
-}
-```
-
-Each entry keys on `config` (the resolved config path), matching the no-agent
-cron script's `item["config"]` contract; `workdir`/`receipts_file`/`name` are
-also read by the script, and `board`/`enabled` are extra metadata it ignores.
-The cron script iterates `configs[]` and runs, per entry, `agentflow-hermes
-roadmap watch --config <config> --once --apply --receipts-file <receipts_file>`
-with `cwd=<workdir>`. A legacy registry that keyed entries on `path` is still
-read and deduped correctly. `init-config`/`register-watchdog` never create cron
-units, touch systemctl, or write another board — they only read/write local
-files.
-
-### Remove / disable a board/channel
-
-```bash
-# Stop the cron watchdog from picking a config up (leaves the file on disk):
-agentflow-hermes roadmap unregister-watchdog \
-  --config ~/roadmaps/contextops-roadmap.yaml \
-  --registry ~/.hermes/agentflow/roadmap-watchdog-configs.json
-
-# Or hard-disable in-place: set `enabled: false` in the config (the kill switch),
-# after which promote/watch perform no board read or write at all.
-```
-
-### Board templates
-
-Scaffold per board/channel. Only boards you explicitly name are enabled; no
-board is registered or armed by default.
-
-```bash
-# #hermes-main (the primary devhub board):
-agentflow-hermes roadmap init-config --output agentflow-roadmap.yaml \
+  --output agentflow-roadmap.yaml \
   --board agentflow-hermes --origin 'Discord Devhub / #hermes-main' \
   --transition 'm16->m17.impl_review_fanin' --from m16 --to m17
+```
 
-# #contextops:
-agentflow-hermes roadmap init-config --output contextops-roadmap.yaml \
-  --board contextops --origin 'Discord Devhub / #contextops' \
-  --transition 'm1->m2.impl_review_fanin' --from m1 --to m2
+Smoke it in request-only mode (no board write, no `--apply`):
 
-# #research:
+```bash
+agentflow-hermes roadmap promote --config agentflow-roadmap.yaml --task <some-final-go-task-id>
+```
+
+Register the config so a cron/watchdog process picks it up:
+
+```bash
+agentflow-hermes roadmap register-watchdog \
+  --config agentflow-roadmap.yaml \
+  --registry ~/.hermes/agentflow/roadmap-watchdog-configs.json
+```
+
+## Examples: channel template presets
+
+Presets shape the generated task graph per channel. Pass `--template-preset` to `roadmap init-config`:
+
+```bash
+# #research: research-loop -> scout / evidence / scorecard / review / brief
 agentflow-hermes roadmap init-config --output research-roadmap.yaml \
   --board research --origin 'Discord Devhub / #research' \
   --template-preset research-loop \
   --transition 'r1->r2.impl_review_fanin' --from r1 --to r2
 
-# #oracle / #shaman-style advisory boards (review-heavy):
-agentflow-hermes roadmap init-config --output oracle-roadmap.yaml \
-  --board oracle --origin 'Discord Devhub / #oracle' \
+# #shaman: shaman-loop -> design / impl / browser_e2e / review / fanin
+agentflow-hermes roadmap init-config --output shaman-roadmap.yaml \
+  --board shaman --origin 'Discord Devhub / #shaman' \
   --template-preset shaman-loop \
   --transition 's1->s2.impl_review_fanin' --from s1 --to s2 \
   --impl-assignee ccsupervisor --review-assignee ccreviewer
+
+# #hermes-main: default impl / review / fanin (no --template-preset needed)
+agentflow-hermes roadmap init-config --output agentflow-roadmap.yaml \
+  --board agentflow-hermes --origin 'Discord Devhub / #hermes-main' \
+  --transition 'm16->m17.impl_review_fanin' --from m16 --to m17
 ```
 
-Post-update smoke (no live board write):
+After scaffolding, smoke each config with `roadmap promote` (request-only, no `--apply`) before arming writes.
 
-```bash
-agentflow-hermes roadmap promote --config agentflow-roadmap.yaml --task <some-final-task-id>
-```
+## Terminology glossary
 
-## GitHub release publish trigger (M20)
+| Term | Meaning |
+| --- | --- |
+| **Source final GO task** | The board task carrying an explicit `Verdict: GO` and continuation markers that AgentFlow reads to decide the next slice. |
+| **Transition** | A named config entry (e.g. `m16->m17.impl_review_fanin`) mapping a `from` slice to a `to` slice, with its template preset and policy refs. |
+| **Next slice** | The `to` slice a transition promotes into — the identifier for the upcoming unit of work. |
+| **`apply_mode`** | The config-level kill switch for board writes. Must be `true` in the config *and* paired with `--apply` on the CLI before anything is written; either one alone is a no-op. |
+| **Receipts file** | A local JSON ledger keyed by idempotency key; re-running `promote`/`watch` over the same task creates zero duplicate tasks. |
+| **Watchdog registry** | A JSON file (`roadmap register-watchdog`/`unregister-watchdog`) listing which configs a cron/watchdog process should poll, across boards/channels. |
+| **Final ACK** | The `[JOB ACK]` block a completed graph reports back to the task's own `origin`/`return_to` lane, closing the loop. |
 
-A bounded, dry-run-first trigger that turns a final reviewed `GO` summary into
-a `git tag` + `git push` (tag) + `gh release create`. It never runs git/gh on
-its own — see `src/agentflow_hermes/release_action.py`.
+## Operator notes / production boundaries
+
+- Active-wake/notify subscription handling belongs to Hermes/Kanban itself — AgentFlow only consumes board events (`GO`/`BLOCK`) that Hermes/Kanban already surfaces.
+- No live `send_message` dispatch by default.
+- No Discord channel scraping — the only trigger is board state via `roadmap watch`/`roadmap promote`.
+- No `systemctl` writes — watchdog registration only reads/writes local registry files; it never creates cron units.
+- No money side effects anywhere in this CLI.
+
+### GitHub release trigger (M20) — bounded, not default automation
+
+`agentflow-hermes release github` is a request-only-by-default trigger for turning a final reviewed `GO` summary into a `git tag` + `git push` + `gh release create`. It is **not** wired into any live default-on path — you must supply a config with `release_actions_enabled: true` and `apply_mode: true`, *and* pass `--apply`, before anything runs.
 
 ```bash
 # Dry-run (default): reads the summary, evaluates the gates, proposes a plan.
-# No config passed at all => release actions are disabled => always a noop.
+# No --config at all => release actions are disabled => always a noop.
 agentflow-hermes release github --summary-file final-go.txt --config release.json
 
 # Apply requires BOTH config.apply_mode: true AND --apply on the CLI.
@@ -195,71 +141,16 @@ agentflow-hermes release github --summary-file final-go.txt --config release.jso
   --apply --receipts-file .agentflow-release-receipts.json
 ```
 
-The final GO summary must carry explicit markers — prose like "we should
-probably release this" is never treated as a directive:
-
-```
-Verdict: GO
-Release-Action: github-release
-Release-Version: v1.2.3
-Release-Approved: true
-Release-Title: v1.2.3 release        # optional
-Release-Notes: Bugfixes and docs.    # optional
-Release-Target: main                 # optional, passed to `gh release create --target`
-```
-
-Safety gates, all fail closed:
-
-1. `release_actions_enabled: false` (default) — no summary is ever acted on;
-   this is the master kill switch in the release-action config.
-2. `Verdict: GO` plus all four required markers must be present and explicit;
-   `BLOCK`/`NEED_MORE`/prose-only directives always refuse.
-3. `Release-Action` must be in the config's `allowed_actions` allowlist (e.g.
-   `github-release`) — an unlisted action refuses (`unknown_action`).
-4. `Release-Approved: true` must be present — anything else refuses
-   (`missing_approval`).
-5. `Release-Version` must match `allowed_versions` (an explicit list) or
-   `allowed_version_pattern` (a regex) if configured, else the built-in
-   `vX.Y.Z` pattern — otherwise refuses (`invalid_version`).
-6. Even with all of the above, the CLI only *proposes* a plan
-   (`mutations` describes the planned release action; nothing runs) unless `config.apply_mode: true` **and**
-   `--apply` are both set.
-7. Duplicate protection is two-layered: a local receipts-file ledger keyed by
-   `release:<action>:<version>` short-circuits before touching git/gh at all,
-   and — independently, right before any mutation — a live `git tag -l` /
-   `gh release view` check refuses (`duplicate_tag` / `duplicate_release`) if
-   the tag or release already exists upstream, even if the local ledger is
-   missing or stale.
-8. If `git tag`, `git push`, or `gh release create` fails partway through, the
-   run refuses (`tag_failed` / `push_failed` / `release_create_failed`) and
-   writes **no** receipt, so a retry can safely pick up where it left off.
-9. The receipt written on success stores only `action`, `version`,
-   `idempotency_key`, and `result` — never the raw summary body, notes, or any
-   secret/token.
-
-An example `release.json`:
-
-```json
-{
-  "release_actions_enabled": true,
-  "apply_mode": true,
-  "allowed_actions": ["github-release"],
-  "allowed_version_pattern": "^v\\d+\\.\\d+\\.\\d+$"
-}
-```
-
-Tests (`tests/test_release_action.py`, `tests/test_release_cli.py`) exercise
-every gate above against an injectable fake git/gh runner. No test ever
-shells out to real git/gh, and this module is not wired into any live
-default-on path — an operator must write a config with both flags on and pass
-`--apply` explicitly.
+Safety gates (all fail closed): `release_actions_enabled` master switch, explicit `Verdict: GO` + required markers, an `allowed_actions` allowlist, explicit `Release-Approved: true`, version-pattern validation, two-layer duplicate protection (local receipts ledger + live `git tag`/`gh release view` check), and no receipt written on partial failure. See `src/agentflow_hermes/release_action.py` for the full gate list.
 
 ## Safety defaults
 
 - No live `send_message` dispatch by default
+- No Discord channel scraping — only board `GO`/`BLOCK` events drive continuation
 - No monkeypatching Hermes core modules
-- Job payloads should store metadata and payload refs, not raw private transcripts or secrets
+- Job payloads store metadata and payload refs, not raw private transcripts or secrets
 - ACKs use explicit `[JOB ACK]` blocks
+- Writes (board promotion, release actions) require a config-level flag *and* a CLI flag together — never one alone
 
 ## Why a plugin + CLI?
 
