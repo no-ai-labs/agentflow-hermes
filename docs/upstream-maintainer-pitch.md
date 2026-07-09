@@ -109,7 +109,13 @@ Recommended path, in order:
 
 ### PR #59775 — lazy-discover plugin hooks/middleware
 
-Draft comment:
+**DO NOT POST — evidence link is broken.** The reproduction notes referenced below exist only in
+a local ahead commit (`docs/upstream-pr-59775-verification.md`) and are not present on public
+`origin/main`; the public URL currently 404s. This comment must not be posted until either that
+verification doc is published on public `origin/main`, or the reproduction evidence is replaced
+with a reachable public artifact, or pasted self-contained directly in the comment body below.
+
+Draft comment (blocked, not postable as-is):
 
 > I have a second external-consumer data point for this fix from AgentFlow-Hermes
 > (standalone repo: https://github.com/no-ai-labs/agentflow-hermes).
@@ -122,8 +128,8 @@ Draft comment:
 >
 > We independently reproduced that shape against PR #59775 in a temp clone: origin/main no-oped a
 > user hook/middleware with `_discovered=False`, while the PR head lazily discovered and fired both.
-> Notes are in:
-> https://github.com/no-ai-labs/agentflow-hermes/blob/main/docs/upstream-pr-59775-verification.md
+> [PLACEHOLDER: reproduction notes are currently local/unpublished only — do not post this comment
+> until the notes are either published at a reachable public URL or pasted here self-contained.]
 >
 > Concrete ask: I would support landing #59775 (or an equivalent lazy-discovery fix) before the docs
 > recommend gateway-context hook integrations for third-party plugins. It is a correctness dependency
