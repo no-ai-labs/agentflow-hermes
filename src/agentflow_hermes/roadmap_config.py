@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from .roadmap import RoadmapTransition, RoadmapTransitionRegistry
+from .roadmap_templates import resolve_template
 
 _INT_RE = re.compile(r"-?\d+")
 _FLOAT_RE = re.compile(r"-?\d+\.\d+")
@@ -110,15 +111,25 @@ def _load_transitions(raw: Any) -> dict[str, RoadmapTransition]:
     for key, value in raw.items():
         if not isinstance(value, dict):
             raise ValueError(f"invalid transition entry: {key}")
+        template_preset = str(value.get("template_preset") or "")
+        raw_slice_template = tuple(str(x) for x in (value.get("slice_template") or ()))
+        goal_anchor = str(value.get("goal_anchor") or "")
+        resolved_template = resolve_template(
+            template_preset=template_preset,
+            slice_template=raw_slice_template,
+            goal_anchor=goal_anchor,
+        )
         transitions[str(key)] = RoadmapTransition(
             transition_id=str(value.get("transition_id") or key),
             roadmap_id=str(value.get("roadmap_id") or ""),
             from_slice=str(value.get("from_slice") or ""),
             to_slice=str(value.get("to_slice") or ""),
-            slice_template=tuple(str(x) for x in (value.get("slice_template") or ())),
+            slice_template=resolved_template.slice_template,
             policy_refs=tuple(str(x) for x in (value.get("policy_refs") or ())),
             max_chain_depth=_int(value.get("max_chain_depth"), 3),
             version=str(value.get("version") or ""),
+            template_preset=template_preset,
+            goal_anchor=goal_anchor,
         )
     return transitions
 

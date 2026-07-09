@@ -10,6 +10,7 @@ from typing import Any
 from .graph_creator import GraphIntentCandidate, _policy_ref_body
 from .live.sanitize import safe_durable_ref, safe_event_payload, sanitize_summary, short_text
 from .remediation import parse_verdict_summary
+from .roadmap_templates import ROLE_REVIEW, ROLE_TERMINAL, ROLE_WORK, resolve_template
 
 _EXPLICIT_TRUE = {"true", "yes", "verified", "present", "ok"}
 _VERDICT_BLOCK_RE = re.compile(r"\bVerdict\s*:\s*(BLOCK|NEED_MORE|UNKNOWN|GO)\b", re.IGNORECASE)
@@ -30,6 +31,8 @@ class RoadmapTransition:
     policy_refs: tuple[str, ...]
     max_chain_depth: int = 3
     version: str = ""
+    template_preset: str = ""
+    goal_anchor: str = ""
 
 
 @dataclass(frozen=True)
@@ -53,6 +56,8 @@ class RoadmapTransitionRegistry:
                         "policy_refs": list(value.policy_refs),
                         "max_chain_depth": value.max_chain_depth,
                         "version": value.version,
+                        "template_preset": value.template_preset,
+                        "goal_anchor": value.goal_anchor,
                     }
                     for key, value in sorted(self.transitions.items())
                 },
@@ -185,15 +190,25 @@ def load_roadmap_transition_registry(path: str | Path) -> RoadmapTransitionRegis
     for key, raw in transitions_payload.items():
         if not isinstance(raw, dict):
             raise ValueError(f"invalid transition {key}")
+        template_preset = str(raw.get("template_preset") or "")
+        raw_slice_template = tuple(str(x) for x in raw.get("slice_template") or ())
+        goal_anchor = str(raw.get("goal_anchor") or "")
+        resolved_template = resolve_template(
+            template_preset=template_preset,
+            slice_template=raw_slice_template,
+            goal_anchor=goal_anchor,
+        )
         transition = RoadmapTransition(
             transition_id=str(raw["transition_id"]),
             roadmap_id=str(raw["roadmap_id"]),
             from_slice=str(raw["from_slice"]),
             to_slice=str(raw["to_slice"]),
-            slice_template=tuple(str(x) for x in raw["slice_template"]),
+            slice_template=resolved_template.slice_template,
             policy_refs=tuple(str(x) for x in raw["policy_refs"]),
             max_chain_depth=int(raw.get("max_chain_depth", 3)),
             version=str(raw.get("version", "")),
+            template_preset=template_preset,
+            goal_anchor=goal_anchor,
         )
         if key != transition.transition_id:
             raise ValueError("transition key must match transition_id")
@@ -558,24 +573,29 @@ def _apply_task_profile(kind: str, transition: RoadmapTransition, policy: Roadma
     """
     trusted = policy.trusted_assignees[0] if policy.trusted_assignees else ""
     ack_agent_default = policy.ack_trigger_agent or trusted
+    template = resolve_template(
+        template_preset=transition.template_preset,
+        slice_template=transition.slice_template,
+        goal_anchor=transition.goal_anchor,
+    )
+    step = template.step_for(kind)
     to_slice = transition.to_slice
     tid = transition.transition_id
-    if kind in {"impl", "implementation"}:
+    if step.role == ROLE_WORK:
         return (
             policy.impl_assignee or trusted,
-            f"Complete {to_slice} implementation slice per template {tid}",
+            f"Complete {kind} work step for {to_slice} per template {tid}",
             "",
         )
-    if kind == "review":
+    if step.role == ROLE_REVIEW:
         return (
             policy.review_assignee or trusted,
-            f"Review {to_slice} implementation and emit GO/BLOCK verdict for {tid}",
+            f"Review {to_slice} {kind} step and emit GO/BLOCK/NEED_MORE verdict for {tid}",
             "",
         )
-    # fanin / final: emit ACK edge back to origin.
     return (
         ack_agent_default,
-        f"Fan-in {to_slice} outputs, confirm review GO, emit ACK for {tid}",
+        f"Complete terminal {kind} ACK for {to_slice}, confirm review GO, emit ACK for {tid}",
         ack_agent_default,
     )
 
@@ -663,19 +683,30 @@ def _duplicate_apply_result(proposal: dict[str, Any], existing: dict[str, Any], 
 
 
 def _build_plan(transition: RoadmapTransition, promotion_key: str, chain_depth: int, *, origin: str, return_to: str, source_final_ref: str) -> NextSlicePlan:
+    template = resolve_template(
+        template_preset=transition.template_preset,
+        slice_template=transition.slice_template,
+        goal_anchor=transition.goal_anchor,
+    )
     candidates: list[GraphIntentCandidate] = []
     parent_key = ""
     body = _policy_ref_body(transition.policy_refs)
-    for kind in transition.slice_template:
+    for step in template.steps:
+        kind = step.kind
         idem = f"{promotion_key}:{kind}"
-        candidate_body = body
-        if kind == "fanin":
-            candidate_body = "\n".join(filter(None, [
-                body,
-                f"Roadmap-Transition: {transition.transition_id}",
-                f"Next-Slice: {transition.to_slice}",
-                "Auto-Continue: false",
-            ]))
+        candidate_body = _candidate_body(
+            base_body=body,
+            transition=transition,
+            template_name=template.name,
+            lane=template.lane,
+            goal_anchor=template.goal_anchor,
+            kind=kind,
+            role=step.role,
+            objective=step.objective,
+            source_final_ref=source_final_ref,
+            origin=origin,
+            return_to=return_to or origin,
+        )
         intent = GraphIntentCandidate(
             kind=kind,
             blocker="roadmap_promotion",
@@ -693,6 +724,9 @@ def _build_plan(transition: RoadmapTransition, promotion_key: str, chain_depth: 
                 "to_slice": transition.to_slice,
                 "chain_depth": chain_depth,
                 "source_final_ref": source_final_ref,
+                "template_preset": transition.template_preset or template.name,
+                "template_role": step.role,
+                "goal_anchor": template.goal_anchor,
                 "resolved_preview": {"binding": False, "redacted": True},
             },
             body=candidate_body,
@@ -707,6 +741,72 @@ def _build_plan(transition: RoadmapTransition, promotion_key: str, chain_depth: 
         idempotency_key=promotion_key,
         candidates=tuple(candidates),
     )
+
+
+def _candidate_body(
+    *,
+    base_body: str,
+    transition: RoadmapTransition,
+    template_name: str,
+    lane: str,
+    goal_anchor: str,
+    kind: str,
+    role: str,
+    objective: str,
+    source_final_ref: str,
+    origin: str,
+    return_to: str,
+) -> str:
+    lines = [base_body] if base_body else []
+    lines.extend([
+        "Roadmap context:",
+        f"Lane: {lane}",
+        f"Template-Preset: {template_name}",
+        f"Goal anchor: {short_text(goal_anchor)[:700]}",
+        f"Roadmap-Transition: {transition.transition_id}",
+        f"Slice: {transition.to_slice}",
+        f"Step: {kind}",
+        f"Role: {role}",
+        f"Source-Final-Ref: {source_final_ref}",
+        "",
+        "Step objective:",
+        short_text(objective)[:700],
+    ])
+    if role == ROLE_REVIEW:
+        lines.extend([
+            "",
+            "Review output requirements:",
+            "- Emit Verdict: GO or Verdict: BLOCK/NEED_MORE.",
+            "- If GO, include the continuation markers exactly so the terminal step can preserve them:",
+            "  Review-Edge: verified",
+            "  Parent-GO: verified",
+            f"  Roadmap-Transition: {transition.transition_id}",
+            f"  Next-Slice: {transition.to_slice}",
+            "- Do not set Auto-Continue: true unless this is the final terminal ACK and the next transition is intentionally approved.",
+        ])
+    if role == ROLE_TERMINAL:
+        lines.extend([
+            "",
+            "Final ACK schema (fill all fields; use none/n/a explicitly when absent):",
+            "Verdict: GO|BLOCK|NEED_MORE",
+            f"Slice: {transition.to_slice}",
+            "Evidence: <sources/artifacts or n/a>",
+            "Commit: <sha or none>",
+            "Tests: <commands/results or n/a>",
+            "Runtime smoke: <command/result or n/a>",
+            "Next: <human-readable next action>",
+            f"Roadmap-Transition: {transition.transition_id}",
+            f"Next-Slice: {transition.to_slice}",
+            "Review-Edge: verified|missing",
+            "ACK-Edge: verified|missing",
+            "Parent-GO: verified|missing",
+            "Auto-Continue: false",
+            f"Origin/return_to: {short_text(origin)}",
+            f"Return-To: {short_text(return_to)}",
+            "Subscription-Status: verified",
+            "Policy-Resolution-Ref: <central policy/config ref>",
+        ])
+    return "\n".join(lines)
 
 
 def _coerce_policy(policy: RoadmapPromotionPolicy | None) -> tuple[RoadmapPromotionPolicy, bool]:
@@ -733,8 +833,16 @@ def _coerce_policy(policy: RoadmapPromotionPolicy | None) -> tuple[RoadmapPromot
 def _validate_transition(transition: RoadmapTransition) -> None:
     if not transition.transition_id or not transition.roadmap_id or not transition.from_slice or not transition.to_slice:
         raise ValueError("transition requires ids")
-    if not transition.slice_template or any(not isinstance(k, str) or not k for k in transition.slice_template):
+    if not transition.slice_template and not transition.template_preset:
         raise ValueError("transition requires slice template")
+    try:
+        resolve_template(
+            template_preset=transition.template_preset,
+            slice_template=transition.slice_template,
+            goal_anchor=transition.goal_anchor,
+        )
+    except ValueError as exc:
+        raise ValueError(str(exc)) from exc
     if any(not isinstance(ref, str) or not ref or any(token in ref.lower() for token in ("openrouter", "kimi", "moonshot", "claude-")) for ref in transition.policy_refs):
         raise ValueError("transition policy_refs must be symbolic refs")
     if isinstance(transition.max_chain_depth, bool) or not isinstance(transition.max_chain_depth, int) or transition.max_chain_depth < 0:

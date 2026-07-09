@@ -220,6 +220,8 @@ def _build_roadmap_registry(raw: Any) -> RoadmapTransitionRegistry | None:
                 policy_refs=tuple(str(x) for x in value.get("policy_refs") or ()),
                 max_chain_depth=int(value.get("max_chain_depth", 3)),
                 version=str(value.get("version") or ""),
+                template_preset=str(value.get("template_preset") or ""),
+                goal_anchor=str(value.get("goal_anchor") or ""),
             )
             transitions[key] = transition
         return RoadmapTransitionRegistry(

@@ -26,6 +26,7 @@ from typing import Any
 
 from .live.sanitize import sanitize_string
 from .roadmap_config import load_repo_roadmap_config
+from .roadmap_templates import LEGACY_PRESET, preset_names, resolve_template
 
 REGISTRY_VERSION = 1
 
@@ -71,6 +72,9 @@ def add_roadmap_init_config_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--impl-assignee", default="ccsupervisor")
     parser.add_argument("--review-assignee", default="ccreviewer")
     parser.add_argument("--roadmap-id", default="", help="defaults to <board>.roadmap")
+    parser.add_argument("--template-preset", default="",
+                        help=f"roadmap task template preset (default: {LEGACY_PRESET}; choices: {', '.join(preset_names())})")
+    parser.add_argument("--goal-anchor", default="", help="optional lane standing goal anchor for generated task bodies")
     parser.add_argument("--apply-mode", action="store_true", default=False,
                         help="arm board writes in the generated config (still needs --apply at run time)")
     parser.add_argument("--force", action="store_true", default=False,
@@ -88,6 +92,8 @@ def render_roadmap_config(
     impl_assignee: str = "ccsupervisor",
     review_assignee: str = "ccreviewer",
     roadmap_id: str = "",
+    template_preset: str = "",
+    goal_anchor: str = "",
     apply_mode: bool = False,
 ) -> str:
     """Render a committed roadmap config in the dependency-free YAML subset.
@@ -105,6 +111,14 @@ def render_roadmap_config(
     origin = _safe_origin(origin)
     return_to = _safe_origin(return_to) if return_to else origin
     roadmap_id = _safe_ident(roadmap_id) if roadmap_id else f"{board}.roadmap"
+    template_preset = _safe_ident(template_preset) if template_preset else ""
+    goal_anchor = _safe_origin(goal_anchor) if goal_anchor else ""
+    resolved_template = resolve_template(
+        template_preset=template_preset,
+        slice_template=(),
+        goal_anchor=goal_anchor,
+    )
+    sequence = resolved_template.slice_template
 
     apply_mode_str = "true" if apply_mode else "false"
     lines = [
@@ -151,15 +165,15 @@ def render_roadmap_config(
         f"    roadmap_id: {roadmap_id}",
         f"    from_slice: {from_slice}",
         f"    to_slice: {to_slice}",
+        *([f"    template_preset: {template_preset}"] if template_preset else []),
+        *([f'    goal_anchor: "{goal_anchor}"'] if goal_anchor else []),
         "    slice_template:",
-        "      - impl",
-        "      - review",
-        "      - fanin",
+        *[f"      - {kind}" for kind in sequence],
         "    policy_refs:",
         "      - design_opus",
         "      - implementation_default",
         "    max_chain_depth: 3",
-        "    version: template-v1",
+        f"    version: {'template-v2' if template_preset else 'template-v1'}",
         "",
     ]
     return "\n".join(lines)
@@ -181,9 +195,11 @@ def run_roadmap_init_config(args: argparse.Namespace) -> tuple[int, dict[str, An
             impl_assignee=args.impl_assignee,
             review_assignee=args.review_assignee,
             roadmap_id=args.roadmap_id,
+            template_preset=args.template_preset,
+            goal_anchor=args.goal_anchor,
             apply_mode=args.apply_mode,
         )
-    except ConfigValueError as exc:
+    except (ConfigValueError, ValueError) as exc:
         return 2, {"success": False, "error": str(exc)}
 
     try:

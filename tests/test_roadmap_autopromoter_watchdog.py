@@ -435,3 +435,93 @@ def test_roadmap_promote_committed_yaml_config_loads_and_evaluates(monkeypatch, 
     assert len(roadmap["created_task_ids"]) == 3
     create_calls = [c for c in runner.calls if "create" in c]
     assert all(c[:4] == ["hermes", "kanban", "--board", "agentflow-hermes"] for c in create_calls)
+
+
+def test_roadmap_promote_research_preset_request_only_canary(monkeypatch, tmp_path):
+    payload = dict(CONFIG_PAYLOAD)
+    payload.update({
+        "board": "warroom-os",
+        "expected_origin": "Discord Devhub / #research",
+        "expected_return_to": "Discord Devhub / #research",
+        "allowed_transitions": ["research.default.scout_evidence_scorecard_review_brief"],
+        "transitions": {
+            "research.default.scout_evidence_scorecard_review_brief": {
+                "roadmap_id": "research.roadmap",
+                "from_slice": "research-current",
+                "to_slice": "research-next",
+                "template_preset": "research-loop",
+                "slice_template": ["scout", "evidence", "scorecard", "review", "brief"],
+                "policy_refs": ["design_opus", "implementation_default"],
+                "max_chain_depth": 2,
+                "version": "template-v2",
+            }
+        },
+    })
+    task = _task(
+        result=_go_summary(
+            transition="research.default.scout_evidence_scorecard_review_brief",
+            next_slice="research-next",
+            origin="Discord Devhub / #research",
+            return_to="Discord Devhub / #research",
+        ),
+        origin="Discord Devhub / #research",
+        return_to="Discord Devhub / #research",
+    )
+    runner = _RecordingCliRunner(tasks={"t_final_research": task})
+    monkeypatch.setattr(roadmap_cli, "resolve_kanban_board_client", lambda: runner)
+    config_path = _write_config(tmp_path, payload, name="research-roadmap.json")
+
+    rc, data = _run(["roadmap", "promote", "--config", config_path, "--task", "t_final_research"], monkeypatch, tmp_path)
+
+    assert rc == 0
+    roadmap = data["receipt"]["decision_payload"]["roadmap_autopromote"]
+    assert roadmap["action"] == "propose"
+    assert roadmap["applied"] is False
+    assert [c["kind"] for c in data["proposal"]["candidates"]] == ["scout", "evidence", "scorecard", "review", "brief"]
+    assert "#research" in data["proposal"]["candidates"][0]["body"]
+    assert not any("create" in c for c in runner.calls)
+
+
+def test_roadmap_promote_shaman_preset_request_only_canary(monkeypatch, tmp_path):
+    payload = dict(CONFIG_PAYLOAD)
+    payload.update({
+        "board": "oracle-lab",
+        "expected_origin": "Discord Devhub / #shaman",
+        "expected_return_to": "Discord Devhub / #shaman",
+        "allowed_transitions": ["shaman.default.design_impl_browser_review_fanin"],
+        "transitions": {
+            "shaman.default.design_impl_browser_review_fanin": {
+                "roadmap_id": "shaman.roadmap",
+                "from_slice": "shaman-current",
+                "to_slice": "shaman-next",
+                "template_preset": "shaman-loop",
+                "slice_template": ["design", "impl", "browser_e2e", "review", "fanin"],
+                "policy_refs": ["design_opus", "implementation_default"],
+                "max_chain_depth": 2,
+                "version": "template-v2",
+            }
+        },
+    })
+    task = _task(
+        result=_go_summary(
+            transition="shaman.default.design_impl_browser_review_fanin",
+            next_slice="shaman-next",
+            origin="Discord Devhub / #shaman",
+            return_to="Discord Devhub / #shaman",
+        ),
+        origin="Discord Devhub / #shaman",
+        return_to="Discord Devhub / #shaman",
+    )
+    runner = _RecordingCliRunner(tasks={"t_final_shaman": task})
+    monkeypatch.setattr(roadmap_cli, "resolve_kanban_board_client", lambda: runner)
+    config_path = _write_config(tmp_path, payload, name="shaman-roadmap.json")
+
+    rc, data = _run(["roadmap", "promote", "--config", config_path, "--task", "t_final_shaman"], monkeypatch, tmp_path)
+
+    assert rc == 0
+    roadmap = data["receipt"]["decision_payload"]["roadmap_autopromote"]
+    assert roadmap["action"] == "propose"
+    assert roadmap["applied"] is False
+    assert [c["kind"] for c in data["proposal"]["candidates"]] == ["design", "impl", "browser_e2e", "review", "fanin"]
+    assert "browser_e2e" in data["proposal"]["candidates"][2]["body"]
+    assert not any("create" in c for c in runner.calls)

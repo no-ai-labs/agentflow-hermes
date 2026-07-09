@@ -28,6 +28,7 @@ trusted_assignees:
 
 allowed_transitions:
   - m16->m17.impl_review_fanin
+  - m18->m19.channel_templates
 
 max_chain_depth: 3
 max_promotions_per_roadmap: 6
@@ -52,3 +53,19 @@ transitions:
       - implementation_default
     max_chain_depth: 3
     version: template-v1
+
+  m18->m19.channel_templates:
+    roadmap_id: agentflow-hermes.roadmap
+    from_slice: m18
+    to_slice: m19
+    template_preset: impl-review-fanin
+    slice_template:
+      - impl
+      - review
+      - fanin
+    goal_anchor: "#hermes-main: implement bounded AgentFlow autopromoter template rendering, tests, and canary; no generic policy platform."
+    policy_refs:
+      - design_opus
+      - implementation_default
+    max_chain_depth: 3
+    version: template-v2

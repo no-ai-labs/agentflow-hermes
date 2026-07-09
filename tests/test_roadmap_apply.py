@@ -33,7 +33,31 @@ def _registry() -> RoadmapTransitionRegistry:
                 policy_refs=("design_opus", "implementation_default"),
                 max_chain_depth=2,
                 version="template-v1",
-            )
+            ),
+            "research.default.scout_evidence_scorecard_review_brief": RoadmapTransition(
+                transition_id="research.default.scout_evidence_scorecard_review_brief",
+                roadmap_id="research.roadmap",
+                from_slice="research-current",
+                to_slice="research-next",
+                slice_template=("scout", "evidence", "scorecard", "review", "brief"),
+                policy_refs=("design_opus", "implementation_default"),
+                max_chain_depth=2,
+                version="template-v2",
+                template_preset="research-loop",
+                goal_anchor="#research custom standing anchor",
+            ),
+            "shaman.default.design_impl_browser_review_fanin": RoadmapTransition(
+                transition_id="shaman.default.design_impl_browser_review_fanin",
+                roadmap_id="shaman.roadmap",
+                from_slice="shaman-current",
+                to_slice="shaman-next",
+                slice_template=("design", "impl", "browser_e2e", "review", "fanin"),
+                policy_refs=("design_opus", "implementation_default"),
+                max_chain_depth=2,
+                version="template-v2",
+                template_preset="shaman-loop",
+                goal_anchor="#shaman custom standing anchor",
+            ),
         },
     )
 
@@ -445,6 +469,139 @@ def test_partial_failure_after_first_create_fails_closed_no_ledger_poison():
     assert len(retry["created_task_ids"]) == 3
 
 
+def _research_registry() -> RoadmapTransitionRegistry:
+    return RoadmapTransitionRegistry(
+        version="test-v2",
+        source_ref="test-registry",
+        transitions={
+            "research.default.scout_evidence_scorecard_review_brief": RoadmapTransition(
+                transition_id="research.default.scout_evidence_scorecard_review_brief",
+                roadmap_id="research.roadmap",
+                from_slice="research-current",
+                to_slice="research-next",
+                slice_template=("scout", "evidence", "scorecard", "review", "brief"),
+                policy_refs=("design_opus", "implementation_default"),
+                max_chain_depth=2,
+                version="template-v2",
+                template_preset="research-loop",
+                goal_anchor="#research anchor text",
+            )
+        },
+    )
+
+
+def _shaman_registry() -> RoadmapTransitionRegistry:
+    return RoadmapTransitionRegistry(
+        version="test-v2",
+        source_ref="test-registry",
+        transitions={
+            "shaman.default.design_impl_browser_review_fanin": RoadmapTransition(
+                transition_id="shaman.default.design_impl_browser_review_fanin",
+                roadmap_id="shaman.roadmap",
+                from_slice="shaman-current",
+                to_slice="shaman-next",
+                slice_template=("design", "impl", "browser_e2e", "review", "fanin"),
+                policy_refs=("design_opus", "implementation_default"),
+                max_chain_depth=2,
+                version="template-v2",
+                template_preset="shaman-loop",
+                goal_anchor="#shaman anchor text",
+            )
+        },
+    )
+
+
+def test_research_loop_apply_creates_five_tasks_with_role_based_assignees():
+    adapter = FakeKanbanGraphAdapter()
+    result = apply_roadmap_promotion(
+        _summary(transition="research.default.scout_evidence_scorecard_review_brief", next_slice="research-next"),
+        event_id="evt-research-1",
+        source_final_ref="t_final",
+        source_assignee="ccreviewer",
+        origin="Discord Devhub / #hermes-main",
+        return_to="Discord Devhub / #hermes-main",
+        subscription_status="verified",
+        policy_resolution_ref="policy:model.implementation_default@v1",
+        chain_depth=0,
+        occurred_at=1000.0,
+        registry=_research_registry(),
+        ledger=InMemoryRoadmapPromotionLedger(),
+        apply_ledger=InMemoryRoadmapApplyLedger(),
+        policy=_policy(allowlisted_transitions=("research.default.scout_evidence_scorecard_review_brief",)),
+        adapter=adapter,
+    )
+
+    assert result["applied"] is True
+    assert [t["kind"] for t in result["tasks"]] == ["scout", "evidence", "scorecard", "review", "brief"]
+    tasks = {t["kind"]: t for t in result["tasks"]}
+    assert tasks["scout"]["assignee"] == "impl-agent"
+    assert tasks["evidence"]["assignee"] == "impl-agent"
+    assert tasks["scorecard"]["assignee"] == "impl-agent"
+    assert tasks["review"]["assignee"] == "ccreviewer"
+    assert tasks["brief"]["assignee"] == "ack-agent"
+    assert tasks["brief"]["ack_trigger_agent"] == "ack-agent"
+    assert tasks["scout"]["ack_trigger_agent"] == ""
+    assert tasks["review"]["ack_trigger_agent"] == ""
+
+    scout_body = adapter.create_calls[0].body
+    assert "#research anchor text" in scout_body
+    assert "Role: work" in scout_body
+    assert "Step: scout" in scout_body
+
+    review_body = adapter.create_calls[3].body
+    assert "Role: review" in review_body
+    assert "Review-Edge: verified" in review_body
+    assert "Do not set Auto-Continue: true" in review_body
+
+    brief_body = adapter.create_calls[4].body
+    assert "Role: terminal" in brief_body
+    assert "Auto-Continue: false" in brief_body
+    assert "Roadmap-Transition: research.default.scout_evidence_scorecard_review_brief" in brief_body
+    assert "Next-Slice: research-next" in brief_body
+    assert "Verdict: GO|BLOCK|NEED_MORE" in brief_body
+
+
+def test_shaman_loop_apply_creates_five_tasks_browser_e2e_work_role():
+    adapter = FakeKanbanGraphAdapter()
+    result = apply_roadmap_promotion(
+        _summary(transition="shaman.default.design_impl_browser_review_fanin", next_slice="shaman-next"),
+        event_id="evt-shaman-1",
+        source_final_ref="t_final",
+        source_assignee="ccreviewer",
+        origin="Discord Devhub / #hermes-main",
+        return_to="Discord Devhub / #hermes-main",
+        subscription_status="verified",
+        policy_resolution_ref="policy:model.implementation_default@v1",
+        chain_depth=0,
+        occurred_at=1000.0,
+        registry=_shaman_registry(),
+        ledger=InMemoryRoadmapPromotionLedger(),
+        apply_ledger=InMemoryRoadmapApplyLedger(),
+        policy=_policy(allowlisted_transitions=("shaman.default.design_impl_browser_review_fanin",)),
+        adapter=adapter,
+    )
+
+    assert result["applied"] is True
+    assert [t["kind"] for t in result["tasks"]] == ["design", "impl", "browser_e2e", "review", "fanin"]
+    tasks = {t["kind"]: t for t in result["tasks"]}
+    assert tasks["design"]["assignee"] == "impl-agent"
+    assert tasks["browser_e2e"]["assignee"] == "impl-agent"
+    assert tasks["fanin"]["assignee"] == "ack-agent"
+    fanin_body = adapter.create_calls[4].body
+    assert "Auto-Continue: false" in fanin_body
+    assert "#shaman anchor text" in adapter.create_calls[2].body
+
+
+def test_legacy_impl_review_fanin_bodies_carry_terminal_markers_via_role():
+    adapter = FakeKanbanGraphAdapter()
+    result = _apply(_summary(), adapter=adapter)
+    assert result["applied"] is True
+    fanin_body = adapter.create_calls[2].body
+    assert "Auto-Continue: false" in fanin_body
+    assert "Roadmap-Transition: m14->m15.impl_review_fanin" in fanin_body
+    assert "Next-Slice: m15" in fanin_body
+
+
 def test_apply_receipt_sanitizes_raw_paths_and_secrets():
     adapter = FakeKanbanGraphAdapter()
     result = _apply(
@@ -461,3 +618,71 @@ def test_apply_receipt_sanitizes_raw_paths_and_secrets():
     # Applied graph still produced with a safe hashed source ref.
     assert result["applied"] is True
     assert "ref:sha256:" in receipt_text
+
+
+def test_research_preset_apply_uses_role_based_assignees_and_bodies():
+    adapter = FakeKanbanGraphAdapter()
+    result = _apply(
+        _summary(
+            transition="research.default.scout_evidence_scorecard_review_brief",
+            next_slice="research-next",
+        ),
+        adapter=adapter,
+        event_id="evt-research",
+        policy=_policy(
+            allowlisted_transitions=("research.default.scout_evidence_scorecard_review_brief",),
+            apply_enabled=True,
+            impl_assignee="research-worker",
+            review_assignee="research-reviewer",
+            ack_trigger_agent="brief-agent",
+        ),
+    )
+
+    assert result["applied"] is True
+    assert [t["kind"] for t in result["tasks"]] == ["scout", "evidence", "scorecard", "review", "brief"]
+    tasks = {t["kind"]: t for t in result["tasks"]}
+    assert tasks["scout"]["assignee"] == "research-worker"
+    assert tasks["evidence"]["assignee"] == "research-worker"
+    assert tasks["scorecard"]["assignee"] == "research-worker"
+    assert tasks["review"]["assignee"] == "research-reviewer"
+    assert tasks["brief"]["assignee"] == "brief-agent"
+    assert tasks["brief"]["ack_trigger_agent"] == "brief-agent"
+
+    candidates = {c["kind"]: c for c in result["candidates"]}
+    assert "#research custom standing anchor" in candidates["scout"]["body"]
+    assert "Role: review" in candidates["review"]["body"]
+    assert "Review output requirements:" in candidates["review"]["body"]
+    assert "Review-Edge: verified" in candidates["review"]["body"]
+    assert "Role: terminal" in candidates["brief"]["body"]
+    assert "Final ACK schema" in candidates["brief"]["body"]
+    assert "Auto-Continue: false" in candidates["brief"]["body"]
+
+
+def test_shaman_preset_apply_treats_browser_e2e_as_work_and_fanin_terminal():
+    adapter = FakeKanbanGraphAdapter()
+    result = _apply(
+        _summary(
+            transition="shaman.default.design_impl_browser_review_fanin",
+            next_slice="shaman-next",
+        ),
+        adapter=adapter,
+        event_id="evt-shaman",
+        policy=_policy(
+            allowlisted_transitions=("shaman.default.design_impl_browser_review_fanin",),
+            apply_enabled=True,
+            impl_assignee="shaman-worker",
+            review_assignee="shaman-reviewer",
+            ack_trigger_agent="fanin-agent",
+        ),
+    )
+
+    assert result["applied"] is True
+    assert [t["kind"] for t in result["tasks"]] == ["design", "impl", "browser_e2e", "review", "fanin"]
+    tasks = {t["kind"]: t for t in result["tasks"]}
+    assert tasks["browser_e2e"]["assignee"] == "shaman-worker"
+    assert tasks["review"]["assignee"] == "shaman-reviewer"
+    assert tasks["fanin"]["assignee"] == "fanin-agent"
+    candidates = {c["kind"]: c for c in result["candidates"]}
+    assert "browser/user-flow smoke" in candidates["browser_e2e"]["body"]
+    assert "Role: work" in candidates["browser_e2e"]["body"]
+    assert "Role: terminal" in candidates["fanin"]["body"]

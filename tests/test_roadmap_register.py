@@ -60,6 +60,65 @@ def test_init_config_scaffolds_loadable_config(monkeypatch, tmp_path):
     assert config.expected_return_to == "Discord Devhub / #contextops"
 
 
+def test_init_config_research_template_preset_scaffolds_sequence_and_anchor(monkeypatch, tmp_path):
+    output = tmp_path / "research-roadmap.yaml"
+    rc, data = _run(
+        _init_argv(
+            output,
+            board="warroom-os",
+            origin="Discord Devhub / #research",
+            transition="research.default.scout_evidence_scorecard_review_brief",
+            from_slice="research-current",
+            to_slice="research-next",
+        )
+        + ["--template-preset", "research-loop", "--goal-anchor", "#research / warroom-os sourced briefs"],
+        monkeypatch,
+        tmp_path,
+    )
+
+    assert rc == 0
+    assert data["success"] is True
+    config = load_repo_roadmap_config(str(output))
+    transition = config.transitions["research.default.scout_evidence_scorecard_review_brief"]
+    assert transition.template_preset == "research-loop"
+    assert transition.goal_anchor == "#research / warroom-os sourced briefs"
+    assert transition.slice_template == ("scout", "evidence", "scorecard", "review", "brief")
+
+
+def test_init_config_shaman_template_preset_scaffolds_sequence(monkeypatch, tmp_path):
+    output = tmp_path / "shaman-roadmap.yaml"
+    rc, data = _run(
+        _init_argv(
+            output,
+            board="oracle-lab",
+            origin="Discord Devhub / #shaman",
+            transition="shaman.default.design_impl_browser_review_fanin",
+            from_slice="shaman-current",
+            to_slice="shaman-next",
+        )
+        + ["--template-preset", "shaman-loop"],
+        monkeypatch,
+        tmp_path,
+    )
+
+    assert rc == 0
+    assert data["success"] is True
+    config = load_repo_roadmap_config(str(output))
+    transition = config.transitions["shaman.default.design_impl_browser_review_fanin"]
+    assert transition.template_preset == "shaman-loop"
+    assert transition.slice_template == ("design", "impl", "browser_e2e", "review", "fanin")
+
+
+def test_init_config_invalid_template_preset_returns_json_error_no_clobber(monkeypatch, tmp_path):
+    output = tmp_path / "roadmap.yaml"
+    rc, data = _run(_init_argv(output) + ["--template-preset", "freeform-loop"], monkeypatch, tmp_path)
+
+    assert rc != 0
+    assert data["success"] is False
+    assert "unknown template_preset" in data["error"]
+    assert not output.exists()
+
+
 def test_init_config_apply_mode_flag_arms_board_writes(monkeypatch, tmp_path):
     output = tmp_path / "roadmap.yaml"
     rc, data = _run(_init_argv(output) + ["--apply-mode"], monkeypatch, tmp_path)
@@ -88,6 +147,15 @@ def test_init_config_rejects_unsafe_origin(monkeypatch, tmp_path):
     assert data["success"] is False
     assert data["error"] == "invalid_value"
     assert not output.exists()
+
+
+def test_init_config_default_output_unchanged_when_preset_omitted(monkeypatch, tmp_path):
+    output = tmp_path / "legacy.yaml"
+    _run(_init_argv(output), monkeypatch, tmp_path)
+    config = load_repo_roadmap_config(str(output))
+    transition = next(iter(config.transitions.values()))
+    assert transition.slice_template == ("impl", "review", "fanin")
+    assert transition.template_preset == ""
 
 
 def test_generated_config_runs_dry_run_propose(monkeypatch, tmp_path):
