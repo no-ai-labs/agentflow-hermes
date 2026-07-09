@@ -179,6 +179,81 @@ Post-update smoke (no live board write):
 agentflow-hermes roadmap promote --config agentflow-roadmap.yaml --task <some-final-task-id>
 ```
 
+## GitHub release publish trigger (M20)
+
+A bounded, dry-run-first trigger that turns a final reviewed `GO` summary into
+a `git tag` + `git push` (tag) + `gh release create`. It never runs git/gh on
+its own — see `src/agentflow_hermes/release_action.py`.
+
+```bash
+# Dry-run (default): reads the summary, evaluates the gates, proposes a plan.
+# No config passed at all => release actions are disabled => always a noop.
+agentflow-hermes release github --summary-file final-go.txt --config release.json
+
+# Apply requires BOTH config.apply_mode: true AND --apply on the CLI.
+agentflow-hermes release github --summary-file final-go.txt --config release.json \
+  --apply --receipts-file .agentflow-release-receipts.json
+```
+
+The final GO summary must carry explicit markers — prose like "we should
+probably release this" is never treated as a directive:
+
+```
+Verdict: GO
+Release-Action: github-release
+Release-Version: v1.2.3
+Release-Approved: true
+Release-Title: v1.2.3 release        # optional
+Release-Notes: Bugfixes and docs.    # optional
+Release-Target: main                 # optional, passed to `gh release create --target`
+```
+
+Safety gates, all fail closed:
+
+1. `release_actions_enabled: false` (default) — no summary is ever acted on;
+   this is the master kill switch in the release-action config.
+2. `Verdict: GO` plus all four required markers must be present and explicit;
+   `BLOCK`/`NEED_MORE`/prose-only directives always refuse.
+3. `Release-Action` must be in the config's `allowed_actions` allowlist (e.g.
+   `github-release`) — an unlisted action refuses (`unknown_action`).
+4. `Release-Approved: true` must be present — anything else refuses
+   (`missing_approval`).
+5. `Release-Version` must match `allowed_versions` (an explicit list) or
+   `allowed_version_pattern` (a regex) if configured, else the built-in
+   `vX.Y.Z` pattern — otherwise refuses (`invalid_version`).
+6. Even with all of the above, the CLI only *proposes* a plan
+   (`mutations` describes the planned release action; nothing runs) unless `config.apply_mode: true` **and**
+   `--apply` are both set.
+7. Duplicate protection is two-layered: a local receipts-file ledger keyed by
+   `release:<action>:<version>` short-circuits before touching git/gh at all,
+   and — independently, right before any mutation — a live `git tag -l` /
+   `gh release view` check refuses (`duplicate_tag` / `duplicate_release`) if
+   the tag or release already exists upstream, even if the local ledger is
+   missing or stale.
+8. If `git tag`, `git push`, or `gh release create` fails partway through, the
+   run refuses (`tag_failed` / `push_failed` / `release_create_failed`) and
+   writes **no** receipt, so a retry can safely pick up where it left off.
+9. The receipt written on success stores only `action`, `version`,
+   `idempotency_key`, and `result` — never the raw summary body, notes, or any
+   secret/token.
+
+An example `release.json`:
+
+```json
+{
+  "release_actions_enabled": true,
+  "apply_mode": true,
+  "allowed_actions": ["github-release"],
+  "allowed_version_pattern": "^v\\d+\\.\\d+\\.\\d+$"
+}
+```
+
+Tests (`tests/test_release_action.py`, `tests/test_release_cli.py`) exercise
+every gate above against an injectable fake git/gh runner. No test ever
+shells out to real git/gh, and this module is not wired into any live
+default-on path — an operator must write a config with both flags on and pass
+`--apply` explicitly.
+
 ## Safety defaults
 
 - No live `send_message` dispatch by default
