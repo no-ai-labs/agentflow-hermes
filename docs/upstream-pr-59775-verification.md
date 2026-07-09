@@ -11,10 +11,17 @@ PR [#59775](https://github.com/NousResearch/hermes-agent/pull/59775) fixes a rea
 ## PR status / checks
 
 - URL: https://github.com/NousResearch/hermes-agent/pull/59775
-- State: **OPEN**, draft: false, mergeable: **UNKNOWN**, reviewDecision: empty
+- State: **OPEN**, draft: false, mergeable: **MERGEABLE**, reviewDecision: empty.
+  All PR metadata in this section is **point-in-time**, captured live via
+  `gh pr view 59775 --repo NousResearch/hermes-agent --json state,isDraft,mergeable,headRefOid,statusCheckRollup`
+  at **2026-07-09 18:17:13 UTC** (head `4fc01ffbc8c8c7ca3e9092ec578fabc548f48cfd`; PR `updatedAt`
+  2026-07-06T17:54:49Z). Re-check before relying on it. Earlier drafts of this doc reported
+  mergeable UNKNOWN — that was stale at time of writing, not a re-check failure; treat
+  mergeability as a live, re-checkable field, not a fact fixed at audit time.
 - Title: `fix: lazy-discover plugins in invoke_hook / invoke_middleware so user hooks fire in gateway context`
 - Head: `feat/lazy-discover-plugin-hooks` → base: `main`; author: `magicbluesmoke`
-- Status check rollup from `gh`: empty (`checks: []`) — no GitHub checks reported by this query
+- Status check rollup from `gh`: empty (`statusCheckRollup: []`) — no GitHub checks reported by
+  this query; mergeable MERGEABLE does **not** imply CI passed or review approved
 - Commits: `a49a58b...`, `e6d74e5...`, final `4fc01ffbc8c8c7ca3e9092ec578fabc548f48cfd`
 - Files changed: `hermes_cli/kanban_db.py` (+7/-1), `hermes_cli/plugins.py` (+18/-2), `tests/hermes_cli/test_plugins.py` (+77/-0)
 
@@ -54,7 +61,10 @@ This does **not** block AgentFlow's current CLI/polling integration path, which 
 
 ## Residual risks
 
-- No GitHub status checks were reported by `gh` for this PR (`checks: []`) — CI signal, if any exists, was not observed by this verification.
+- No GitHub status checks were reported by `gh` for this PR (`statusCheckRollup: []`,
+  re-confirmed 2026-07-09 18:17:13 UTC) — CI signal, if any exists, was not observed by this
+  verification. Mergeability being MERGEABLE says nothing about CI/review state; do not
+  conflate the two.
 - No full Hermes test suite was run against the PR; only the two PR-added targeted tests were executed.
 - No live gateway end-to-end or process-restart test was performed, by design (verification was scoped to a temp clone, no live Hermes mutation).
 - Hook coverage in this verification is limited to the existing hook/event names used in the regression script (`kanban_task_claimed`, `llm_request`); other hook/event names were not exercised.
