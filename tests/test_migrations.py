@@ -34,7 +34,7 @@ def test_fresh_db_initializes_at_schema_version(tmp_path):
     store.init()
     with store.connect() as con:
         version = con.execute("pragma user_version").fetchone()[0]
-    assert version == SCHEMA_VERSION == 4
+    assert version == SCHEMA_VERSION == 5
 
 
 def test_v1_db_upgrades_without_data_loss(tmp_path):
@@ -58,7 +58,7 @@ def test_v1_db_upgrades_without_data_loss(tmp_path):
         cycle_cols = {r[1] for r in con.execute("pragma table_info(maintenance_cycles)").fetchall()}
         job = con.execute("select * from jobs where id='j1'").fetchone()
 
-    assert version == SCHEMA_VERSION == 4
+    assert version == SCHEMA_VERSION == 5
     assert cycle_cols
     assert "correlation_id" in cols
     assert "causation_id" in cols

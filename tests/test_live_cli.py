@@ -53,7 +53,7 @@ def test_cli_doctor_includes_policy_and_schema_version(monkeypatch, tmp_path):
     rc, data = _run(["doctor"], monkeypatch, tmp_path)
     assert rc == 0
     assert data["success"] is True
-    assert data["schema_version"] == 4
+    assert data["schema_version"] == 5
     assert "policy" in data
 
 

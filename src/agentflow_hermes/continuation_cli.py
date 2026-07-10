@@ -1,0 +1,211 @@
+"""Operator CLI surface for the needs-input continuation engine.
+
+``ingest`` reads a controlled fixture file of board events (there is no
+importable real-time Hermes Kanban event stream client available at runtime,
+matching the same constraint documented on ``RealKanbanGraphAdapter``).
+Real-time board polling against a live per-board Kanban DB is an explicit,
+documented follow-up (see docs/plans design section 3.7), not hidden here.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+from typing import Any
+
+from .board_adapter import FakeBoardAdapter, RealBoardAdapter
+from .board_events import BoardEvent, FakeBoardEventSource
+from .continuation_config import ContractRegistry, UnknownContractError, load_contract_registry
+from .continuation_engine import ingest_board_once
+from .continuation_store import ContinuationState, ContinuationStore, doctor_store_selection
+from .live.sanitize import safe_event_payload
+
+_DEFAULT_CONTRACTS_DIR = Path(__file__).resolve().parents[2] / "contracts"
+
+
+def _default_contract_paths() -> list[Path]:
+    if not _DEFAULT_CONTRACTS_DIR.exists():
+        return []
+    return sorted(_DEFAULT_CONTRACTS_DIR.glob("*.yaml"))
+
+
+def _load_registry(contract_files: list[str] | None) -> ContractRegistry:
+    paths: list[Path] = [Path(p) for p in contract_files] if contract_files else _default_contract_paths()
+    return load_contract_registry(paths)
+
+
+def _store(args: argparse.Namespace) -> ContinuationStore:
+    return ContinuationStore(Path(args.db))
+
+
+def _adapter(args: argparse.Namespace):
+    mode = getattr(args, "adapter_mode", "fake")
+    if mode == "real":
+        return RealBoardAdapter(board=getattr(args, "board", ""), hermes_bin=getattr(args, "hermes_bin", "hermes"))
+    return FakeBoardAdapter()
+
+
+def add_continuation_cli_args(sub: argparse._SubParsersAction) -> None:
+    ingest = sub.add_parser("ingest")
+    ingest.add_argument("--board", required=True)
+    ingest.add_argument("--board-db-identity", default="")
+    ingest.add_argument("--events-file", required=True)
+    ingest.add_argument("--contract-file", action="append", default=None)
+    ingest.add_argument("--adapter-mode", choices=["fake", "real"], default="fake")
+    ingest.add_argument("--hermes-bin", default="hermes")
+    ingest.add_argument("--db", required=True)
+
+    listp = sub.add_parser("list")
+    listp.add_argument("--state", default="")
+    listp.add_argument("--db", required=True)
+
+    show = sub.add_parser("show")
+    show.add_argument("instance_id", type=int)
+    show.add_argument("--db", required=True)
+
+    submit = sub.add_parser("submit")
+    submit.add_argument("instance_id", type=int)
+    submit.add_argument("--input-file", required=True)
+    submit.add_argument("--contract-file", action="append", default=None)
+    submit.add_argument("--adapter-mode", choices=["fake", "real"], default="fake")
+    submit.add_argument("--hermes-bin", default="hermes")
+    submit.add_argument("--board", default="")
+    submit.add_argument("--db", required=True)
+
+    retry = sub.add_parser("retry")
+    retry.add_argument("instance_id", type=int)
+    retry.add_argument("--adapter-mode", choices=["fake", "real"], default="fake")
+    retry.add_argument("--hermes-bin", default="hermes")
+    retry.add_argument("--board", default="")
+    retry.add_argument("--db", required=True)
+
+    doctor = sub.add_parser("doctor")
+    doctor.add_argument("--db", default="")
+    doctor.add_argument("--fallback-db", default="")
+
+
+def run_continuation_ingest(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
+    store = _store(args)
+    contracts = _load_registry(args.contract_file)
+    adapter = _adapter(args)
+
+    raw_events = json.loads(Path(args.events_file).read_text(encoding="utf-8"))
+    events = [
+        BoardEvent(
+            event_id=str(e.get("event_id") or ""),
+            event_seq=int(e.get("event_seq") or 0),
+            source_task_id=str(e.get("source_task_id") or ""),
+            source_graph_id=str(e.get("source_graph_id") or ""),
+            summary=str(e.get("summary") or ""),
+            run_metadata=e.get("run_metadata"),
+            origin_ref=str(e.get("origin_ref") or ""),
+            return_to_ref=str(e.get("return_to_ref") or ""),
+            workspace_ref=str(e.get("workspace_ref") or ""),
+            assignee=str(e.get("assignee") or ""),
+            occurred_at=float(e.get("occurred_at") or 0.0),
+        )
+        for e in raw_events
+    ]
+    source = FakeBoardEventSource(db_identity=args.board_db_identity or args.board, events=events)
+    result = ingest_board_once(board=args.board, source=source, store=store, contract_registry=contracts, adapter=adapter)
+    return 0, safe_event_payload(result)
+
+
+def run_continuation_list(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
+    store = _store(args)
+    instances = store.list_instances(state=args.state or None)
+    return 0, safe_event_payload({"success": True, "instances": instances})
+
+
+def run_continuation_show(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
+    store = _store(args)
+    instance = store.get_instance(args.instance_id)
+    if instance is None:
+        return 2, {"success": False, "error": "unknown_instance"}
+
+    contracts = _load_registry(None)
+    required_owner_fields: list[str] = []
+    system_fields: list[str] = []
+    try:
+        contract = contracts.get(instance.get("contract_ref") or "")
+        required_owner_fields = [f.name for f in contract.owner_fields()]
+        system_fields = [f.name for f in contract.fields if f.authority.value == "system"]
+    except UnknownContractError:
+        pass
+
+    steps = store.list_steps(args.instance_id)
+    receipts = store.list_owner_receipts(args.instance_id)
+
+    report = {
+        "success": True,
+        "instance": instance,
+        "why_paused": instance.get("continuation_kind") or "",
+        "required_owner_fields": required_owner_fields,
+        "system_derived_fields_available": system_fields,
+        "steps": steps,
+        "owner_receipts": [{"version": r["version"], "owner_ref": r["owner_ref"]} for r in receipts],
+        "after_submit_will": "materialize exactly one downstream artifact task",
+        "downstream_will_not": [
+            "fabricate an owner-authority field",
+            "assert owner approval without a real receipt",
+            "create review or packet-rerun tasks before prior semantic GO",
+        ],
+    }
+    return 0, safe_event_payload(report)
+
+
+def run_continuation_submit(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
+    store = _store(args)
+    instance = store.get_instance(args.instance_id)
+    if instance is None:
+        return 2, {"success": False, "error": "unknown_instance"}
+
+    contracts = _load_registry(args.contract_file)
+    try:
+        contract = contracts.get(instance.get("contract_ref") or "")
+    except UnknownContractError:
+        return 2, {"success": False, "error": "unknown_contract_ref"}
+
+    if instance["state"] != ContinuationState.WAITING_OWNER.value:
+        return 2, {"success": False, "error": "not_waiting_owner", "state": instance["state"]}
+
+    submission = json.loads(Path(args.input_file).read_text(encoding="utf-8"))
+    clean, errors = contract.validate_owner_submission(dict(submission.get("fields") or {}))
+    if errors:
+        return 2, safe_event_payload({"success": False, "errors": errors})
+
+    from .continuation import get_handler
+    from .outcome import ContinuationKind
+
+    handler = get_handler(ContinuationKind.NEEDS_INPUT)
+    adapter = _adapter(args)
+    result = handler.on_receipt(instance, submission, store=store, adapter=adapter, contract=contract)
+    payload = {"success": result.success, "state": result.state, "reason": result.reason, "metadata": result.metadata}
+    return (0 if result.success else 2), safe_event_payload(payload)
+
+
+def run_continuation_retry(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
+    store = _store(args)
+    instance = store.get_instance(args.instance_id)
+    if instance is None:
+        return 2, {"success": False, "error": "unknown_instance"}
+
+    adapter = _adapter(args)
+    pending = [row for row in store.list_outbox() if row["continuation_id"] == args.instance_id and row["state"] == "pending"]
+    retried = []
+    for row in pending:
+        payload = json.loads(row["payload_json"])
+        result = adapter.create_task(payload)
+        if result.get("success"):
+            store.outbox_mark(row["id"], state="applied", board_task_id=result.get("task_id", ""))
+            retried.append(row["idempotency_key"])
+    return 0, safe_event_payload({"success": True, "retried": retried, "pending_before": len(pending)})
+
+
+def run_continuation_doctor(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
+    result = doctor_store_selection(
+        canonical_path=Path(args.db) if args.db else None,
+        fallback_path=Path(args.fallback_db) if args.fallback_db else None,
+    )
+    return (0 if result.get("success") else 2), result

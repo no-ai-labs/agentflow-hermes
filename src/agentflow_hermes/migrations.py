@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 SQL_V1 = """
 create table if not exists jobs (
@@ -160,7 +160,97 @@ create index if not exists idx_maintenance_cycles_repo_unit on maintenance_cycle
 create index if not exists idx_maintenance_deadletter_target on maintenance_deadletter(target_unit, created_at);
 """
 
-STEPS = [(1, SQL_V1), (2, SQL_V2), (3, SQL_V3), (4, SQL_V4)]
+SQL_V5 = """
+-- Needs-Input Continuation Engine: durable continuation ledger. Refs, hashes,
+-- and short sanitized identifiers only; never raw transcripts or secrets.
+create table if not exists continuation_instances (
+    id integer primary key autoincrement,
+    board text not null,
+    source_task_id text not null,
+    source_event_id text not null,
+    source_graph_id text not null default '',
+    contract_ref text not null default '',
+    verdict text not null default '',
+    continuation_kind text not null default '',
+    state text not null default 'detected',
+    origin_ref text not null default '',
+    return_to_ref text not null default '',
+    workspace_ref text not null default '',
+    idempotency_key text not null,
+    created_at real not null,
+    updated_at real not null
+);
+
+create table if not exists continuation_steps (
+    id integer primary key autoincrement,
+    continuation_id integer not null,
+    step_kind text not null,
+    state text not null default 'pending',
+    board_task_id text not null default '',
+    parent_step_id integer null,
+    idempotency_key text not null,
+    created_at real not null,
+    updated_at real not null,
+    foreign key(continuation_id) references continuation_instances(id)
+);
+
+create table if not exists owner_input_receipts (
+    id integer primary key autoincrement,
+    continuation_id integer not null,
+    version integer not null,
+    owner_ref text not null default '',
+    fields_json text not null default '{}',
+    source_ref text not null default '',
+    created_at real not null,
+    supersedes_receipt_id integer null,
+    foreign key(continuation_id) references continuation_instances(id)
+);
+
+create table if not exists continuation_events (
+    id integer primary key autoincrement,
+    continuation_id integer not null,
+    seq integer not null,
+    kind text not null,
+    payload_json text not null default '{}',
+    created_at real not null,
+    foreign key(continuation_id) references continuation_instances(id)
+);
+
+create table if not exists board_cursors (
+    board text not null,
+    db_identity text not null,
+    last_event_id integer not null default 0,
+    updated_at real not null,
+    primary key(board, db_identity)
+);
+
+create table if not exists board_outbox (
+    id integer primary key autoincrement,
+    continuation_id integer not null,
+    step_id text not null default '',
+    operation text not null,
+    payload_json text not null default '{}',
+    idempotency_key text not null,
+    state text not null default 'pending',
+    board_task_id text not null default '',
+    attempts integer not null default 0,
+    created_at real not null,
+    updated_at real not null,
+    foreign key(continuation_id) references continuation_instances(id)
+);
+
+create unique index if not exists uniq_continuation_source_tuple
+    on continuation_instances(board, source_task_id, source_event_id, contract_ref);
+create index if not exists idx_continuation_state on continuation_instances(state, updated_at);
+create unique index if not exists uniq_continuation_steps_key on continuation_steps(continuation_id, idempotency_key);
+create index if not exists idx_continuation_steps_continuation on continuation_steps(continuation_id, step_kind);
+create unique index if not exists uniq_owner_receipt_version on owner_input_receipts(continuation_id, version);
+create unique index if not exists uniq_continuation_events_seq on continuation_events(continuation_id, seq);
+create unique index if not exists uniq_board_outbox_key on board_outbox(idempotency_key);
+create index if not exists idx_board_outbox_continuation on board_outbox(continuation_id, state);
+"""
+
+STEPS = [(1, SQL_V1), (2, SQL_V2), (3, SQL_V3), (4, SQL_V4), (5, SQL_V5)]
 
 
 def migrate(con) -> int:

@@ -1,0 +1,44 @@
+contract_ref: warroom.g421.exposure-resolution.v1
+version: 1
+owner_role: warroom-owner
+resume_transition: warroom.g421.packet-rerun
+
+fields:
+  target_order_ref_id:
+    authority: system
+    type: opaque_id
+  target_ledger_sha256:
+    authority: system
+    type: sha256
+  target_terminal_source_line_sha256:
+    authority: system
+    type: sha256
+  resolution_basis:
+    authority: owner
+    type: enum
+    allowed_values:
+      - target_never_submitted
+      - later_round_trip_completed
+  approval_receipt_id:
+    authority: owner
+    type: opaque_id
+  owner_confirmation:
+    authority: owner
+    type: boolean
+  transport_calls:
+    authority: verifier
+    type: list
+    required: false
+
+artifacts:
+  evidence:
+    template_path: data/warroom/canary_execution/templates/g421_semantic_evidence.template.json
+    final_path: data/warroom/canary_execution/g421_semantic_exposure_evidence_<timestamp>.json
+    write_mode: materialize
+  local_no_post_proof:
+    template_path: data/warroom/canary_execution/templates/g421_local_no_post_proof.template.json
+    final_path: data/warroom/canary_execution/g421_local_no_post_proof.json
+    write_mode: materialize
+  marker:
+    final_path: data/warroom/canary_execution/exposure_resolution_ledger.jsonl
+    write_mode: append_only
