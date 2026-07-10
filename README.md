@@ -154,6 +154,10 @@ AgentFlow replaces that manual step with durable, board-driven continuation:
 - ACKs use explicit `[JOB ACK]` blocks
 - Writes (board promotion, release actions) require a config-level flag *and* a CLI flag together — never one alone
 
+## Design documents
+
+- [Needs-Input Continuation Engine](docs/plans/2026-07-10-needs-input-continuation-engine-design.md) — typed `GO`/code-fix/operator-input continuations, owner-anchor workflows, and the Warroom G4.21 vertical implementation plan.
+
 ## Why a plugin + CLI?
 
 The plugin makes AgentFlow feel native inside Hermes (`agentflow_enqueue`, `agentflow_status`, etc.). The CLI keeps the control-plane engine reusable and testable outside Hermes.
