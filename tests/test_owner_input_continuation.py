@@ -79,6 +79,54 @@ def test_needs_input_plan_creates_one_waiting_owner_instance(tmp_path):
     assert adapter.subscriptions == [(adapter.created_tasks[0]["task_id"], "discord:#research")]
 
 
+def test_board_idempotency_keys_are_stable_and_differ_across_fresh_stores_sharing_row_id(tmp_path):
+    """Two independent fresh stores (e.g. two canary runs, or a temp store vs
+    the canonical store) commonly both assign row id 1 to their first
+    instance. Board mutation idempotency keys must be derived from the
+    instance's durable source-scoped key, not the row id, so they never
+    collide across unrelated continuations/runs/boards."""
+    store_a = ContinuationStore(tmp_path / "a" / "agentflow.sqlite")
+    store_b = ContinuationStore(tmp_path / "b" / "agentflow.sqlite")
+    adapter_a = FakeAdapter()
+    adapter_b = FakeAdapter()
+    handler = OwnerInputHandler()
+
+    plan_a = handler.plan(
+        _outcome(event_id="ev_a", source_task_id="t_a"), store=store_a, adapter=adapter_a, contract=_contract()
+    )
+    plan_b = handler.plan(
+        _outcome(event_id="ev_b", source_task_id="t_b"), store=store_b, adapter=adapter_b, contract=_contract()
+    )
+
+    assert plan_a.instance_id == 1
+    assert plan_b.instance_id == 1  # same local row id in each fresh store
+
+    key_a = store_a.list_steps(plan_a.instance_id)[0]["idempotency_key"]
+    key_b = store_b.list_steps(plan_b.instance_id)[0]["idempotency_key"]
+    assert key_a != key_b
+    assert not key_a.endswith(":1")
+    assert not key_b.endswith(":1")
+    assert key_a.startswith("owner_anchor:")
+    assert key_b.startswith("owner_anchor:")
+
+
+def test_board_idempotency_key_is_stable_across_repeat_calls_for_same_instance(tmp_path):
+    store = ContinuationStore(tmp_path / "agentflow.sqlite")
+    adapter = FakeAdapter()
+    handler = OwnerInputHandler()
+
+    plan = handler.plan(_outcome(), store=store, adapter=adapter, contract=_contract())
+    key_first = store.list_steps(plan.instance_id)[0]["idempotency_key"]
+
+    # Re-plan the same source event: duplicate ingest must resolve to the same
+    # instance and the same board idempotency key (no duplicate anchor card).
+    plan_again = handler.plan(_outcome(), store=store, adapter=adapter, contract=_contract())
+    key_again = store.list_steps(plan_again.instance_id)[0]["idempotency_key"]
+
+    assert key_first == key_again
+    assert len(adapter.created_tasks) == 1
+
+
 def test_repeated_event_returns_existing_anchor_without_duplicate(tmp_path):
     store = ContinuationStore(tmp_path / "agentflow.sqlite")
     adapter = FakeAdapter()

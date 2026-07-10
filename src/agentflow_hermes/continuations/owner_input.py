@@ -9,12 +9,29 @@ grants downstream children before the receipt exists.
 
 from __future__ import annotations
 
+import hashlib
 from typing import Any
 
 from ..continuation_store import ContinuationState, ContinuationStore
 from ..input_contract import InputContract
 from ..outcome import ContinuationKind, OutcomeEnvelope
 from .base import ContinuationPlan, StepResult
+
+
+def _stable_digest(instance: dict[str, Any]) -> str:
+    """Digest of the instance's durable, source-scoped idempotency key
+    (``continuation:{board}:{source_task_id}:{source_event_id}:{contract_ref}``),
+    never the local SQLite row id. Two fresh temp/canonical stores that each
+    assign ``instance_id=1`` to a *different* source event must still produce
+    different board mutation idempotency keys — a raw row id cannot guarantee
+    that, but this source-scoped key does.
+    """
+    base = str(instance.get("idempotency_key") or "")
+    if not base:
+        # Defensive fallback only; every instance created via
+        # ContinuationStore.create_instance always has this column populated.
+        base = f"instance:{instance.get('board', '')}:{instance.get('id', '')}"
+    return hashlib.sha256(base.encode("utf-8")).hexdigest()[:16]
 
 
 def _owner_anchor_intent(instance: dict[str, Any], contract: InputContract, idempotency_key: str) -> dict[str, Any]:
@@ -80,7 +97,7 @@ class OwnerInputHandler:
             store.transition(instance_id, ContinuationState.WAITING_OWNER, reason="needs_input_detected")
             instance = store.get_instance(instance_id)
 
-        anchor_key = f"owner_anchor:{instance_id}"
+        anchor_key = f"owner_anchor:{_stable_digest(instance)}"
         intent = _owner_anchor_intent(instance, contract, anchor_key)
         step = store.add_step(instance_id, step_kind="owner_anchor", idempotency_key=anchor_key)
 
@@ -133,7 +150,7 @@ class OwnerInputHandler:
         if anchor_steps and anchor_steps[0].get("board_task_id") and adapter is not None:
             adapter.complete_owner_anchor(anchor_steps[0]["board_task_id"], receipt_ref=f"receipt:{receipt['id']}")
 
-        mat_key = f"materialize:{instance_id}"
+        mat_key = f"materialize:{_stable_digest(instance)}"
         step = store.add_step(instance_id, step_kind="materialization", idempotency_key=mat_key)
         materialization_task_id = ""
         if step["created"] and adapter is not None:
@@ -171,7 +188,7 @@ class OwnerInputHandler:
             return StepResult(success=False, reason="materialization_not_go", state=store.get_instance(instance_id)["state"])
 
         store.transition(instance_id, ContinuationState.WAITING_REVIEW, reason="materialization_go")
-        review_key = f"review:{instance_id}"
+        review_key = f"review:{_stable_digest(instance)}"
         step = store.add_step(instance_id, step_kind="review", idempotency_key=review_key)
         review_task_id = ""
         if step["created"] and adapter is not None:
@@ -213,7 +230,7 @@ class OwnerInputHandler:
             return StepResult(success=False, reason="review_not_go", state=store.get_instance(instance_id)["state"])
 
         store.transition(instance_id, ContinuationState.RESUMABLE, reason="review_go")
-        rerun_key = f"packet_rerun:{instance_id}"
+        rerun_key = f"packet_rerun:{_stable_digest(instance)}"
         step = store.add_step(instance_id, step_kind="packet_rerun", idempotency_key=rerun_key)
         rerun_task_id = ""
         if step["created"] and adapter is not None:

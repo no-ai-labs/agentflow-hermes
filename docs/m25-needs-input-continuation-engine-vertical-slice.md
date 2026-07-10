@@ -91,6 +91,22 @@ that the corrected adapter actually drives the vertical loop. No claim is
 made that `FakeBoardAdapter` alone satisfies the real-board canary
 requirement — see "Real-board canary readiness" above.
 
+**Second correction — unstable board idempotency keys.** `OwnerInputHandler`
+originally built board mutation idempotency keys as `owner_anchor:{instance_id}`,
+`materialize:{instance_id}`, `review:{instance_id}`, `packet_rerun:{instance_id}`,
+using the local SQLite row id. Two independent fresh stores (two canary runs,
+or a temp store vs. the canonical store) commonly both assign row id `1` to
+their first instance, so on a real shared board this could make unrelated
+continuations collide on the same `--idempotency-key`. Fixed by deriving
+these keys from the instance's durable, source-scoped
+`idempotency_key` column (`continuation:{board}:{source_task_id}:{source_event_id}:{contract_ref}`,
+already unique-indexed in `continuation_store.py`) via a sha256 digest
+(`_stable_digest` in `continuations/owner_input.py`), never the row id.
+`tests/test_owner_input_continuation.py::test_board_idempotency_keys_are_stable_and_differ_across_fresh_stores_sharing_row_id`
+proves two fresh stores that both land on instance id `1` for different
+source events now get different keys; it fails against the pre-fix code
+(verified by re-running it with the fix stashed).
+
 ## Explicit follow-ups (not hidden, not implemented here)
 
 1. **Task 9 (full watchdog consolidation) is out of scope for this slice.**

@@ -180,8 +180,15 @@ def test_g421_duplicate_ingest_and_submit_create_zero_duplicate_cards(tmp_path):
     assert dup_submit.success is False
     assert len(adapter.tasks) == tasks_after_first_submit  # no duplicate materialization card
 
-    # Retry (re-enqueue same idempotency key) creates zero duplicate cards.
-    retry_step = store.add_step(instance["id"], step_kind="materialization", idempotency_key=f"materialize:{instance['id']}")
+    # Retry (re-enqueue the same stable, source-scoped idempotency key that was
+    # actually used to create the materialization step) creates zero duplicate
+    # cards. The key is derived from the instance's durable source-scoped
+    # idempotency_key, not the local row id, so this must be looked up from
+    # the store rather than reconstructed from instance["id"].
+    materialization_step = next(s for s in store.list_steps(instance["id"]) if s["step_kind"] == "materialization")
+    retry_step = store.add_step(
+        instance["id"], step_kind="materialization", idempotency_key=materialization_step["idempotency_key"]
+    )
     assert retry_step["created"] is False
     assert len(adapter.tasks) == tasks_after_first_submit
 
