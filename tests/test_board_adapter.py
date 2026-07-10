@@ -14,6 +14,7 @@ def _intent(**overrides):
         origin_ref="discord:#research",
         status="blocked",
         blocked_reason="awaiting_owner_input",
+        required_owner_fields=["resolution_basis", "approval_receipt_id"],
     )
     kwargs.update(overrides)
     return kwargs
@@ -56,22 +57,37 @@ def test_fake_subscribe_block_comment_complete_are_idempotent():
     assert adapter.completed.count((task_id, "receipt:1")) == 1
 
 
-def test_real_adapter_create_task_builds_argv_and_parses_json():
+# --- RealBoardAdapter: argv shapes verified against the installed `hermes`
+# CLI's own --help output and hermes_cli/kanban.py source (not invented). See
+# board_adapter.py's module docstring for the verification notes.
+
+
+def test_real_adapter_create_task_uses_initial_status_blocked_and_body_checklist():
     calls = []
 
     def runner(argv):
         calls.append(argv)
-        return 0, json.dumps({"task_id": "task:abc123"}), ""
+        return 0, json.dumps({"id": "t_abc123"}), ""
 
     adapter = RealBoardAdapter(runner=runner, board="warroom-os", hermes_bin="hermes")
     result = adapter.create_task(_intent())
 
-    assert result == {"success": True, "task_id": "task:abc123"}
+    assert result == {"success": True, "task_id": "t_abc123"}
     argv = calls[0]
-    assert argv[0] == "hermes"
-    assert "--board" in argv and "warroom-os" in argv
+    assert argv[:4] == ["hermes", "kanban", "--board", "warroom-os"]
+    assert argv[4] == "create"
+    assert "--initial-status" in argv and "blocked" in argv
     assert "--idempotency-key" in argv and "anchor:1" in argv
-    assert "--origin-platform" in argv and "discord" in argv
+    # No such flags exist on the real `create` command.
+    assert "--status" not in argv
+    assert "--blocked-reason" not in argv
+    assert "--origin-platform" not in argv
+    # The awaiting-owner reason/checklist is folded into --body instead.
+    body_index = argv.index("--body") + 1
+    body = argv[body_index]
+    assert "awaiting_owner_input" in body
+    assert "resolution_basis" in body
+    assert "approval_receipt_id" in body
 
 
 def test_real_adapter_create_task_is_cached_locally_and_skips_second_cli_call():
@@ -79,7 +95,7 @@ def test_real_adapter_create_task_is_cached_locally_and_skips_second_cli_call():
 
     def runner(argv):
         calls.append(argv)
-        return 0, json.dumps({"task_id": "task:abc123"}), ""
+        return 0, json.dumps({"id": "t_abc123"}), ""
 
     adapter = RealBoardAdapter(runner=runner, board="warroom-os")
     first = adapter.create_task(_intent())
@@ -98,21 +114,98 @@ def test_real_adapter_create_task_runner_failure_is_reported():
     assert result["success"] is False
 
 
-def test_real_adapter_block_subscribe_comment_complete_build_expected_argv():
+def test_real_adapter_block_uses_positional_reason_and_kind_flag():
     calls = []
 
     def runner(argv):
         calls.append(argv)
-        return 0, json.dumps({"success": True}), ""
+        return 0, "t:1 blocked", ""
 
     adapter = RealBoardAdapter(runner=runner, board="warroom-os")
-    adapter.block_task("task:1", "awaiting_owner_input")
-    adapter.subscribe("task:1", "discord:#research")
-    adapter.comment("task:1", "note")
-    adapter.complete_owner_anchor("task:1", receipt_ref="receipt:1")
+    result = adapter.block_task("t:1", "awaiting_owner_input", kind="needs_input")
 
-    assert len(calls) == 4
-    assert any("block" in c for c in calls)
-    assert any("subscribe" in c for c in calls)
-    assert any("comment" in c for c in calls)
-    assert any("complete" in c for c in calls)
+    assert result == {"success": True}
+    argv = calls[0]
+    assert argv == ["hermes", "kanban", "--board", "warroom-os", "block", "t:1", "awaiting_owner_input", "--kind", "needs_input"]
+
+
+def test_real_adapter_subscribe_uses_notify_subscribe_not_subscribe():
+    calls = []
+
+    def runner(argv):
+        calls.append(argv)
+        return 0, "Subscribed discord:research to t:1", ""
+
+    adapter = RealBoardAdapter(runner=runner, board="warroom-os")
+    result = adapter.subscribe("t:1", "discord:#research")
+
+    assert result == {"success": True}
+    argv = calls[0]
+    assert argv[:4] == ["hermes", "kanban", "--board", "warroom-os"]
+    assert argv[4] == "notify-subscribe"
+    assert "subscribe" == argv[4] or argv[4] == "notify-subscribe"
+    assert "--platform" in argv and "discord" in argv
+    assert "--chat-id" in argv and "research" in argv
+    assert "--origin-platform" not in argv
+
+
+def test_real_adapter_subscribe_refuses_unparseable_endpoint_without_calling_cli():
+    calls = []
+
+    def runner(argv):
+        calls.append(argv)
+        return 0, "", ""
+
+    adapter = RealBoardAdapter(runner=runner, board="warroom-os")
+    result = adapter.subscribe("t:1", "not a valid endpoint")
+
+    assert result["success"] is False
+    assert calls == []
+
+
+def test_real_adapter_comment_uses_positional_text_not_body_flag():
+    calls = []
+
+    def runner(argv):
+        calls.append(argv)
+        return 0, "Comment added to t:1", ""
+
+    adapter = RealBoardAdapter(runner=runner, board="warroom-os")
+    result = adapter.comment("t:1", "note")
+
+    assert result == {"success": True}
+    assert calls[0] == ["hermes", "kanban", "--board", "warroom-os", "comment", "t:1", "note"]
+
+
+def test_real_adapter_complete_uses_summary_and_metadata_not_receipt_ref():
+    calls = []
+
+    def runner(argv):
+        calls.append(argv)
+        return 0, "Completed t:1", ""
+
+    adapter = RealBoardAdapter(runner=runner, board="warroom-os")
+    result = adapter.complete_owner_anchor("t:1", receipt_ref="receipt:1")
+
+    assert result == {"success": True}
+    argv = calls[0]
+    assert argv[:6] == ["hermes", "kanban", "--board", "warroom-os", "complete", "t:1"]
+    assert "--summary" in argv
+    assert "--metadata" in argv
+    assert "--receipt-ref" not in argv
+    metadata_index = argv.index("--metadata") + 1
+    assert json.loads(argv[metadata_index]) == {"receipt_ref": "receipt:1"}
+
+
+def test_real_adapter_plain_text_commands_do_not_require_json_output():
+    """block/comment/complete/notify-subscribe print plain text on this CLI
+    version, not JSON — the adapter must not try to json.loads their stdout."""
+
+    def runner(argv):
+        return 0, "some human-readable confirmation, not json", ""
+
+    adapter = RealBoardAdapter(runner=runner, board="warroom-os")
+    assert adapter.block_task("t:1", "reason")["success"] is True
+    assert adapter.comment("t:1", "note")["success"] is True
+    assert adapter.complete_owner_anchor("t:1", receipt_ref="r:1")["success"] is True
+    assert adapter.subscribe("t:1", "discord:#research")["success"] is True
