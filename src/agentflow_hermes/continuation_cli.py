@@ -42,7 +42,10 @@ def _store(args: argparse.Namespace) -> ContinuationStore:
 def _adapter(args: argparse.Namespace):
     mode = getattr(args, "adapter_mode", "fake")
     if mode == "real":
-        return RealBoardAdapter(board=getattr(args, "board", ""), hermes_bin=getattr(args, "hermes_bin", "hermes"))
+        board = getattr(args, "board", "") or ""
+        if not board:
+            raise ValueError("adapter_mode_real_requires_explicit_board")
+        return RealBoardAdapter(board=board, hermes_bin=getattr(args, "hermes_bin", "hermes"))
     return FakeBoardAdapter()
 
 
@@ -88,7 +91,10 @@ def add_continuation_cli_args(sub: argparse._SubParsersAction) -> None:
 def run_continuation_ingest(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
     store = _store(args)
     contracts = _load_registry(args.contract_file)
-    adapter = _adapter(args)
+    try:
+        adapter = _adapter(args)
+    except ValueError as exc:
+        return 2, {"success": False, "error": str(exc)}
 
     raw_events = json.loads(Path(args.events_file).read_text(encoding="utf-8"))
     events = [
@@ -179,7 +185,10 @@ def run_continuation_submit(args: argparse.Namespace) -> tuple[int, dict[str, An
     from .outcome import ContinuationKind
 
     handler = get_handler(ContinuationKind.NEEDS_INPUT)
-    adapter = _adapter(args)
+    try:
+        adapter = _adapter(args)
+    except ValueError as exc:
+        return 2, {"success": False, "error": str(exc)}
     result = handler.on_receipt(instance, submission, store=store, adapter=adapter, contract=contract)
     payload = {"success": result.success, "state": result.state, "reason": result.reason, "metadata": result.metadata}
     return (0 if result.success else 2), safe_event_payload(payload)
@@ -191,14 +200,31 @@ def run_continuation_retry(args: argparse.Namespace) -> tuple[int, dict[str, Any
     if instance is None:
         return 2, {"success": False, "error": "unknown_instance"}
 
-    adapter = _adapter(args)
+    try:
+        adapter = _adapter(args)
+    except ValueError as exc:
+        return 2, {"success": False, "error": str(exc)}
     pending = [row for row in store.list_outbox() if row["continuation_id"] == args.instance_id and row["state"] == "pending"]
     retried = []
     for row in pending:
         payload = json.loads(row["payload_json"])
-        result = adapter.create_task(payload)
+        operation = row.get("operation") or "create_task"
+        if operation == "create_task":
+            result = adapter.create_task(payload)
+        elif operation == "subscribe":
+            result = adapter.subscribe(str(payload.get("task_id") or ""), str(payload.get("endpoint") or ""))
+        elif operation == "complete_owner_anchor":
+            result = adapter.complete_owner_anchor(
+                str(payload.get("task_id") or ""), receipt_ref=str(payload.get("receipt_ref") or "")
+            )
+        else:
+            result = {"success": False, "error": "unknown_outbox_operation"}
         if result.get("success"):
-            store.outbox_mark(row["id"], state="applied", board_task_id=result.get("task_id", ""))
+            task_id = result.get("task_id", "")
+            store.outbox_mark(row["id"], state="applied", board_task_id=task_id)
+            step_id = row.get("step_id") or ""
+            if step_id:
+                store.mark_step(int(step_id), state="applied", board_task_id=task_id)
             retried.append(row["idempotency_key"])
     return 0, safe_event_payload({"success": True, "retried": retried, "pending_before": len(pending)})
 

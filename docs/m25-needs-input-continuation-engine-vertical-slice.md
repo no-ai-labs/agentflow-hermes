@@ -22,10 +22,20 @@ design's migration plan (additive; existing GO/code-fix paths unchanged).
   implementing `needs_input -> WAITING_OWNER -> owner receipt ->
   MATERIALIZING -> (materialization GO) -> WAITING_REVIEW -> (review GO) ->
   RESUMABLE -> RESUMED`, with lazy per-stage task creation gated on each
-  stage's own semantic GO, never on lifecycle `done`.
+  stage's own semantic GO, never on lifecycle `done`. All external board
+  mutations made by the handler (`create_task`, owner-anchor `subscribe`, and
+  owner-anchor completion) are first persisted as durable `board_outbox` rows;
+  `continuation retry` replays pending rows by operation.
 - `board_adapter.py` — `FakeBoardAdapter` / `RealBoardAdapter` (injectable CLI
   runner, same pattern as `RealKanbanGraphAdapter`) implementing
   create/block/subscribe/comment/complete-anchor, each idempotent by key.
+  Real subprocess mode pins `HERMES_KANBAN_BOARD`/`HERMES_KANBAN_DB` to the
+  explicit `--board` so a worker's inherited board environment cannot silently
+  redirect `--board warroom-os` mutations to another board. `discord:#research`
+  is normalized to the numeric Devhub #research channel id
+  `1499390151393284106`, and successful numeric Discord subscriptions repair
+  durable `kanban_notify_subs` + `ack_subscription` + `ack_active_wake` rows in
+  the target board DB without sending Discord messages.
   **`RealBoardAdapter`'s argv shapes were verified against the installed
   `hermes` CLI's own `--help` output and `hermes_cli/kanban.py` source**
   (initial fix used invented flags — corrected after supervisor review, see
@@ -54,27 +64,20 @@ design's migration plan (additive; existing GO/code-fix paths unchanged).
     against `RealBoardAdapter` with a **mocked CLI runner** that returns
     CLI-shaped stdout for the verified argv patterns above, asserting exactly
     one owner-anchor `create --initial-status blocked` call, one
-    `notify-subscribe --platform discord --chat-id research` call, zero
+    `notify-subscribe --platform discord --chat-id 1499390151393284106` call, zero
     downstream `create` calls before the owner receipt, and exactly 4 total
     `create` calls (anchor + materialization + review + packet-rerun) across
     the full loop with zero duplicates on repeat ingest. It does **not**
     invoke a real subprocess or touch any real board database.
 
-### Real-board canary readiness (for supervisor)
+### Real-board canary execution note
 
-`RealBoardAdapter` is implemented and unit-tested against verified CLI argv
-shapes (`tests/test_board_adapter.py`, `tests/test_g421_real_adapter_canary.py`),
-but **no code in this repo has actually invoked `hermes kanban create` (or any
-other mutating subcommand) against the real `warroom-os` board.** Doing so —
-e.g. `agentflow-hermes continuation ingest --board warroom-os --adapter-mode
-real --events-file <fixture>` with no injected runner — would create a real,
-visible task on a shared production board. That is a mutating action on
-shared state, so it was deliberately not executed in this session per the
-standing safety rule (confirm before actions with real, hard-to-reverse
-blast radius on shared systems). It should be run by/with explicit supervisor
-sign-off, pointed at a disposable board or with an operator standing by to
-archive the resulting cards, not assumed safe to fire-and-forget against
-`warroom-os`.
+`RealBoardAdapter` is unit-tested with mocked CLI runners so ordinary pytest
+never mutates live boards. The supervised replacement canary for this slice is
+run explicitly against `warroom-os` with disposable synthetic task IDs, numeric
+#research ACK rows, durable outbox evidence, and cleanup/archival captured in
+the Kanban handoff. Do not infer real G4.21 owner proof from that canary; it is
+a controlled fixture only.
 
 ## Corrections applied after supervisor review
 

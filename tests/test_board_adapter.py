@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 
-from agentflow_hermes.board_adapter import FakeBoardAdapter, RealBoardAdapter
+from agentflow_hermes.board_adapter import FakeBoardAdapter, RealBoardAdapter, default_board_kanban_db_path
 
 
 def _intent(**overrides):
@@ -18,6 +19,15 @@ def _intent(**overrides):
     )
     kwargs.update(overrides)
     return kwargs
+
+
+def test_default_board_db_path_uses_inherited_shared_board_root(monkeypatch, tmp_path):
+    current = tmp_path / ".hermes" / "kanban" / "boards" / "agentflow-hermes" / "kanban.db"
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes" / "profiles" / "ccsupervisor"))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(current))
+
+    expected = tmp_path / ".hermes" / "kanban" / "boards" / "warroom-os" / "kanban.db"
+    assert default_board_kanban_db_path("warroom-os") == expected
 
 
 def test_fake_create_task_is_idempotent_by_key():
@@ -145,8 +155,79 @@ def test_real_adapter_subscribe_uses_notify_subscribe_not_subscribe():
     assert argv[4] == "notify-subscribe"
     assert "subscribe" == argv[4] or argv[4] == "notify-subscribe"
     assert "--platform" in argv and "discord" in argv
-    assert "--chat-id" in argv and "research" in argv
+    assert "--chat-id" in argv and "1499390151393284106" in argv
+    assert "research" not in argv
     assert "--origin-platform" not in argv
+
+
+def test_real_adapter_subscribe_numeric_research_creates_durable_ack_rows(tmp_path):
+    db = tmp_path / "kanban.db"
+    con = sqlite3.connect(db)
+    con.executescript(
+        """
+        create table kanban_notify_subs (
+            task_id text not null,
+            platform text not null,
+            chat_id text not null,
+            thread_id text not null default '',
+            user_id text,
+            notifier_profile text,
+            created_at integer not null,
+            last_event_id integer not null default 0,
+            trigger_agent integer not null default 0,
+            primary key(task_id, platform, chat_id, thread_id)
+        );
+        create table ack_subscription (
+            id integer primary key autoincrement,
+            task_id text not null,
+            subscription_id integer,
+            platform text,
+            chat_id text,
+            thread_id text,
+            notifier_profile text,
+            desired_delivery_mode text,
+            active_wake_required integer not null default 0,
+            operator_receipt_required integer not null default 0,
+            created_at integer not null
+        );
+        create table ack_active_wake (
+            id integer primary key autoincrement,
+            task_id text not null,
+            subscription_id integer,
+            triggered_agent integer not null default 0,
+            trigger_error text,
+            correlation_id text,
+            created_at integer not null,
+            status text,
+            accepted_by_session integer not null default 0,
+            started_by_session integer not null default 0,
+            target_session_key text
+        );
+        """
+    )
+    con.close()
+    calls = []
+
+    def runner(argv):
+        calls.append(argv)
+        return 0, "Subscribed", ""
+
+    adapter = RealBoardAdapter(runner=runner, board="warroom-os", board_db_path=db)
+    result = adapter.subscribe("t_owner", "discord:#research")
+
+    assert result["success"] is True
+    assert result["ack"] == {"success": True}
+    assert calls[0][calls[0].index("--chat-id") + 1] == "1499390151393284106"
+    con = sqlite3.connect(db)
+    try:
+        notify = con.execute("select platform, chat_id, trigger_agent from kanban_notify_subs where task_id='t_owner'").fetchone()
+        sub = con.execute("select id, platform, chat_id, active_wake_required from ack_subscription where task_id='t_owner'").fetchone()
+        wake = con.execute("select task_id, subscription_id, status from ack_active_wake where task_id='t_owner'").fetchone()
+    finally:
+        con.close()
+    assert notify == ("discord", "1499390151393284106", 1)
+    assert sub[1:] == ("discord", "1499390151393284106", 1)
+    assert wake == ("t_owner", sub[0], "pending")
 
 
 def test_real_adapter_subscribe_refuses_unparseable_endpoint_without_calling_cli():

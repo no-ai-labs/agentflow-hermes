@@ -5,6 +5,7 @@ import json
 import pytest
 
 from agentflow_hermes import cli
+from agentflow_hermes.continuation_store import ContinuationStore
 
 
 def _events_file(tmp_path, events):
@@ -125,3 +126,41 @@ def test_doctor_reports_selected_store(tmp_path, capsys):
     assert rc == 0
     assert report["success"] is True
     assert "selected" in report
+
+
+def test_retry_reconciles_pending_outbox_create_and_subscribe(tmp_path, capsys):
+    db_path = tmp_path / "continuation.sqlite"
+    store = ContinuationStore(db_path)
+    instance = store.create_instance(
+        board="warroom-os",
+        source_task_id="t_source",
+        source_event_id="ev_retry",
+        contract_ref="warroom.g421.exposure-resolution.v1",
+        continuation_kind="needs_input",
+    )["instance"]
+    step = store.add_step(instance["id"], step_kind="owner_anchor", idempotency_key="owner_anchor:retry")["step"]
+    store.outbox_enqueue(
+        instance["id"],
+        step_id=str(step["id"]),
+        operation="create_task",
+        payload={"title": "retry owner anchor", "idempotency_key": "owner_anchor:retry"},
+        idempotency_key="owner_anchor:retry",
+    )
+    store.outbox_enqueue(
+        instance["id"],
+        step_id=str(step["id"]),
+        operation="subscribe",
+        payload={"task_id": "task:owner", "endpoint": "discord:#research"},
+        idempotency_key="subscribe:retry",
+    )
+
+    rc = cli.main(["continuation", "retry", str(instance["id"]), "--db", str(db_path)])
+    report = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+
+    assert rc == 0
+    assert report["pending_before"] == 2
+    rows = store.list_outbox()
+    assert [(r["operation"], r["state"], r["attempts"]) for r in rows] == [
+        ("create_task", "applied", 1),
+        ("subscribe", "applied", 1),
+    ]

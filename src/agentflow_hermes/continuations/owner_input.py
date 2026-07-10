@@ -51,6 +51,49 @@ def _owner_anchor_intent(instance: dict[str, Any], contract: InputContract, idem
     }
 
 
+def _apply_board_operation(
+    store: ContinuationStore,
+    instance_id: int,
+    *,
+    step_id: int | str,
+    operation: str,
+    payload: dict[str, Any],
+    idempotency_key: str,
+    adapter: Any,
+) -> dict[str, Any]:
+    """Durable outbox intent/attempt/applied cycle for a board mutation.
+
+    Enqueues (idempotent by key) before ever calling the adapter, so a crash
+    or adapter failure between enqueue and apply leaves a durable ``pending``
+    row that ``continuation retry`` can see/reconcile instead of an external
+    mutation that only ever existed as a direct, unrecorded adapter call.
+    """
+    enqueued = store.outbox_enqueue(
+        instance_id, step_id=str(step_id), operation=operation, payload=payload, idempotency_key=idempotency_key
+    )
+    row = enqueued["outbox"]
+    if row["state"] == "applied" and row.get("board_task_id"):
+        return {"success": True, "task_id": row["board_task_id"]}
+    if adapter is None:
+        return {"success": False, "error": "no_adapter"}
+    if operation == "create_task":
+        result = adapter.create_task(payload)
+    elif operation == "subscribe":
+        result = adapter.subscribe(str(payload.get("task_id") or ""), str(payload.get("endpoint") or ""))
+    elif operation == "complete_owner_anchor":
+        result = adapter.complete_owner_anchor(
+            str(payload.get("task_id") or ""), receipt_ref=str(payload.get("receipt_ref") or "")
+        )
+    else:
+        result = {"success": False, "error": "unknown_outbox_operation"}
+    if result.get("success"):
+        task_id = result.get("task_id", "")
+        store.outbox_mark(row["id"], state="applied", board_task_id=task_id)
+        return {"success": True, "task_id": task_id}
+    store.outbox_mark(row["id"], state="pending")
+    return {"success": False, "error": result.get("error", "adapter_error")}
+
+
 def _materialization_intent(
     instance: dict[str, Any], contract: InputContract, receipt: dict[str, Any], idempotency_key: str
 ) -> dict[str, Any]:
@@ -97,17 +140,29 @@ class OwnerInputHandler:
             store.transition(instance_id, ContinuationState.WAITING_OWNER, reason="needs_input_detected")
             instance = store.get_instance(instance_id)
 
+        assert instance is not None
+
         anchor_key = f"owner_anchor:{_stable_digest(instance)}"
         intent = _owner_anchor_intent(instance, contract, anchor_key)
         step = store.add_step(instance_id, step_kind="owner_anchor", idempotency_key=anchor_key)
 
-        if step["created"] and adapter is not None:
-            result = adapter.create_task(intent)
+        if step["created"]:
+            result = _apply_board_operation(
+                store, instance_id, step_id=step["step"]["id"], operation="create_task", payload=intent, idempotency_key=anchor_key, adapter=adapter
+            )
             if result.get("success"):
                 task_id = result.get("task_id", "")
                 store.mark_step(step["step"]["id"], state="applied", board_task_id=task_id)
-                if instance.get("origin_ref"):
-                    adapter.subscribe(task_id, instance["origin_ref"])
+                if instance.get("origin_ref") and adapter is not None:
+                    _apply_board_operation(
+                        store,
+                        instance_id,
+                        step_id=step["step"]["id"],
+                        operation="subscribe",
+                        payload={"task_id": task_id, "endpoint": instance["origin_ref"]},
+                        idempotency_key=f"subscribe:{anchor_key}:{instance['origin_ref']}",
+                        adapter=adapter,
+                    )
 
         return ContinuationPlan(
             instance_id=instance_id,
@@ -148,14 +203,24 @@ class OwnerInputHandler:
 
         anchor_steps = [s for s in store.list_steps(instance_id) if s["step_kind"] == "owner_anchor"]
         if anchor_steps and anchor_steps[0].get("board_task_id") and adapter is not None:
-            adapter.complete_owner_anchor(anchor_steps[0]["board_task_id"], receipt_ref=f"receipt:{receipt['id']}")
+            _apply_board_operation(
+                store,
+                instance_id,
+                step_id=anchor_steps[0]["id"],
+                operation="complete_owner_anchor",
+                payload={"task_id": anchor_steps[0]["board_task_id"], "receipt_ref": f"receipt:{receipt['id']}"},
+                idempotency_key=f"complete_owner_anchor:{anchor_steps[0]['board_task_id']}:receipt:{receipt['id']}",
+                adapter=adapter,
+            )
 
         mat_key = f"materialize:{_stable_digest(instance)}"
         step = store.add_step(instance_id, step_kind="materialization", idempotency_key=mat_key)
         materialization_task_id = ""
-        if step["created"] and adapter is not None:
+        if step["created"]:
             intent = _materialization_intent(instance, contract, receipt, mat_key)
-            result = adapter.create_task(intent)
+            result = _apply_board_operation(
+                store, instance_id, step_id=step["step"]["id"], operation="create_task", payload=intent, idempotency_key=mat_key, adapter=adapter
+            )
             if result.get("success"):
                 materialization_task_id = result.get("task_id", "")
                 store.mark_step(step["step"]["id"], state="applied", board_task_id=materialization_task_id)
@@ -191,7 +256,7 @@ class OwnerInputHandler:
         review_key = f"review:{_stable_digest(instance)}"
         step = store.add_step(instance_id, step_kind="review", idempotency_key=review_key)
         review_task_id = ""
-        if step["created"] and adapter is not None:
+        if step["created"]:
             intent = {
                 "kind": "review",
                 "title": "Review owner-bound artifact/marker",
@@ -199,7 +264,9 @@ class OwnerInputHandler:
                 "origin_ref": instance.get("origin_ref", ""),
                 "return_to_ref": instance.get("return_to_ref", ""),
             }
-            result = adapter.create_task(intent)
+            result = _apply_board_operation(
+                store, instance_id, step_id=step["step"]["id"], operation="create_task", payload=intent, idempotency_key=review_key, adapter=adapter
+            )
             if result.get("success"):
                 review_task_id = result.get("task_id", "")
                 store.mark_step(step["step"]["id"], state="applied", board_task_id=review_task_id)
@@ -241,7 +308,9 @@ class OwnerInputHandler:
                 "origin_ref": instance.get("origin_ref", ""),
                 "return_to_ref": instance.get("return_to_ref", ""),
             }
-            result = adapter.create_task(intent)
+            result = _apply_board_operation(
+                store, instance_id, step_id=step["step"]["id"], operation="create_task", payload=intent, idempotency_key=rerun_key, adapter=adapter
+            )
             if result.get("success"):
                 rerun_task_id = result.get("task_id", "")
                 store.mark_step(step["step"]["id"], state="applied", board_task_id=rerun_task_id)

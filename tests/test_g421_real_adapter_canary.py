@@ -107,7 +107,8 @@ def test_real_adapter_g421_needs_input_creates_exactly_one_owner_anchor(tmp_path
     subscribe_calls = [c for c in runner.calls if len(c) > 4 and c[4] == "notify-subscribe"]
     assert len(subscribe_calls) == 1
     assert "--platform" in subscribe_calls[0] and "discord" in subscribe_calls[0]
-    assert "--chat-id" in subscribe_calls[0] and "research" in subscribe_calls[0]
+    assert "--chat-id" in subscribe_calls[0] and "1499390151393284106" in subscribe_calls[0]
+    assert "research" not in subscribe_calls[0]
 
 
 def test_real_adapter_g421_no_downstream_cards_before_owner_receipt(tmp_path):

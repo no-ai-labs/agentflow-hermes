@@ -77,6 +77,8 @@ def test_needs_input_plan_creates_one_waiting_owner_instance(tmp_path):
     assert len(store.list_instances()) == 1
     assert len(adapter.created_tasks) == 1
     assert adapter.subscriptions == [(adapter.created_tasks[0]["task_id"], "discord:#research")]
+    outbox = store.list_outbox()
+    assert [(r["operation"], r["state"]) for r in outbox] == [("create_task", "applied"), ("subscribe", "applied")]
 
 
 def test_board_idempotency_keys_are_stable_and_differ_across_fresh_stores_sharing_row_id(tmp_path):
@@ -201,6 +203,13 @@ def test_valid_receipt_advances_state_and_creates_one_materialization_task(tmp_p
     assert store.count_steps(plan.instance_id, step_kind="materialization") == 1
     assert len(adapter.created_tasks) == 2  # owner anchor + exactly one materialization task
     assert adapter.completed_anchors  # owner anchor completed with receipt ref
+    outbox_ops = [(r["operation"], r["state"]) for r in store.list_outbox()]
+    assert outbox_ops == [
+        ("create_task", "applied"),
+        ("subscribe", "applied"),
+        ("complete_owner_anchor", "applied"),
+        ("create_task", "applied"),
+    ]
 
 
 def _accepted_instance(store, adapter):
