@@ -97,13 +97,18 @@ def _apply_board_operation(
 def _materialization_intent(
     instance: dict[str, Any], contract: InputContract, receipt: dict[str, Any], idempotency_key: str
 ) -> dict[str, Any]:
+    # Sanitized receipt reference only — never raw owner field values or the
+    # local SQLite row shape leak onto the board card.
+    receipt_ref = f"receipt:{receipt['id']}:v{receipt['version']}"
     return {
         "kind": "materialization",
         "title": f"{contract.contract_ref} materialize artifacts",
+        "body": f"Resume authorized by owner receipt {receipt_ref}.",
         "idempotency_key": idempotency_key,
         "contract_ref": contract.contract_ref,
         "origin_ref": instance.get("origin_ref", ""),
         "return_to_ref": instance.get("return_to_ref", ""),
+        "receipt_ref": receipt_ref,
         "owner_receipt_id": receipt["id"],
         "owner_receipt_version": receipt["version"],
         "artifact_ids": [a.artifact_id for a in contract.artifacts],

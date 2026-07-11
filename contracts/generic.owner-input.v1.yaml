@@ -1,0 +1,24 @@
+contract_ref: generic.owner-input.v1
+version: 1
+owner_role: board-owner
+resume_transition: generic.owner-input.resume
+
+# Versioned default contract for an explicit needs_input outcome that carries
+# no domain-specific InputContract. Domain contracts (e.g.
+# warroom.g421.exposure-resolution.v1) override this by supplying their own
+# contract_ref on the outcome; this file is only used when the outcome asks for
+# owner input generically. It intentionally declares no artifacts: the generic
+# resume path materializes exactly one action/resume task carrying a sanitized
+# receipt reference rather than writing domain evidence files.
+
+fields:
+  owner_decision:
+    authority: owner
+    type: enum
+    allowed_values:
+      - approve
+      - reject
+      - revise
+  owner_confirmation:
+    authority: owner
+    type: boolean

@@ -154,9 +154,42 @@ AgentFlow replaces that manual step with durable, board-driven continuation:
 - ACKs use explicit `[JOB ACK]` blocks
 - Writes (board promotion, release actions) require a config-level flag *and* a CLI flag together — never one alone
 
+## Global needs_input watchdog (M26)
+
+One registry-driven runtime consumes live `needs_input` events for **every**
+enabled board in the canonical catalog (`config/boards.yaml`) — no per-board
+scanner script, no per-board cron. Enrolling a new board is one YAML entry.
+
+```bash
+# Dry-run (default): reads real per-board Kanban sqlite DBs read-only, seeds a
+# newly seen board's cursor to its current max event (no historical replay),
+# plans owner-input continuations in memory. No board write. Silent when there
+# is nothing new — safe on a tight cron.
+python scripts/agentflow_needs_input_watchdog.py
+
+# Apply: mutate the real shared boards via the gated CLI adapter. Must be
+# explicit; owner-input BLOCK never creates a code-fix task.
+python scripts/agentflow_needs_input_watchdog.py --apply
+```
+
+Behavior:
+- Cursor identity is `(board, db_identity, event id)`; boards with overlapping
+  event ids stay independent.
+- Structured run metadata `agentflow_outcome` is preferred; explicit summary
+  markers (`Verdict`, `Outcome-Kind`, `Continuation-Contract`, operator-input
+  prose) are the compatibility fallback.
+- `needs_input` with no domain contract uses the versioned
+  `generic.owner-input.v1` contract; a domain contract (e.g.
+  `warroom.g421.exposure-resolution.v1`) overrides it.
+- Return endpoint resolves generically: a source task's typed notify/ACK
+  endpoint first, then the board's declared `default_endpoint` — route data is
+  declared once, in `config/boards.yaml`.
+- Every board mutation flows through the durable, idempotent outbox.
+
 ## Design documents
 
 - [Needs-Input Continuation Engine](docs/plans/2026-07-10-needs-input-continuation-engine-design.md) — typed `GO`/code-fix/operator-input continuations, owner-anchor workflows, and the Warroom G4.21 vertical implementation plan.
+- [M26 Global needs_input rollout](docs/m26-global-needs-input-rollout.md) — one board-aware scan loop across the canonical board catalog, live sqlite event source, and the registry-driven watchdog.
 
 ## Why a plugin + CLI?
 

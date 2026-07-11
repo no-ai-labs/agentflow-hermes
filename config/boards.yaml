@@ -1,0 +1,34 @@
+# Canonical board catalog for the global needs_input continuation rollout.
+#
+# One declarative registry drives the board-aware scan loop
+# (`continuation_engine.ingest_all_boards`) and the live watchdog
+# (`scripts/agentflow_needs_input_watchdog.py`). Enrolling a new board here is
+# the ONLY step required for it to receive needs_input continuation — there is
+# no per-channel scanner script and no per-board cron.
+#
+# Fields per board:
+#   db_identity      stable logical identity for the cursor key. Kept distinct
+#                    from the on-disk path so a board can be relocated without
+#                    replaying history.
+#   db_path          optional explicit sqlite path override. When omitted the
+#                    runtime derives ~/.hermes/kanban/boards/<board>/kanban.db
+#                    via board_adapter.default_board_kanban_db_path.
+#   enabled          whether the scan loop processes this board.
+#   default_endpoint declarative return/notify endpoint used only when a source
+#                    task carries no typed notify/ACK endpoint of its own. This
+#                    is the single place route data is declared — no per-channel
+#                    branch exists in code.
+
+boards:
+  agentflow-hermes:
+    db_identity: agentflow-hermes
+    enabled: true
+    default_endpoint: discord:1497895797579190357
+  warroom-os:
+    db_identity: warroom-os
+    enabled: true
+    default_endpoint: discord:1499390151393284106
+  oracle-lab:
+    db_identity: oracle-lab
+    enabled: true
+    default_endpoint: discord:1500539609413849200

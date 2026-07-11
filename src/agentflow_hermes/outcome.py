@@ -18,6 +18,12 @@ from .remediation import parse_verdict_summary
 
 _CONFIDENCE_LEVELS = {"structured", "text_explicit", "none"}
 
+# Versioned default contract for an explicit needs_input outcome that carries
+# no domain-specific contract_ref. A domain contract (e.g.
+# ``warroom.g421.exposure-resolution.v1``) always overrides this because it
+# supplies its own contract_ref; this is only the generic fallback.
+GENERIC_OWNER_INPUT_CONTRACT = "generic.owner-input.v1"
+
 _OUTCOME_KIND_RE = re.compile(r"\bOutcome-Kind\s*:\s*([a-z_]+)", re.IGNORECASE)
 _CONTINUATION_CONTRACT_RE = re.compile(r"\bContinuation-Contract\s*:\s*([\w.\-]+)", re.IGNORECASE)
 _OPERATOR_MUST_RE = re.compile(
@@ -174,12 +180,16 @@ def _from_structured(block: dict[str, Any], **common: Any) -> OutcomeEnvelope | 
         elif isinstance(item, str):
             requirements.append(RequirementRef(name=item, authority="owner"))
 
+    contract_ref = str(block.get("contract_ref") or "")
+    if continuation_kind == ContinuationKind.NEEDS_INPUT and not contract_ref:
+        contract_ref = GENERIC_OWNER_INPUT_CONTRACT
+
     try:
         return OutcomeEnvelope(
             schema_version=1,
             verdict=verdict,
             continuation_kind=continuation_kind,
-            contract_ref=str(block.get("contract_ref") or ""),
+            contract_ref=contract_ref,
             requirements=tuple(requirements),
             next_transition=str(block.get("resume_transition") or block.get("next_transition") or ""),
             confidence="structured",
@@ -200,34 +210,36 @@ def _from_text_fallback(summary: str, **common: Any) -> OutcomeEnvelope:
     kind_match = _OUTCOME_KIND_RE.search(text)
     contract_match = _CONTINUATION_CONTRACT_RE.search(text)
 
-    if kind_match and contract_match:
+    if kind_match:
         try:
             continuation_kind = ContinuationKind(kind_match.group(1).lower())
         except ValueError:
             continuation_kind = None
-        if continuation_kind is not None:
+        # An explicit Outcome-Kind marker still needs an explicit contract for
+        # kinds other than needs_input; needs_input without a domain contract
+        # falls back to the versioned generic owner-input contract.
+        contract_ref = contract_match.group(1) if contract_match else ""
+        if continuation_kind == ContinuationKind.NEEDS_INPUT and not contract_ref:
+            contract_ref = GENERIC_OWNER_INPUT_CONTRACT
+        if continuation_kind is not None and (contract_match or continuation_kind == ContinuationKind.NEEDS_INPUT):
             try:
                 return OutcomeEnvelope(
                     schema_version=1,
                     verdict=verdict,
                     continuation_kind=continuation_kind,
-                    contract_ref=contract_match.group(1),
+                    contract_ref=contract_ref,
                     confidence="text_explicit",
                     **common,
                 )
             except OutcomeEnvelopeError:
                 return _unknown_envelope(**common)
 
-    if (
-        verdict in (Verdict.BLOCK, Verdict.NEED_MORE)
-        and contract_match
-        and _OPERATOR_MUST_RE.search(text)
-    ):
+    if verdict in (Verdict.BLOCK, Verdict.NEED_MORE) and _OPERATOR_MUST_RE.search(text):
         return OutcomeEnvelope(
             schema_version=1,
             verdict=verdict,
             continuation_kind=ContinuationKind.NEEDS_INPUT,
-            contract_ref=contract_match.group(1),
+            contract_ref=contract_match.group(1) if contract_match else GENERIC_OWNER_INPUT_CONTRACT,
             confidence="text_explicit",
             **common,
         )

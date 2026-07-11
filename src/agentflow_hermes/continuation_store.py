@@ -305,6 +305,19 @@ class ContinuationStore:
 
     # -- board cursors ---------------------------------------------------
 
+    def cursor_exists(self, board: str, db_identity: str) -> bool:
+        """Whether a cursor row already exists for ``(board, db_identity)``.
+
+        Distinct from ``get_cursor`` returning 0: a board seen for the first
+        time has NO row, and the global scan loop seeds it to the current max
+        event id so historical events are never replayed."""
+        self.init()
+        with self.connect() as con:
+            row = con.execute(
+                "select 1 from board_cursors where board=? and db_identity=?", (board, db_identity)
+            ).fetchone()
+        return row is not None
+
     def get_cursor(self, board: str, db_identity: str) -> int:
         self.init()
         with self.connect() as con:
