@@ -6,6 +6,7 @@ test_plugin_adapter.py (existing tools) and test_input_reply_bridge.py
 from __future__ import annotations
 
 import importlib.util
+import inspect
 import sys
 from pathlib import Path
 
@@ -45,6 +46,17 @@ def test_all_tools_are_namespaced_agentflow_with_a_schema_and_handler():
         assert callable(tool["handler"])
         assert tool["schema"]["type"] == "function"
         assert tool["schema"]["function"]["name"] == tool["name"]
+
+
+def test_all_handlers_accept_runtime_injected_keyword_context():
+    """Hermes invokes plugin handlers with the args dict plus runtime kwargs
+    such as ``task_id``.  Every registered handler must tolerate those kwargs
+    even when it does not consume them directly."""
+    ctx = FakeHermesContext()
+    plugin.register(ctx)
+    for tool in ctx.tools:
+        parameters = inspect.signature(tool["handler"]).parameters.values()
+        assert any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters), tool["name"]
 
 
 def test_interaction_tools_are_registered_alongside_existing_tools():

@@ -218,7 +218,7 @@ def _ensure_engine() -> dict[str, Any] | None:
     return None
 
 
-def _handle_enqueue(args: dict) -> str:
+def _handle_enqueue(args: dict, **_runtime: Any) -> str:
     bad = _ensure_engine()
     if bad is not None:
         return json.dumps(bad, ensure_ascii=False)
@@ -233,7 +233,7 @@ def _handle_enqueue(args: dict) -> str:
     return json.dumps(result, ensure_ascii=False)
 
 
-def _handle_status(args: dict) -> str:
+def _handle_status(args: dict, **_runtime: Any) -> str:
     bad = _ensure_engine()
     if bad is not None:
         return json.dumps(bad, ensure_ascii=False)
@@ -241,7 +241,7 @@ def _handle_status(args: dict) -> str:
     return json.dumps(result, ensure_ascii=False)
 
 
-def _handle_dispatch_dry_run(args: dict) -> str:
+def _handle_dispatch_dry_run(args: dict, **_runtime: Any) -> str:
     bad = _ensure_engine()
     if bad is not None:
         return json.dumps(bad, ensure_ascii=False)
@@ -249,7 +249,7 @@ def _handle_dispatch_dry_run(args: dict) -> str:
     return json.dumps(result, ensure_ascii=False)
 
 
-def _handle_ack_ingest(args: dict) -> str:
+def _handle_ack_ingest(args: dict, **_runtime: Any) -> str:
     bad = _ensure_engine()
     if bad is not None:
         return json.dumps(bad, ensure_ascii=False)
@@ -257,7 +257,7 @@ def _handle_ack_ingest(args: dict) -> str:
     return json.dumps(result, ensure_ascii=False)
 
 
-def _handle_doctor(args: dict) -> str:
+def _handle_doctor(args: dict, **_runtime: Any) -> str:
     bad = _ensure_engine()
     if bad is not None:
         return json.dumps({
@@ -273,7 +273,7 @@ def _handle_doctor(args: dict) -> str:
     return json.dumps(result, ensure_ascii=False)
 
 
-def _handle_bridge_cron(args: dict) -> str:
+def _handle_bridge_cron(args: dict, **_runtime: Any) -> str:
     bad = _ensure_engine()
     if bad is not None:
         return json.dumps(bad, ensure_ascii=False)
@@ -291,7 +291,7 @@ def _handle_bridge_cron(args: dict) -> str:
     return json.dumps(result, ensure_ascii=False)
 
 
-def _handle_dispatch(args: dict) -> str:
+def _handle_dispatch(args: dict, **_runtime: Any) -> str:
     bad = _ensure_engine()
     if bad is not None:
         return json.dumps(bad, ensure_ascii=False)
@@ -303,7 +303,7 @@ def _handle_dispatch(args: dict) -> str:
     return json.dumps(result, ensure_ascii=False)
 
 
-def _handle_live_status(args: dict) -> str:
+def _handle_live_status(args: dict, **_runtime: Any) -> str:
     bad = _ensure_engine()
     if bad is not None:
         return json.dumps(bad, ensure_ascii=False)
@@ -311,7 +311,7 @@ def _handle_live_status(args: dict) -> str:
     return json.dumps(result, ensure_ascii=False)
 
 
-def _handle_input_inbox(args: dict) -> str:
+def _handle_input_inbox(args: dict, **_runtime: Any) -> str:
     bad = _ensure_engine()
     if bad is not None:
         return json.dumps(bad, ensure_ascii=False)
@@ -407,7 +407,7 @@ def _compile_reply_text(text: str, ordered_fields: list[dict[str, Any]]) -> dict
     return result
 
 
-def _handle_submit_input_text(args: dict) -> str:
+def _handle_submit_input_text(args: dict, **_runtime: Any) -> str:
     bad = _ensure_engine()
     if bad is not None:
         return json.dumps(bad, ensure_ascii=False)
@@ -514,7 +514,7 @@ def _handle_submit_input_text(args: dict) -> str:
     )
 
 
-def _handle_input_status(args: dict) -> str:
+def _handle_input_status(args: dict, **_runtime: Any) -> str:
     bad = _ensure_engine()
     if bad is not None:
         return json.dumps(bad, ensure_ascii=False)
