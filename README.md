@@ -188,6 +188,7 @@ Behavior:
 
 ## Design documents
 
+- [Zero-Ceremony AgentFlow Autopilot](docs/plans/2026-07-12-zero-ceremony-agentflow-autopilot.md) — event-driven continuation, automatic requirement resolution, batched owner questions, natural-language replies, standing policies, and the human-effort budget.
 - [Needs-Input Continuation Engine](docs/plans/2026-07-10-needs-input-continuation-engine-design.md) — typed `GO`/code-fix/operator-input continuations, owner-anchor workflows, and the Warroom G4.21 vertical implementation plan.
 - [M26 Global needs_input rollout](docs/m26-global-needs-input-rollout.md) — one board-aware scan loop across the canonical board catalog, live sqlite event source, and the registry-driven watchdog.
 
