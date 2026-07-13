@@ -34,6 +34,11 @@ class BoardEvent:
     workspace_ref: str = ""
     assignee: str = ""
     occurred_at: float = 0.0
+    # Bounded outcome-compiler input (plan section 5.2): the terminal event
+    # kind and source task title, alongside the existing summary/assignee/
+    # run_metadata/source_graph_id fields already on this record.
+    event_kind: str = ""
+    title: str = ""
 
 
 class BoardEventSource(Protocol):
@@ -127,6 +132,7 @@ class LiveBoardEventSource:
                     e.payload as event_payload,
                     e.created_at as created_at,
                     t.assignee as assignee,
+                    t.title as task_title,
                     t.workspace_path as workspace_path,
                     t.workflow_template_id as workflow_template_id,
                     r.step_key as step_key,
@@ -168,6 +174,8 @@ class LiveBoardEventSource:
             workspace_ref=str(row["workspace_path"] or ""),
             assignee=str(row["assignee"] or ""),
             occurred_at=float(row["created_at"] or 0.0),
+            event_kind=str(row["event_kind"] or ""),
+            title=str(row["task_title"] if "task_title" in row.keys() else "") or "",
         )
 
     def _resolve_endpoint(self, conn: sqlite3.Connection, task_id: str) -> str:

@@ -16,7 +16,10 @@ from typing import Any
 
 from .remediation import parse_verdict_summary
 
-_CONFIDENCE_LEVELS = {"structured", "text_explicit", "none"}
+# "deterministic_grammar" and "model_compiled" are additive confidence levels
+# used by outcome_compiler.py's stage 2/3 (see that module's docstring); they
+# never claim "structured" since only real agentflow_outcome metadata may.
+_CONFIDENCE_LEVELS = {"structured", "text_explicit", "deterministic_grammar", "model_compiled", "none"}
 
 # Versioned default contract for an explicit needs_input outcome that carries
 # no domain-specific contract_ref. A domain contract (e.g.
