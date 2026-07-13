@@ -1,0 +1,392 @@
+{
+  "cases_after_reply_sample": [
+    {
+      "answered_at": 1783918042.1016345,
+      "applied_at": 1783918042.1046543,
+      "asked_at": 1783918042.077922,
+      "batch_key": "discord:1497895797579190357|||owner",
+      "created_at": 1783918041.9236372,
+      "endpoint": "discord:1497895797579190357",
+      "id": "ic_4654440e2902",
+      "question_count": 1,
+      "state": "applied"
+    },
+    {
+      "answered_at": 1783918042.17049,
+      "applied_at": 1783918042.173883,
+      "asked_at": 1783918042.1458275,
+      "batch_key": "discord:1500539609413849200|||owner",
+      "created_at": 1783918041.9620662,
+      "endpoint": "discord:1500539609413849200",
+      "id": "ic_7bd799b03e51",
+      "question_count": 1,
+      "state": "applied"
+    },
+    {
+      "answered_at": 1783918042.1357188,
+      "applied_at": 1783918042.138526,
+      "asked_at": 1783918042.1117575,
+      "batch_key": "discord:1499390151393284106|||owner",
+      "created_at": 1783918041.990766,
+      "endpoint": "discord:1499390151393284106",
+      "id": "ic_ed74a530e792",
+      "question_count": 1,
+      "state": "applied"
+    }
+  ],
+  "detected_instances": [
+    {
+      "board": "agentflow-hermes",
+      "continuation_kind": "needs_input",
+      "contract_ref": "generic.owner-input.v1",
+      "created_at": 1783918041.918674,
+      "id": 1,
+      "idempotency_key": "continuation:agentflow-hermes:t_m27live_20260713T044721Z_agentflow_hermes:kanban-event-2728:generic.owner-input.v1",
+      "origin_ref": "discord:1497895797579190357",
+      "return_to_ref": "discord:1497895797579190357",
+      "source_event_id": "kanban-event-2728",
+      "source_graph_id": "m27-live-canary",
+      "source_task_id": "t_m27live_20260713T044721Z_agentflow_hermes",
+      "state": "waiting_owner",
+      "updated_at": 1783918041.921158,
+      "verdict": "BLOCK",
+      "workspace_ref": "/home/duckran/dev/agentflow-hermes"
+    },
+    {
+      "board": "oracle-lab",
+      "continuation_kind": "needs_input",
+      "contract_ref": "generic.owner-input.v1",
+      "created_at": 1783918041.9570634,
+      "id": 2,
+      "idempotency_key": "continuation:oracle-lab:t_m27live_20260713T044721Z_oracle_lab:kanban-event-3638:generic.owner-input.v1",
+      "origin_ref": "discord:1500539609413849200",
+      "return_to_ref": "discord:1500539609413849200",
+      "source_event_id": "kanban-event-3638",
+      "source_graph_id": "m27-live-canary",
+      "source_task_id": "t_m27live_20260713T044721Z_oracle_lab",
+      "state": "waiting_owner",
+      "updated_at": 1783918041.95992,
+      "verdict": "BLOCK",
+      "workspace_ref": "/home/duckran/dev/agentflow-hermes"
+    },
+    {
+      "board": "warroom-os",
+      "continuation_kind": "needs_input",
+      "contract_ref": "generic.owner-input.v1",
+      "created_at": 1783918041.9833217,
+      "id": 3,
+      "idempotency_key": "continuation:warroom-os:t_m27live_20260713T044721Z_warroom_os:kanban-event-5423:generic.owner-input.v1",
+      "origin_ref": "discord:1499390151393284106",
+      "return_to_ref": "discord:1499390151393284106",
+      "source_event_id": "kanban-event-5423",
+      "source_graph_id": "m27-live-canary",
+      "source_task_id": "t_m27live_20260713T044721Z_warroom_os",
+      "state": "waiting_owner",
+      "updated_at": 1783918041.9876053,
+      "verdict": "BLOCK",
+      "workspace_ref": "/home/duckran/dev/agentflow-hermes"
+    }
+  ],
+  "inserted": [
+    {
+      "after": {
+        "ack_active_wake": 163,
+        "ack_subscription": 164,
+        "kanban_notify_subs": 10,
+        "task_events": 2728,
+        "task_runs": 230,
+        "tasks": 223
+      },
+      "before": {
+        "ack_active_wake": 162,
+        "ack_subscription": 163,
+        "kanban_notify_subs": 9,
+        "task_events": 2727,
+        "task_runs": 229,
+        "tasks": 222
+      },
+      "board": "agentflow-hermes",
+      "channel": "#hermes-main",
+      "db": "/home/duckran/.hermes/kanban/boards/agentflow-hermes/kanban.db",
+      "endpoint": "discord:1497895797579190357",
+      "event_seq": 2728,
+      "inserted_at": 1783918041.9173021,
+      "run_id": 230,
+      "task_id": "t_m27live_20260713T044721Z_agentflow_hermes"
+    },
+    {
+      "after": {
+        "ack_active_wake": 20,
+        "ack_subscription": 166,
+        "kanban_notify_subs": 28,
+        "task_events": 5409,
+        "task_runs": 528,
+        "tasks": 513
+      },
+      "before": {
+        "ack_active_wake": 19,
+        "ack_subscription": 165,
+        "kanban_notify_subs": 27,
+        "task_events": 5408,
+        "task_runs": 527,
+        "tasks": 512
+      },
+      "board": "warroom-os",
+      "channel": "#research",
+      "db": "/home/duckran/.hermes/kanban/boards/warroom-os/kanban.db",
+      "endpoint": "discord:1499390151393284106",
+      "event_seq": 5423,
+      "inserted_at": 1783918041.9204445,
+      "run_id": 534,
+      "task_id": "t_m27live_20260713T044721Z_warroom_os"
+    },
+    {
+      "after": {
+        "ack_active_wake": 106,
+        "ack_subscription": 117,
+        "kanban_notify_subs": 8,
+        "task_events": 3638,
+        "task_runs": 306,
+        "tasks": 271
+      },
+      "before": {
+        "ack_active_wake": 105,
+        "ack_subscription": 116,
+        "kanban_notify_subs": 7,
+        "task_events": 3637,
+        "task_runs": 305,
+        "tasks": 270
+      },
+      "board": "oracle-lab",
+      "channel": "#shaman",
+      "db": "/home/duckran/.hermes/kanban/boards/oracle-lab/kanban.db",
+      "endpoint": "discord:1500539609413849200",
+      "event_seq": 3638,
+      "inserted_at": 1783918041.923501,
+      "run_id": 900015,
+      "task_id": "t_m27live_20260713T044721Z_oracle_lab"
+    }
+  ],
+  "instances_after_reply": [
+    {
+      "board": "agentflow-hermes",
+      "continuation_kind": "needs_input",
+      "contract_ref": "generic.owner-input.v1",
+      "created_at": 1783918041.918674,
+      "id": 1,
+      "idempotency_key": "continuation:agentflow-hermes:t_m27live_20260713T044721Z_agentflow_hermes:kanban-event-2728:generic.owner-input.v1",
+      "origin_ref": "discord:1497895797579190357",
+      "return_to_ref": "discord:1497895797579190357",
+      "source_event_id": "kanban-event-2728",
+      "source_graph_id": "m27-live-canary",
+      "source_task_id": "t_m27live_20260713T044721Z_agentflow_hermes",
+      "state": "materializing",
+      "updated_at": 1783918042.0981493,
+      "verdict": "BLOCK",
+      "workspace_ref": "/home/duckran/dev/agentflow-hermes"
+    },
+    {
+      "board": "oracle-lab",
+      "continuation_kind": "needs_input",
+      "contract_ref": "generic.owner-input.v1",
+      "created_at": 1783918041.9570634,
+      "id": 2,
+      "idempotency_key": "continuation:oracle-lab:t_m27live_20260713T044721Z_oracle_lab:kanban-event-3638:generic.owner-input.v1",
+      "origin_ref": "discord:1500539609413849200",
+      "return_to_ref": "discord:1500539609413849200",
+      "source_event_id": "kanban-event-3638",
+      "source_graph_id": "m27-live-canary",
+      "source_task_id": "t_m27live_20260713T044721Z_oracle_lab",
+      "state": "materializing",
+      "updated_at": 1783918042.166736,
+      "verdict": "BLOCK",
+      "workspace_ref": "/home/duckran/dev/agentflow-hermes"
+    },
+    {
+      "board": "warroom-os",
+      "continuation_kind": "needs_input",
+      "contract_ref": "generic.owner-input.v1",
+      "created_at": 1783918041.9833217,
+      "id": 3,
+      "idempotency_key": "continuation:warroom-os:t_m27live_20260713T044721Z_warroom_os:kanban-event-5423:generic.owner-input.v1",
+      "origin_ref": "discord:1499390151393284106",
+      "return_to_ref": "discord:1499390151393284106",
+      "source_event_id": "kanban-event-5423",
+      "source_graph_id": "m27-live-canary",
+      "source_task_id": "t_m27live_20260713T044721Z_warroom_os",
+      "state": "materializing",
+      "updated_at": 1783918042.1321456,
+      "verdict": "BLOCK",
+      "workspace_ref": "/home/duckran/dev/agentflow-hermes"
+    }
+  ],
+  "latencies_seconds": [
+    0.11083579063415527,
+    0.10769343376159668,
+    0.10463690757751465
+  ],
+  "p95_seconds_upper_bound": 0.11083579063415527,
+  "plugin_checks": [
+    {
+      "board": "agentflow-hermes",
+      "case_id": "ic_4654440e2902",
+      "endpoint": "discord:1497895797579190357",
+      "right_lane": {
+        "case_id": "ic_4654440e2902",
+        "resumed_continuation_ids": [
+          1
+        ],
+        "status": "resumed",
+        "success": true
+      },
+      "status": {
+        "case_id": "ic_4654440e2902",
+        "continuations": [
+          {
+            "id": 1,
+            "state": "materializing"
+          }
+        ],
+        "status": "resumed",
+        "success": true
+      },
+      "wrong_lane": {
+        "error": "origin_mismatch",
+        "success": false
+      }
+    },
+    {
+      "board": "warroom-os",
+      "case_id": "ic_ed74a530e792",
+      "endpoint": "discord:1499390151393284106",
+      "right_lane": {
+        "case_id": "ic_ed74a530e792",
+        "resumed_continuation_ids": [
+          3
+        ],
+        "status": "resumed",
+        "success": true
+      },
+      "status": {
+        "case_id": "ic_ed74a530e792",
+        "continuations": [
+          {
+            "id": 3,
+            "state": "materializing"
+          }
+        ],
+        "status": "resumed",
+        "success": true
+      },
+      "wrong_lane": {
+        "error": "origin_mismatch",
+        "success": false
+      }
+    },
+    {
+      "board": "oracle-lab",
+      "case_id": "ic_7bd799b03e51",
+      "endpoint": "discord:1500539609413849200",
+      "right_lane": {
+        "case_id": "ic_7bd799b03e51",
+        "resumed_continuation_ids": [
+          2
+        ],
+        "status": "resumed",
+        "success": true
+      },
+      "status": {
+        "case_id": "ic_7bd799b03e51",
+        "continuations": [
+          {
+            "id": 2,
+            "state": "materializing"
+          }
+        ],
+        "status": "resumed",
+        "success": true
+      },
+      "wrong_lane": {
+        "error": "origin_mismatch",
+        "success": false
+      }
+    }
+  ],
+  "raw_reply_text_absent_from_receipts": true,
+  "receipt_storage_shape": {
+    "columns": [
+      "case_id",
+      "compile_result_json",
+      "content_sha256",
+      "created_at",
+      "id",
+      "message_ref"
+    ],
+    "has_raw_text_column": false,
+    "note": "compile_result_json contains the validated typed field value; the raw free-form reply body is not stored as a separate durable text column.",
+    "stores_content_sha256": true,
+    "stores_message_ref": true,
+    "stores_validated_compile_result": true
+  },
+  "recent_receipts": [
+    {
+      "case_id": "ic_7bd799b03e51",
+      "compile_result_json": "{\"result_url\": \"https://example.invalid/m27/20260713T044721Z/oracle-lab\"}",
+      "content_sha256": "bcd37f9d8673576945e02d035c990ea76619b2ad6318313f7165be796332db54",
+      "created_at": 1783918042.154824,
+      "id": 3,
+      "message_ref": "20260713T044721Z:oracle-lab:right"
+    },
+    {
+      "case_id": "ic_ed74a530e792",
+      "compile_result_json": "{\"result_url\": \"https://example.invalid/m27/20260713T044721Z/warroom-os\"}",
+      "content_sha256": "1fd7ed2c5205d78a93c4a791deae65bf9e731faf95cff6688385e09e1eb09ae5",
+      "created_at": 1783918042.119922,
+      "id": 2,
+      "message_ref": "20260713T044721Z:warroom-os:right"
+    },
+    {
+      "case_id": "ic_4654440e2902",
+      "compile_result_json": "{\"result_url\": \"https://example.invalid/m27/20260713T044721Z/agentflow-hermes\"}",
+      "content_sha256": "737918e085e8ec3f568f5baa1323b0bc84bb48a3a91450e917cc605a0ddcc02a",
+      "created_at": 1783918042.085894,
+      "id": 1,
+      "message_ref": "20260713T044721Z:agentflow-hermes:right"
+    }
+  ],
+  "run_id": "20260713T044721Z",
+  "service_after": {
+    "is_active_service": {
+      "rc": 0,
+      "stderr": "",
+      "stdout": "active"
+    },
+    "is_active_timer": {
+      "rc": 0,
+      "stderr": "",
+      "stdout": "active"
+    },
+    "main_pid": {
+      "rc": 0,
+      "stderr": "",
+      "stdout": "113035"
+    }
+  },
+  "service_before": {
+    "is_active_service": {
+      "rc": 0,
+      "stderr": "",
+      "stdout": "active"
+    },
+    "is_active_timer": {
+      "rc": 0,
+      "stderr": "",
+      "stdout": "active"
+    },
+    "main_pid": {
+      "rc": 0,
+      "stderr": "",
+      "stdout": "113035"
+    }
+  }
+}

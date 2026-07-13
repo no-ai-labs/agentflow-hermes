@@ -1,9 +1,48 @@
 # M27 Zero-Ceremony Autopilot — Canary Report
 
 Companion to [the design doc](plans/2026-07-12-zero-ceremony-agentflow-autopilot.md).
-This report says plainly what M27 actually proved versus what still requires
-a live production run. It is written after all nine implementation commits
-landed on `main`.
+This report says plainly what M27 proved and how the follow-up remediation
+closed the concrete live-rollout gaps. It was originally written after the
+nine M27 implementation commits landed on `main`; the remediation evidence
+below was added by Kanban task `t_a47b3d11`.
+
+## Remediation live rollout evidence (`t_a47b3d11`)
+
+Reviewer BLOCK `t_4d493bc2` found four live-rollout gaps: plugin tools were
+not hard-bound to the current gateway origin, `agentflowd.service` was not
+installed/running, inotify was not the primary wake path, and the three-board
+canary was hermetic-only. The remediation commits close those gaps with
+durable artifacts:
+
+- `0f83640` hard-binds `agentflow_input_inbox`,
+  `agentflow_submit_input_text`, and `agentflow_input_status` to the caller's
+  endpoint. Known cross-lane `case_id` submissions fail closed with
+  `origin_mismatch`; cross-lane inbox/status lookups do not leak or mutate
+  cases. Regression coverage lives in `tests/test_input_reply_bridge.py`,
+  `tests/test_plugin.py`, and `tests/test_zero_ceremony_e2e.py`.
+- `442b2da` adds a stdlib `ctypes` Linux inotify wrapper. `agentflowd` watches
+  each discovered board's `kanban.db` plus `-wal`/`-journal`/`-shm` siblings;
+  the timed poll remains a fallback. Regression coverage is
+  `tests/test_inotify_watch.py`.
+- `5cad87d` exposes guarded user-service management for the single
+  `agentflowd.service` plus quiet `agentflow-reconcile.timer` path. On this
+  host `systemctl --user status agentflowd.service` is active/running and
+  `agentflow-reconcile.timer` is active/waiting.
+- Live real-DB canary artifact:
+  `artifacts/m27-remediation/live-canary-20260713T044721Z.json`. It inserted
+  controlled source events and active-wake rows into the real
+  `agentflow-hermes`/`#hermes-main`, `warroom-os`/`#research`, and
+  `oracle-lab`/`#shaman` board DBs without Discord live-send. The running
+  service observed all three via the live path in ~0.105–0.111s (p95 upper
+  bound 0.111s), created correctly scoped H1 cases, refused wrong-lane natural
+  replies with `origin_mismatch`, accepted correct-origin plain text replies,
+  and materialized all three continuations. The artifact also confirms raw
+  reply text is absent from durable inbound receipts.
+- Restart/idempotency artifact:
+  `artifacts/m27-remediation/restart-idempotency-20260713T044824Z.json`. It
+  enqueued a pending outbox row, restarted `agentflowd.service`, observed the
+  row applied exactly once (`attempts=1`, one idempotency row), restarted the
+  daemon again, and confirmed no duplicate replay.
 
 ## What was proven (real, hermetic, local verification)
 
@@ -12,7 +51,7 @@ production code path — `AgentflowDaemon`, `continuation_engine.ingest_board_on
 `outcome_compiler.compile_outcome`, `requirement_resolver.HumanEffortResolver`,
 `interaction.InteractionInbox`, `standing_policy.StandingPolicyMatcher`, and
 the real natural-language plugin reply bridge in
-`plugins/hermes-agentflow/__init__.py` — against temporary sqlite board DBs
+`plugins/hermes-agentflow/__init__.py` — originally against temporary sqlite board DBs
 that simulate three boards (`agentflow-hermes`, `warroom-os`, `oracle-lab`).
 Nothing here is mocked-away business logic; the only fake is the board
 adapter that would otherwise shell out to the real `hermes` CLI, and the
@@ -32,44 +71,21 @@ Kanban DBs).
 | Board auto-discovery | `tests/test_agentflowd.py::test_discover_boards_scans_root_and_auto_enrolls`, `test_discover_boards_respects_disable_override`, `test_discover_boards_applies_endpoint_override` | New boards are enrolled by directory presence alone; `config/boards.yaml` only overrides (disable/endpoint), it is never a required allowlist entry. |
 | Canonical store migration | `tests/test_control_plane_store_migration.py` (whole file) | Legacy `ContinuationStore`-shaped DBs migrate into the canonical `~/.hermes/agentflow/agentflow.sqlite` store with source ids preserved, verified row counts, a written migration receipt, and idempotent re-runs (zero duplicate rows). |
 
-Full-suite regression: `uv run pytest -q` passes (685 tests at the time this
-report was written) — every prior milestone's behavior (M1–M26) still holds
-alongside the new M27 surface.
+Full-suite regression: `uv run pytest -q` passes after remediation (704 tests)
+— every prior milestone's behavior (M1–M26) still holds alongside the new M27
+surface.
 
-## What this substitutes for, and why
+## Original hermetic substitute note
 
-The design doc's 13.8 asks for a "three-board **live** canary" against the
+The design doc's 13.8 asked for a "three-board **live** canary" against the
 real `agentflow-hermes`/`#hermes-main`, `warroom-os`/`#research`, and
-`oracle-lab`/`#shaman` channels. That was explicitly out of scope for this
-implementation pass — no live Discord send, no live/signed trading or
-release call, and no mutation of the real shared Kanban boards happens
-anywhere in this milestone's test suite or its default runtime posture
-(`agentflowd` is dry-run by default; `--apply` is required and separate).
-`tests/test_zero_ceremony_e2e.py` proves the same event→resolve→resume logic
-against three *simulated* boards instead, which is the strongest hermetic
-substitute available without live infrastructure access.
+`oracle-lab`/`#shaman` channels. The original M27 implementation only proved
+that via hermetic simulated boards. Remediation `t_a47b3d11` added the real
+board-DB canary artifact named above while still avoiding Discord live-send,
+trading/private/signed calls, and channel-specific Python branches.
 
-## Explicit follow-ups (not done, not claimed as done)
+## Remaining explicit follow-ups
 
-- **Live three-board production canary.** Running `agentflowd --apply`
-  against the real `agentflow-hermes`, `warroom-os`, and `oracle-lab` boards
-  and observing a real Discord active-wake, a real natural-language owner
-  reply, and a real resume. This is the only way to close 13.8 as originally
-  written; it requires an operator with production Discord/Kanban access and
-  should happen as a deliberate, supervised follow-up, not inside this
-  automated implementation pass.
-- **Real Linux inotify wake source.** `agentflowd` currently uses a short
-  coalescing poll loop (default 0.5s) as its primary wake source, which the
-  design doc explicitly allows as the fallback (section 9.3) — no ctypes/ffi
-  inotify bindings were added, since that would introduce a non-stdlib
-  dependency for marginal latency benefit over the current poll interval.
-- **Real systemd unit installation.** `service_install.py`/`autopilot`
-  render and validate the `agentflowd.service` / `agentflow-reconcile.timer`
-  unit files and support writing them to a unit directory, but no test or
-  canary in this milestone actually registers them with a live systemd and
-  observes a real process supervision restart. `SingleInstanceLock` and the
-  restart-recovery test (13.7) cover the idempotency guarantee that matters
-  most; live `systemctl enable --now` verification is a follow-up.
 - **Real bounded LLM outcome compiler (stage 3).** `outcome_compiler.py`'s
   `ModelCompiler` protocol is implemented and wired, but the shipped default
   (`default_model_compiler`) is a deterministic no-op — the project has zero

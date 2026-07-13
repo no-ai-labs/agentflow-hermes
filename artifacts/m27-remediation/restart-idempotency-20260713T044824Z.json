@@ -1,0 +1,107 @@
+{
+  "after_restart1": {
+    "attempts": 1,
+    "board_task_id": "task:e3b0c44298fc",
+    "continuation_id": 1,
+    "created_at": 1783918104.9205859,
+    "id": 10,
+    "idempotency_key": "m27-restart-idempotency:20260713T044824Z:1",
+    "operation": "create_task",
+    "payload_json": "{\"title\": \"M27 restart idempotency canary 20260713T044824Z\", \"body\": \"Controlled dry-run outbox replay canary; service FakeBoardAdapter marks once.\", \"assignee\": \"ccreviewer\", \"parents\": []}",
+    "state": "applied",
+    "step_id": "",
+    "updated_at": 1783918105.1300414
+  },
+  "after_restart2": {
+    "attempts": 1,
+    "board_task_id": "task:e3b0c44298fc",
+    "continuation_id": 1,
+    "created_at": 1783918104.9205859,
+    "id": 10,
+    "idempotency_key": "m27-restart-idempotency:20260713T044824Z:1",
+    "operation": "create_task",
+    "payload_json": "{\"title\": \"M27 restart idempotency canary 20260713T044824Z\", \"body\": \"Controlled dry-run outbox replay canary; service FakeBoardAdapter marks once.\", \"assignee\": \"ccreviewer\", \"parents\": []}",
+    "state": "applied",
+    "step_id": "",
+    "updated_at": 1783918105.1300414
+  },
+  "before": {
+    "attempts": 0,
+    "board_task_id": "",
+    "continuation_id": 1,
+    "created_at": 1783918104.9205859,
+    "id": 10,
+    "idempotency_key": "m27-restart-idempotency:20260713T044824Z:1",
+    "operation": "create_task",
+    "payload_json": "{\"title\": \"M27 restart idempotency canary 20260713T044824Z\", \"body\": \"Controlled dry-run outbox replay canary; service FakeBoardAdapter marks once.\", \"assignee\": \"ccreviewer\", \"parents\": []}",
+    "state": "pending",
+    "step_id": "",
+    "updated_at": 1783918104.9205859
+  },
+  "duplicate_outbox_rows": 1,
+  "exactly_once": true,
+  "idempotency_key": "m27-restart-idempotency:20260713T044824Z:1",
+  "instance_id": 1,
+  "restart1": {
+    "cmd": [
+      "systemctl",
+      "--user",
+      "restart",
+      "agentflowd.service"
+    ],
+    "rc": 0,
+    "stderr": "",
+    "stdout": ""
+  },
+  "restart2": {
+    "cmd": [
+      "systemctl",
+      "--user",
+      "restart",
+      "agentflowd.service"
+    ],
+    "rc": 0,
+    "stderr": "",
+    "stdout": ""
+  },
+  "run_id": "20260713T044824Z",
+  "service": {
+    "active": {
+      "cmd": [
+        "systemctl",
+        "--user",
+        "is-active",
+        "agentflowd.service"
+      ],
+      "rc": 0,
+      "stderr": "",
+      "stdout": "active"
+    },
+    "main_pid": {
+      "cmd": [
+        "systemctl",
+        "--user",
+        "show",
+        "-p",
+        "MainPID",
+        "--value",
+        "agentflowd.service"
+      ],
+      "rc": 0,
+      "stderr": "",
+      "stdout": "184387"
+    },
+    "timer": {
+      "cmd": [
+        "systemctl",
+        "--user",
+        "is-active",
+        "agentflow-reconcile.timer"
+      ],
+      "rc": 0,
+      "stderr": "",
+      "stdout": "active"
+    }
+  },
+  "store": "/home/duckran/.hermes/agentflow/agentflow-daemon.sqlite"
+}
