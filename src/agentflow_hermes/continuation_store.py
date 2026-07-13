@@ -59,6 +59,53 @@ create index if not exists idx_standing_policies_scope
     on standing_policies(owner_ref, project_scope, action_scope, enabled);
 """
 
+# Interaction Inbox control-plane tables (plan section 6/10): batching,
+# question-count/H-classification tracking, and reply provenance. Same
+# idempotent-DDL pattern as _REQUIREMENT_RESOLVER_DDL above — scoped to
+# ContinuationStore only, never the shared jobs.db migration chain.
+# ``interaction_members.requirement_names_json`` stores the full requirement
+# dict list (not just bare names) so a case can be reconstructed with kind/
+# question/answer_hint intact; the column name follows the plan's schema
+# sketch even though the payload is richer than the name alone.
+_INTERACTION_INBOX_DDL = """
+create table if not exists interaction_cases (
+    id text primary key,
+    endpoint text not null default '',
+    batch_key text not null default '',
+    state text not null default 'collecting',
+    question_count integer not null default 0,
+    created_at real not null,
+    asked_at real,
+    answered_at real,
+    applied_at real
+);
+
+create table if not exists interaction_members (
+    id integer primary key autoincrement,
+    case_id text not null,
+    continuation_id integer not null,
+    requirement_names_json text not null default '[]',
+    created_at real not null,
+    foreign key(case_id) references interaction_cases(id)
+);
+
+create table if not exists inbound_reply_receipts (
+    id integer primary key autoincrement,
+    case_id text not null,
+    message_ref text not null default '',
+    content_sha256 text not null,
+    compile_result_json text not null default '{}',
+    created_at real not null,
+    foreign key(case_id) references interaction_cases(id)
+);
+
+create index if not exists idx_interaction_cases_batch on interaction_cases(batch_key, state);
+create index if not exists idx_interaction_cases_endpoint on interaction_cases(endpoint, state);
+create unique index if not exists uniq_interaction_member on interaction_members(case_id, continuation_id);
+create index if not exists idx_interaction_members_continuation on interaction_members(continuation_id);
+create index if not exists idx_inbound_reply_receipts_case on inbound_reply_receipts(case_id);
+"""
+
 
 class ContinuationState(str, Enum):
     DETECTED = "detected"
@@ -130,6 +177,7 @@ class ContinuationStore:
         with self.connect() as con:
             migrate(con)
             con.executescript(_REQUIREMENT_RESOLVER_DDL)
+            con.executescript(_INTERACTION_INBOX_DDL)
 
     # -- instances -----------------------------------------------------
 
@@ -547,6 +595,150 @@ class ContinuationStore:
         d["conditions"] = json.loads(d.pop("conditions_json") or "{}")
         d["decision"] = json.loads(d.pop("decision_json") or "{}")
         d["enabled"] = bool(d["enabled"])
+        return d
+
+    # -- interaction inbox (interaction.py) --------------------------------
+
+    def create_interaction_case(
+        self,
+        *,
+        id: str,
+        endpoint: str,
+        batch_key: str,
+        state: str = "collecting",
+        question_count: int = 0,
+        created_at: float | None = None,
+    ) -> dict[str, Any]:
+        self.init()
+        now = created_at if created_at is not None else time.time()
+        with self.connect() as con:
+            con.execute(
+                """
+                insert into interaction_cases(
+                    id, endpoint, batch_key, state, question_count, created_at
+                ) values(?, ?, ?, ?, ?, ?)
+                """,
+                (id, endpoint, batch_key, state, question_count, now),
+            )
+            row = con.execute("select * from interaction_cases where id=?", (id,)).fetchone()
+        return dict(row)
+
+    def get_interaction_case(self, case_id: str) -> dict[str, Any] | None:
+        self.init()
+        with self.connect() as con:
+            row = con.execute("select * from interaction_cases where id=?", (case_id,)).fetchone()
+        return dict(row) if row else None
+
+    def list_interaction_cases(self, *, state: str | None = None, endpoint: str | None = None) -> list[dict[str, Any]]:
+        self.init()
+        query = "select * from interaction_cases where 1=1"
+        params: list[Any] = []
+        if state:
+            query += " and state=?"
+            params.append(state)
+        if endpoint:
+            query += " and endpoint=?"
+            params.append(endpoint)
+        query += " order by created_at"
+        with self.connect() as con:
+            rows = con.execute(query, params).fetchall()
+        return [dict(r) for r in rows]
+
+    def update_interaction_case(
+        self,
+        case_id: str,
+        *,
+        state: str | None = None,
+        question_count: int | None = None,
+        asked_at: float | None = None,
+        answered_at: float | None = None,
+        applied_at: float | None = None,
+    ) -> dict[str, Any]:
+        self.init()
+        with self.connect() as con:
+            con.execute(
+                """
+                update interaction_cases set
+                    state = coalesce(?, state),
+                    question_count = coalesce(?, question_count),
+                    asked_at = coalesce(?, asked_at),
+                    answered_at = coalesce(?, answered_at),
+                    applied_at = coalesce(?, applied_at)
+                where id=?
+                """,
+                (state, question_count, asked_at, answered_at, applied_at, case_id),
+            )
+            row = con.execute("select * from interaction_cases where id=?", (case_id,)).fetchone()
+        return dict(row) if row else {}
+
+    def add_interaction_member(
+        self, case_id: str, *, continuation_id: int, requirements: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        self.init()
+        now = time.time()
+        with self.connect() as con:
+            con.execute(
+                """
+                insert into interaction_members(case_id, continuation_id, requirement_names_json, created_at)
+                values(?, ?, ?, ?)
+                on conflict(case_id, continuation_id) do update set
+                    requirement_names_json = excluded.requirement_names_json
+                """,
+                (case_id, continuation_id, json.dumps(requirements, ensure_ascii=False), now),
+            )
+            row = con.execute(
+                "select * from interaction_members where case_id=? and continuation_id=?",
+                (case_id, continuation_id),
+            ).fetchone()
+        return self._member_row_to_dict(row)
+
+    def list_interaction_members(self, case_id: str) -> list[dict[str, Any]]:
+        self.init()
+        with self.connect() as con:
+            rows = con.execute(
+                "select * from interaction_members where case_id=? order by id", (case_id,)
+            ).fetchall()
+        return [self._member_row_to_dict(r) for r in rows]
+
+    @staticmethod
+    def _member_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+        d = dict(row)
+        d["requirements"] = json.loads(d.pop("requirement_names_json") or "[]")
+        return d
+
+    def record_inbound_reply_receipt(
+        self, case_id: str, *, message_ref: str, content_sha256: str, compile_result: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Persist reply provenance only: a content hash and message ref, plus
+        the already-validated typed compile result. Raw user text is never
+        passed to or stored by this method (plan 6/7: raw text is not the
+        receipt)."""
+        self.init()
+        now = time.time()
+        with self.connect() as con:
+            cur = con.execute(
+                """
+                insert into inbound_reply_receipts(
+                    case_id, message_ref, content_sha256, compile_result_json, created_at
+                ) values(?, ?, ?, ?, ?)
+                """,
+                (case_id, message_ref, content_sha256, json.dumps(compile_result, ensure_ascii=False), now),
+            )
+            row = con.execute("select * from inbound_reply_receipts where id=?", (cur.lastrowid,)).fetchone()
+        return self._reply_receipt_row_to_dict(row)
+
+    def list_inbound_reply_receipts(self, case_id: str) -> list[dict[str, Any]]:
+        self.init()
+        with self.connect() as con:
+            rows = con.execute(
+                "select * from inbound_reply_receipts where case_id=? order by id", (case_id,)
+            ).fetchall()
+        return [self._reply_receipt_row_to_dict(r) for r in rows]
+
+    @staticmethod
+    def _reply_receipt_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+        d = dict(row)
+        d["compile_result"] = json.loads(d.pop("compile_result_json") or "{}")
         return d
 
 

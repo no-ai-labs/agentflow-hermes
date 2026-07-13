@@ -14,7 +14,9 @@ from typing import Any
 
 from ..continuation_store import ContinuationState, ContinuationStore
 from ..input_contract import InputContract
+from ..interaction import InteractionCase, InteractionInbox
 from ..outcome import ContinuationKind, OutcomeEnvelope
+from ..requirements import Requirement
 from .base import ContinuationPlan, StepResult
 
 
@@ -34,9 +36,15 @@ def _stable_digest(instance: dict[str, Any]) -> str:
     return hashlib.sha256(base.encode("utf-8")).hexdigest()[:16]
 
 
-def _owner_anchor_intent(instance: dict[str, Any], contract: InputContract, idempotency_key: str) -> dict[str, Any]:
+def _owner_anchor_intent(
+    instance: dict[str, Any],
+    contract: InputContract,
+    idempotency_key: str,
+    *,
+    interaction_case: InteractionCase | None = None,
+) -> dict[str, Any]:
     owner_fields = [f.name for f in contract.owner_fields()]
-    return {
+    payload: dict[str, Any] = {
         "kind": "owner_anchor",
         "title": f"[owner-input] {contract.contract_ref} evidence/approval anchor",
         "idempotency_key": idempotency_key,
@@ -49,6 +57,17 @@ def _owner_anchor_intent(instance: dict[str, Any], contract: InputContract, idem
         "required_owner_fields": owner_fields,
         "owner_anchor": True,
     }
+    if interaction_case is not None:
+        # Machine correlation metadata only (plan 6.4) — the human-facing
+        # question text stays clean of case_id/contract_ref/receipt syntax;
+        # the plugin/daemon use this block for correlation.
+        payload["agentflow_interaction"] = {
+            "case_id": interaction_case.id,
+            "origin_endpoint": interaction_case.origin_endpoint,
+            "continuation_ids": list(interaction_case.continuation_ids),
+            "reply_mode": "natural_language",
+        }
+    return payload
 
 
 def _apply_board_operation(
@@ -125,6 +144,10 @@ class OwnerInputHandler:
         store: ContinuationStore,
         adapter: Any,
         contract: InputContract,
+        interaction_inbox: InteractionInbox | None = None,
+        unresolved_requirements: tuple[Requirement, ...] = (),
+        owner_ref: str = "",
+        project_scope: str = "",
     ) -> ContinuationPlan:
         creation = store.create_instance(
             board=outcome.board,
@@ -147,8 +170,24 @@ class OwnerInputHandler:
 
         assert instance is not None
 
+        interaction_case: InteractionCase | None = None
+        if interaction_inbox is not None and unresolved_requirements:
+            # Batches this continuation into the Interaction Inbox (plan 6.2)
+            # instead of (or alongside) the single-question-per-continuation
+            # anchor below; opt-in only so every caller that omits
+            # interaction_inbox keeps the exact prior behavior.
+            authority_class = unresolved_requirements[0].authority
+            interaction_case = interaction_inbox.open_or_batch_case(
+                origin_endpoint=instance.get("origin_ref", ""),
+                owner_ref=owner_ref,
+                project_scope=project_scope,
+                authority_class=authority_class,
+                continuation_id=instance_id,
+                unresolved_fields=unresolved_requirements,
+            )
+
         anchor_key = f"owner_anchor:{_stable_digest(instance)}"
-        intent = _owner_anchor_intent(instance, contract, anchor_key)
+        intent = _owner_anchor_intent(instance, contract, anchor_key, interaction_case=interaction_case)
         step = store.add_step(instance_id, step_kind="owner_anchor", idempotency_key=anchor_key)
 
         if step["created"]:
