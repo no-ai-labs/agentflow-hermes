@@ -1,0 +1,116 @@
+#!/usr/bin/env python3
+"""agentflowd: the long-lived event-driven AgentFlow continuation runtime
+(plan section 9). Discovers every board under ``--boards-root`` (default
+``~/.hermes/kanban/boards``), routes terminal events through the unified
+handler router in ``agentflow_hermes.daemon``, and runs a periodic
+reconciliation pass.
+
+Wake source: Linux inotify is not wired here because it would require a
+non-stdlib dependency (or hand-rolled ctypes syscall bindings) for marginal
+benefit over a short coalescing poll loop; the plan explicitly allows "a
+one-second async scan if inotify unavailable" as the fallback (section 9.3),
+so this daemon always runs that fallback with a short interval
+(``--poll-interval-seconds``, default 0.5s) as its primary wake source. The
+five-minute reconciliation timer (``--reconcile-interval-seconds``) is the
+real recovery path per plan section 2.6, independent of the poll cadence.
+
+Safety: dry-run (in-memory FakeBoardAdapter) by default; ``--apply`` switches
+to the real gated CLI adapter that mutates the shared Kanban boards.
+"""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import os
+import sys
+from pathlib import Path
+
+_DEFAULT_REPO = Path(os.environ.get("AGENTFLOW_HERMES_REPO", "/home/duckran/dev/agentflow-hermes"))
+_REPO_ROOT = _DEFAULT_REPO if _DEFAULT_REPO.exists() else Path(__file__).resolve().parents[1]
+_SRC = _REPO_ROOT / "src"
+if str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
+
+from agentflow_hermes.daemon import (  # noqa: E402
+    AgentflowDaemon,
+    DaemonConfig,
+    SingleInstanceLock,
+    default_boards_root,
+    default_runtime_dir,
+)
+from agentflow_hermes.continuation_store import ContinuationStore  # noqa: E402
+
+_DEFAULT_OVERRIDES = _REPO_ROOT / "config" / "boards.yaml"
+_DEFAULT_CONTRACTS_DIR = _REPO_ROOT / "contracts"
+
+
+def build_daemon(args: argparse.Namespace) -> AgentflowDaemon:
+    store = ContinuationStore(Path(args.db)) if args.db else ContinuationStore.canonical()
+    config = DaemonConfig(
+        store=store,
+        boards_root=Path(args.boards_root),
+        overrides_path=Path(args.overrides) if args.overrides else None,
+        contracts_dir=Path(args.contracts_dir),
+        poll_interval_seconds=args.poll_interval_seconds,
+        reconcile_interval_seconds=args.reconcile_interval_seconds,
+        apply=args.apply,
+    )
+    return AgentflowDaemon(config)
+
+
+def _add_common_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--boards-root", default=str(default_boards_root()))
+    parser.add_argument("--overrides", default=str(_DEFAULT_OVERRIDES))
+    parser.add_argument("--contracts-dir", default=str(_DEFAULT_CONTRACTS_DIR))
+    parser.add_argument("--db", default="")
+    parser.add_argument("--apply", action="store_true", help="Mutate the real shared boards (default: dry-run).")
+    parser.add_argument("--poll-interval-seconds", type=float, default=0.5)
+    parser.add_argument("--reconcile-interval-seconds", type=float, default=300.0)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    run_p = sub.add_parser("run", help="Run the long-lived daemon loop.")
+    _add_common_args(run_p)
+    run_p.add_argument("--lock-file", default=str(default_runtime_dir() / "agentflowd.pid"))
+    run_p.add_argument("--max-ticks", type=int, default=None, help="Stop after N ticks (test/debug only).")
+
+    tick_p = sub.add_parser("tick", help="Run exactly one wake cycle and exit.")
+    _add_common_args(tick_p)
+
+    reconcile_p = sub.add_parser("reconcile", help="Run one reconciliation pass and exit.")
+    _add_common_args(reconcile_p)
+
+    args = parser.parse_args(argv)
+
+    if args.cmd == "run":
+        lock = SingleInstanceLock(Path(args.lock_file))
+        if not lock.acquire():
+            print("agentflowd: another instance already holds the lock", file=sys.stderr)
+            return 2
+        try:
+            daemon = build_daemon(args)
+            asyncio.run(daemon.run(max_ticks=args.max_ticks))
+        finally:
+            lock.release()
+        return 0
+
+    if args.cmd == "tick":
+        daemon = build_daemon(args)
+        report = daemon.tick()
+        print(report)
+        return 0
+
+    if args.cmd == "reconcile":
+        daemon = build_daemon(args)
+        report = daemon.reconcile()
+        print(report)
+        return 0
+
+    raise AssertionError(args.cmd)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

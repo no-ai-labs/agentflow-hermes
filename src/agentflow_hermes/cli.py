@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from pathlib import Path
 from typing import Sequence
 
 from .ack import AckError, parse_ack_block, validate_ack
@@ -35,10 +36,129 @@ from .maintenance.runner import run_runner_evaluate
 from .maintenance.trust import create_trust_grant, inspect_trust_grants, revoke_trust_grant
 from .maintenance.units import UnitRenderError
 from .store import AgentFlowStore, render_dispatch_prompt
+from .continuation_store import ContinuationStore
 
 
 def _dump(data: dict, **kwargs) -> str:
     return json.dumps(data, ensure_ascii=False, **kwargs)
+
+
+def _add_autopilot_args(parser: argparse.ArgumentParser) -> None:
+    """M27 zero-ceremony autopilot inspection commands (plan 12.2). All of
+    these are read-only against the canonical continuation store except
+    ``reconcile``, which runs one real (dry-run-by-default) recovery pass.
+    The system must work with agentflowd alone; these exist for debugging."""
+    sub = parser.add_subparsers(dest="autopilot_cmd", required=True)
+
+    status_p = sub.add_parser("status")
+    status_p.add_argument("--db", default="")
+
+    waiting_p = sub.add_parser("waiting")
+    waiting_p.add_argument("--db", default="")
+
+    explain_p = sub.add_parser("explain")
+    explain_p.add_argument("ref")
+    explain_p.add_argument("--db", default="")
+
+    sub.add_parser("policies").add_argument("--db", default="")
+
+    reconcile_p = sub.add_parser("reconcile")
+    reconcile_p.add_argument("--db", default="")
+    reconcile_p.add_argument("--boards-root", default="")
+    reconcile_p.add_argument("--overrides", default="")
+    reconcile_p.add_argument("--contracts-dir", default="")
+    reconcile_p.add_argument("--apply", action="store_true")
+
+
+def _autopilot_store(args: argparse.Namespace) -> ContinuationStore:
+    return ContinuationStore(Path(args.db)) if args.db else ContinuationStore.canonical()
+
+
+def run_autopilot_status(args: argparse.Namespace) -> tuple[int, dict]:
+    store = _autopilot_store(args)
+    by_board: dict[str, dict[str, int]] = {}
+    for inst in store.list_instances():
+        board = inst["board"] or "unknown"
+        bucket = by_board.setdefault(board, {"events": 0, "h0_auto": 0, "h1_asked": 0, "waiting": 0})
+        bucket["events"] += 1
+        if inst["state"] == "resumed":
+            bucket["h0_auto"] += 1
+        elif inst["state"] == "waiting_owner":
+            bucket["waiting"] += 1
+            bucket["h1_asked"] += 1
+    outbox_pending = len([o for o in store.list_outbox() if o["state"] == "pending"])
+    return 0, {"success": True, "boards": by_board, "outbox_pending": outbox_pending}
+
+
+def run_autopilot_waiting(args: argparse.Namespace) -> tuple[int, dict]:
+    from .interaction import InteractionInbox, compose_question
+
+    store = _autopilot_store(args)
+    inbox = InteractionInbox(store=store)
+    open_states = ("collecting", "asked", "needs_clarification")
+    waiting = [
+        {"case_id": c.id, "endpoint": c.origin_endpoint, "state": c.state, "question": compose_question(c)}
+        for c in inbox.list_cases()
+        if c.state in open_states
+    ]
+    return 0, {"success": True, "waiting": waiting}
+
+
+def run_autopilot_explain(args: argparse.Namespace) -> tuple[int, dict]:
+    from .interaction import InteractionInbox
+
+    store = _autopilot_store(args)
+    ref = args.ref
+    if ref.startswith("ic_"):
+        inbox = InteractionInbox(store=store)
+        case = inbox.get_case(ref)
+        if case is None:
+            return 2, {"success": False, "error": "unknown_case"}
+        return 0, {
+            "success": True,
+            "case": {
+                "id": case.id,
+                "endpoint": case.origin_endpoint,
+                "continuation_ids": list(case.continuation_ids),
+                "state": case.state,
+                "question_count": case.question_count,
+            },
+        }
+    try:
+        instance_id = int(ref)
+    except ValueError:
+        return 2, {"success": False, "error": "invalid_ref"}
+    instance = store.get_instance(instance_id)
+    if instance is None:
+        return 2, {"success": False, "error": "unknown_instance"}
+    return 0, {
+        "success": True,
+        "instance": instance,
+        "steps": store.list_steps(instance_id),
+        "events": store.list_events(instance_id),
+        "satisfactions": store.list_requirement_satisfactions(instance_id),
+        "receipts": store.list_owner_receipts(instance_id),
+    }
+
+
+def run_autopilot_policies(args: argparse.Namespace) -> tuple[int, dict]:
+    store = _autopilot_store(args)
+    return 0, {"success": True, "policies": store.list_standing_policies()}
+
+
+def run_autopilot_reconcile(args: argparse.Namespace) -> tuple[int, dict]:
+    from .daemon import AgentflowDaemon, DaemonConfig, default_boards_root
+
+    store = _autopilot_store(args)
+    config = DaemonConfig(
+        store=store,
+        boards_root=Path(args.boards_root) if args.boards_root else default_boards_root(),
+        overrides_path=Path(args.overrides) if args.overrides else None,
+        contracts_dir=Path(args.contracts_dir) if args.contracts_dir else None,
+        apply=args.apply,
+    )
+    report = AgentflowDaemon(config).reconcile()
+    return 0, report
 
 
 def _add_cron_ingest_args(parser: argparse.ArgumentParser) -> None:
@@ -191,6 +311,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     trust_revoke.add_argument("--config-file", required=True)
     trust_revoke.add_argument("--gateway", required=True)
     trust_revoke.add_argument("--write", action="store_true", default=False)
+
+    # M27 zero-ceremony autopilot inspection/control commands.
+    autopilot = sub.add_parser("autopilot")
+    _add_autopilot_args(autopilot)
 
     bridge_kanban = bridge_sub.add_parser("kanban")
     bridge_kanban_sub = bridge_kanban.add_subparsers(dest="bridge_kanban_cmd", required=True)
@@ -495,6 +619,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 2
         print(_dump(result))
         return 0
+    if args.cmd == "autopilot":
+        autopilot_handlers = {
+            "status": run_autopilot_status,
+            "waiting": run_autopilot_waiting,
+            "explain": run_autopilot_explain,
+            "policies": run_autopilot_policies,
+            "reconcile": run_autopilot_reconcile,
+        }
+        rc, report = autopilot_handlers[args.autopilot_cmd](args)
+        print(_dump(report))
+        return rc
     if args.cmd == "bridge" and args.bridge_cmd == "kanban":
         if args.bridge_kanban_cmd == "resolve-blocked":
             fixture = load_fixture(args.input_file)
