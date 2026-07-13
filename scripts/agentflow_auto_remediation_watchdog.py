@@ -2,9 +2,22 @@
 """Board-aware AgentFlow -> Hermes Kanban auto-remediation watchdog.
 
 M24B canary scope: oracle-lab only, board-scoped event state, no historical
-replay on activation. The planner dependency lives in the legacy AgentFlow repo;
-this wrapper is the narrow board/cron boundary and does not enable Discord live
-send.
+replay on activation. The planner dependency lives in the legacy AgentFlow repo
+(``agentflow.kanban_auto_remediation``), a separate domain-specific remediation
+planner outside this repo's ``continuation_engine`` router — CODE_FIX outcomes
+compiled by ``outcome_compiler``/routed by ``continuation_engine.ingest_board_once``
+are a distinct, generic code-BLOCK path; this script's oracle-lab-only legacy
+planner integration is intentionally left as-is rather than force-merged into
+that router, to avoid destabilizing the M24B canary's own tested behavior.
+
+M27 (plan section 9/14 commit 7): ``agentflowd`` is the primary event-driven
+runtime now; this script is a compatibility shim whose only remaining job is
+reconciliation — catching up ``last_seen_event_id`` if agentflowd/this cron
+was ever not running, never a low-latency primary path. Its own polling/state
+model (``STATE`` JSON file, board-scoped ``last_seen_event_id``) is unchanged;
+this docstring update reflects operating cadence, not a code migration.
+This wrapper is the narrow board/cron boundary and does not enable Discord
+live send.
 """
 from __future__ import annotations
 

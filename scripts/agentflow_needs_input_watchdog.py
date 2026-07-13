@@ -1,22 +1,32 @@
 #!/usr/bin/env python3
 """Global, registry-driven needs_input continuation watchdog.
 
-One no-agent runtime consumes live needs_input events for EVERY enabled board
-in the canonical board catalog (``config/boards.yaml``) — there is no per-board
-scanner script and no per-board cron. Each cadence it:
+M27 (plan section 9/14 commit 7): ``agentflowd`` is now the primary,
+event-driven path for every continuation kind (GO/CODE_FIX/NEEDS_INPUT/
+APPROVAL_REQUIRED/EXTERNAL_WAIT), reacting within seconds via
+``agentflow_hermes.daemon``. This script is kept as a thin, still-fully-
+functional COMPATIBILITY SHIM and reconciliation-only cadence: its job is to
+catch up the durable board cursor/outbox if agentflowd was ever down, not to
+be anyone's primary path. It intentionally still calls the exact same
+underlying router agentflowd uses — ``continuation_engine.ingest_all_boards``
+/ ``ingest_board_once`` — so there is exactly one router implementation
+behind both entrypoints (no parallel/duplicate routing logic). Each cadence it:
 
   1. loads the declarative board registry + versioned InputContracts,
   2. runs the single board-aware scan loop (``ingest_all_boards``) over a
      read-only live per-board Kanban sqlite source,
   3. seeds a never-before-seen board's cursor to its current max event (no
      historical replay), and
-  4. plans owner-input continuations for needs_input outcomes.
+  4. plans owner-input continuations for needs_input outcomes (or, with
+     ``--all-kinds``, every kind the unified router understands).
 
-Enrolling a future board is purely additive: add it to ``config/boards.yaml``.
+Enrolling a future board is purely additive: add it to ``config/boards.yaml``,
+or — since M27 commit 6 — do nothing at all, since agentflowd auto-discovers
+every board under ``~/.hermes/kanban/boards``.
 
 Output discipline: stdout ONLY for material owner-input/GO/BLOCK creation.
 When a cadence produces nothing new the watchdog is silent (exit 0, no output),
-so it is safe to run on a tight cron without log spam.
+so it is safe to run on a tight cron/timer without log spam.
 
 Safety: dry-run by default (in-memory FakeBoardAdapter, no board mutation).
 ``--apply`` switches to the real gated CLI adapter that mutates the shared
