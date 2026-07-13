@@ -13,6 +13,7 @@ from .continuation_cli import (
     run_continuation_doctor,
     run_continuation_ingest,
     run_continuation_list,
+    run_continuation_migrate_store,
     run_continuation_retry,
     run_continuation_show,
     run_continuation_submit,
@@ -75,6 +76,8 @@ def _autopilot_store(args: argparse.Namespace) -> ContinuationStore:
 
 
 def run_autopilot_status(args: argparse.Namespace) -> tuple[int, dict]:
+    from .continuation_store import legacy_residue_report
+
     store = _autopilot_store(args)
     by_board: dict[str, dict[str, int]] = {}
     for inst in store.list_instances():
@@ -87,7 +90,13 @@ def run_autopilot_status(args: argparse.Namespace) -> tuple[int, dict]:
             bucket["waiting"] += 1
             bucket["h1_asked"] += 1
     outbox_pending = len([o for o in store.list_outbox() if o["state"] == "pending"])
-    return 0, {"success": True, "boards": by_board, "outbox_pending": outbox_pending}
+    return 0, {
+        "success": True,
+        "boards": by_board,
+        "outbox_pending": outbox_pending,
+        "db": str(store.path),
+        "legacy_residue": legacy_residue_report(),
+    }
 
 
 def run_autopilot_waiting(args: argparse.Namespace) -> tuple[int, dict]:
@@ -545,6 +554,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "submit": run_continuation_submit,
             "retry": run_continuation_retry,
             "doctor": run_continuation_doctor,
+            "migrate-store": run_continuation_migrate_store,
         }
         rc, report = handlers[args.continuation_cmd](args)
         print(_dump(report))

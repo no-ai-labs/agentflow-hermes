@@ -14,7 +14,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from .migrations import migrate
+from .migrations import CONTINUATION_LEDGER_TABLES, migrate
 from .store import default_db_path as fallback_job_db_path
 
 # Human Effort Resolver / Standing Policy control-plane tables (plan section
@@ -106,6 +106,22 @@ create index if not exists idx_interaction_members_continuation on interaction_m
 create index if not exists idx_inbound_reply_receipts_case on inbound_reply_receipts(case_id);
 """
 
+# Canonical control-plane store migration receipts (plan section 10):
+# records every ``migrate_legacy_store`` run so an operator/doctor surface
+# can see what was migrated and when without re-scanning the legacy DB. Same
+# idempotent-DDL pattern as the two blocks above.
+_STORE_MIGRATION_DDL = """
+create table if not exists store_migration_receipts (
+    id integer primary key autoincrement,
+    legacy_path text not null,
+    migrated_at real not null,
+    counts_json text not null default '{}',
+    verification_json text not null default '{}'
+);
+
+create index if not exists idx_store_migration_receipts_path on store_migration_receipts(legacy_path, migrated_at);
+"""
+
 
 class ContinuationState(str, Enum):
     DETECTED = "detected"
@@ -159,6 +175,32 @@ def fallback_continuation_db_path() -> Path:
     return fallback_job_db_path()
 
 
+def legacy_needs_input_db_path() -> Path:
+    """The M26 needs-input watchdog's historical default DB (plan 1.7/10):
+    ``scripts/agentflow_needs_input_watchdog.py`` reads
+    ``AGENTFLOW_NEEDS_INPUT_DB`` or falls back to this fixed path. Same shape
+    as the canonical store (a plain ``ContinuationStore``), just a different
+    physical file — never touched implicitly, only read when an operator
+    runs ``continuation migrate-store`` or ``continuation doctor``."""
+    explicit = os.environ.get("AGENTFLOW_NEEDS_INPUT_DB")
+    if explicit:
+        return Path(explicit)
+    return default_continuation_home() / "state" / "agentflow_needs_input_continuations.sqlite"
+
+
+def default_legacy_continuation_db_paths() -> tuple[Path, ...]:
+    """Every known historical continuation-store location (plan 1.7): the
+    M26 needs-input watchdog DB and the older shared jobs.db fallback path.
+    Deduplicated and never including the canonical path itself."""
+    canonical = default_continuation_db_path()
+    candidates = (legacy_needs_input_db_path(), fallback_continuation_db_path())
+    seen: list[Path] = []
+    for path in candidates:
+        if path != canonical and path not in seen:
+            seen.append(path)
+    return tuple(seen)
+
+
 @dataclass(frozen=True)
 class ContinuationStore:
     path: Path
@@ -178,6 +220,7 @@ class ContinuationStore:
             migrate(con)
             con.executescript(_REQUIREMENT_RESOLVER_DDL)
             con.executescript(_INTERACTION_INBOX_DDL)
+            con.executescript(_STORE_MIGRATION_DDL)
 
     # -- instances -----------------------------------------------------
 
@@ -741,6 +784,21 @@ class ContinuationStore:
         d["compile_result"] = json.loads(d.pop("compile_result_json") or "{}")
         return d
 
+    # -- store migration receipts (plan section 10) -------------------------
+
+    def list_migration_receipts(self) -> list[dict[str, Any]]:
+        self.init()
+        with self.connect() as con:
+            rows = con.execute("select * from store_migration_receipts order by id").fetchall()
+        return [self._migration_receipt_row_to_dict(r) for r in rows]
+
+    @staticmethod
+    def _migration_receipt_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+        d = dict(row)
+        d["counts"] = json.loads(d.pop("counts_json") or "{}")
+        d["verification"] = json.loads(d.pop("verification_json") or "{}")
+        return d
+
 
 def _has_active_continuation_state(path: Path) -> bool:
     if not path.exists():
@@ -803,4 +861,237 @@ def doctor_store_selection(
         "split_brain": False,
         "canonical_active": canonical_active,
         "fallback_active": fallback_active,
+    }
+
+
+def legacy_residue_report(*, paths: tuple[Path, ...] | None = None) -> list[dict[str, Any]]:
+    """Report stale legacy continuation-store residue without requiring
+    manual cleanup (plan section 10 item 6): for every known legacy path
+    that still exists and looks like a ``ContinuationStore``-shaped DB,
+    count total and still-active (non-terminal) ``continuation_instances``
+    rows. Read-only — never mutates the legacy DB."""
+    report: list[dict[str, Any]] = []
+    for path in (paths if paths is not None else default_legacy_continuation_db_paths()):
+        if not path.exists():
+            continue
+        con = sqlite3.connect(path)
+        try:
+            con.row_factory = sqlite3.Row
+            tables = {r[0] for r in con.execute("select name from sqlite_master where type='table'").fetchall()}
+            if "continuation_instances" not in tables:
+                continue
+            terminal = tuple(s.value for s in TERMINAL_STATES)
+            placeholders = ",".join("?" for _ in terminal)
+            total = int(con.execute("select count(*) as n from continuation_instances").fetchone()["n"])
+            active = int(
+                con.execute(
+                    f"select count(*) as n from continuation_instances where state not in ({placeholders})", terminal
+                ).fetchone()["n"]
+            )
+            report.append({"path": str(path), "total_rows": total, "active_rows": active})
+        finally:
+            con.close()
+    return report
+
+
+def _verify_migration(canonical: "ContinuationStore", *, legacy_path: Path, id_map: dict[int, int]) -> dict[str, Any]:
+    """Post-copy verification (plan section 10 item 3): every legacy
+    ``continuation_instances`` row must have a canonical mapping, and the
+    canonical store's own unique source tuple must never hold duplicates."""
+    legacy_con = sqlite3.connect(legacy_path)
+    legacy_con.row_factory = sqlite3.Row
+    try:
+        legacy_instance_ids = [r["id"] for r in legacy_con.execute("select id from continuation_instances").fetchall()]
+    finally:
+        legacy_con.close()
+    missing = [lid for lid in legacy_instance_ids if lid not in id_map]
+    with canonical.connect() as con:
+        dup_rows = con.execute(
+            """
+            select board, source_task_id, source_event_id, contract_ref, count(*) as n
+            from continuation_instances
+            group by board, source_task_id, source_event_id, contract_ref
+            having n > 1
+            """
+        ).fetchall()
+    return {
+        "ok": not missing and not dup_rows,
+        "legacy_instances": len(legacy_instance_ids),
+        "mapped_instances": len(id_map),
+        "missing_instance_ids": missing,
+        "duplicate_source_tuples": len(dup_rows),
+    }
+
+
+def _record_migration_receipt(
+    canonical: "ContinuationStore", *, legacy_path: Path, counts: dict[str, int], verification: dict[str, Any]
+) -> dict[str, Any]:
+    now = time.time()
+    with canonical.connect() as con:
+        cur = con.execute(
+            "insert into store_migration_receipts(legacy_path, migrated_at, counts_json, verification_json) values(?,?,?,?)",
+            (str(legacy_path), now, json.dumps(counts, ensure_ascii=False), json.dumps(verification, ensure_ascii=False)),
+        )
+        row = con.execute("select * from store_migration_receipts where id=?", (cur.lastrowid,)).fetchone()
+    return ContinuationStore._migration_receipt_row_to_dict(row)
+
+
+def migrate_legacy_store(*, canonical: "ContinuationStore", legacy_path: Path) -> dict[str, Any]:
+    """Copy instances/steps/receipts/events/cursors/outbox from one legacy
+    ``ContinuationStore``-shaped DB into ``canonical`` (plan section 10,
+    commit 8). Idempotent: every write is guarded by the same unique
+    constraints/dedupe keys the live store already relies on (source tuple
+    for instances, ``idempotency_key``/``(continuation_id, seq|version)`` for
+    steps/events/receipts/outbox, ``(board, db_identity)`` upsert-max for
+    cursors), so running this twice against the same legacy DB never
+    duplicates a row. Writes exactly one migration receipt row per run."""
+    legacy_path = Path(legacy_path)
+    if not legacy_path.exists():
+        return {"success": True, "migrated": False, "reason": "legacy_path_missing", "legacy_path": str(legacy_path)}
+    canonical.init()
+    if legacy_path.resolve() == canonical.path.resolve():
+        return {"success": True, "migrated": False, "reason": "legacy_path_is_canonical", "legacy_path": str(legacy_path)}
+
+    legacy_con = sqlite3.connect(legacy_path)
+    legacy_con.row_factory = sqlite3.Row
+    try:
+        tables = {r[0] for r in legacy_con.execute("select name from sqlite_master where type='table'").fetchall()}
+        if "continuation_instances" not in tables:
+            return {"success": True, "migrated": False, "reason": "no_continuation_tables", "legacy_path": str(legacy_path)}
+
+        id_map: dict[int, int] = {}
+        counts = {"instances": 0, "steps": 0, "receipts": 0, "events": 0, "cursors": 0, "outbox": 0}
+
+        with canonical.connect() as con:
+            for row in legacy_con.execute("select * from continuation_instances order by id"):
+                existing = con.execute(
+                    "select id from continuation_instances where board=? and source_task_id=? and source_event_id=? and contract_ref=?",
+                    (row["board"], row["source_task_id"], row["source_event_id"], row["contract_ref"]),
+                ).fetchone()
+                if existing is not None:
+                    id_map[row["id"]] = existing["id"]
+                    continue
+                cur = con.execute(
+                    """
+                    insert into continuation_instances(
+                        board, source_task_id, source_event_id, source_graph_id, contract_ref, verdict,
+                        continuation_kind, state, origin_ref, return_to_ref, workspace_ref, idempotency_key,
+                        created_at, updated_at
+                    ) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        row["board"], row["source_task_id"], row["source_event_id"], row["source_graph_id"],
+                        row["contract_ref"], row["verdict"], row["continuation_kind"], row["state"],
+                        row["origin_ref"], row["return_to_ref"], row["workspace_ref"], row["idempotency_key"],
+                        row["created_at"], row["updated_at"],
+                    ),
+                )
+                id_map[row["id"]] = cur.lastrowid
+                counts["instances"] += 1
+
+            for row in legacy_con.execute("select * from continuation_steps order by id"):
+                new_cid = id_map.get(row["continuation_id"])
+                if new_cid is None:
+                    continue
+                cur = con.execute(
+                    """
+                    insert or ignore into continuation_steps(
+                        continuation_id, step_kind, state, board_task_id, parent_step_id, idempotency_key,
+                        created_at, updated_at
+                    ) values(?,?,?,?,?,?,?,?)
+                    """,
+                    (new_cid, row["step_kind"], row["state"], row["board_task_id"], row["parent_step_id"],
+                     row["idempotency_key"], row["created_at"], row["updated_at"]),
+                )
+                counts["steps"] += max(cur.rowcount, 0)
+
+            for row in legacy_con.execute("select * from owner_input_receipts order by id"):
+                new_cid = id_map.get(row["continuation_id"])
+                if new_cid is None:
+                    continue
+                cur = con.execute(
+                    """
+                    insert or ignore into owner_input_receipts(
+                        continuation_id, version, owner_ref, fields_json, source_ref, created_at, supersedes_receipt_id
+                    ) values(?,?,?,?,?,?,?)
+                    """,
+                    (new_cid, row["version"], row["owner_ref"], row["fields_json"], row["source_ref"],
+                     row["created_at"], row["supersedes_receipt_id"]),
+                )
+                counts["receipts"] += max(cur.rowcount, 0)
+
+            for row in legacy_con.execute("select * from continuation_events order by id"):
+                new_cid = id_map.get(row["continuation_id"])
+                if new_cid is None:
+                    continue
+                cur = con.execute(
+                    """
+                    insert or ignore into continuation_events(
+                        continuation_id, seq, kind, payload_json, created_at
+                    ) values(?,?,?,?,?)
+                    """,
+                    (new_cid, row["seq"], row["kind"], row["payload_json"], row["created_at"]),
+                )
+                counts["events"] += max(cur.rowcount, 0)
+
+            for row in legacy_con.execute("select * from board_cursors"):
+                existing = con.execute(
+                    "select last_event_id from board_cursors where board=? and db_identity=?",
+                    (row["board"], row["db_identity"]),
+                ).fetchone()
+                new_value = max(int(existing["last_event_id"]) if existing else 0, int(row["last_event_id"]))
+                con.execute(
+                    """
+                    insert into board_cursors(board, db_identity, last_event_id, updated_at) values(?,?,?,?)
+                    on conflict(board, db_identity) do update set
+                        last_event_id = excluded.last_event_id,
+                        updated_at = excluded.updated_at
+                    where excluded.last_event_id > board_cursors.last_event_id
+                    """,
+                    (row["board"], row["db_identity"], new_value, row["updated_at"]),
+                )
+                counts["cursors"] += 1
+
+            for row in legacy_con.execute("select * from board_outbox order by id"):
+                new_cid = id_map.get(row["continuation_id"])
+                if new_cid is None:
+                    continue
+                cur = con.execute(
+                    """
+                    insert or ignore into board_outbox(
+                        continuation_id, step_id, operation, payload_json, idempotency_key, state, board_task_id,
+                        attempts, created_at, updated_at
+                    ) values(?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (new_cid, row["step_id"], row["operation"], row["payload_json"], row["idempotency_key"],
+                     row["state"], row["board_task_id"], row["attempts"], row["created_at"], row["updated_at"]),
+                )
+                counts["outbox"] += max(cur.rowcount, 0)
+    finally:
+        legacy_con.close()
+
+    verification = _verify_migration(canonical, legacy_path=legacy_path, id_map=id_map)
+    receipt = _record_migration_receipt(canonical, legacy_path=legacy_path, counts=counts, verification=verification)
+    return {
+        "success": verification["ok"],
+        "migrated": True,
+        "legacy_path": str(legacy_path),
+        "counts": counts,
+        "verification": verification,
+        "receipt": receipt,
+    }
+
+
+def migrate_all_legacy_stores(
+    *, canonical: "ContinuationStore | None" = None, legacy_paths: tuple[Path, ...] | None = None
+) -> dict[str, Any]:
+    """Run ``migrate_legacy_store`` against every known legacy path (plan
+    section 10) and return one combined report."""
+    store = canonical or ContinuationStore.canonical()
+    paths = legacy_paths if legacy_paths is not None else default_legacy_continuation_db_paths()
+    results = [migrate_legacy_store(canonical=store, legacy_path=path) for path in paths]
+    return {
+        "success": all(r["success"] for r in results),
+        "canonical_db": str(store.path),
+        "results": results,
     }

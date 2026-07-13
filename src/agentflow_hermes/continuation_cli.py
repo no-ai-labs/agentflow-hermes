@@ -18,7 +18,15 @@ from .board_adapter import FakeBoardAdapter, RealBoardAdapter
 from .board_events import BoardEvent, FakeBoardEventSource
 from .continuation_config import ContractRegistry, UnknownContractError, load_contract_registry
 from .continuation_engine import ingest_board_once
-from .continuation_store import ContinuationState, ContinuationStore, doctor_store_selection
+from .continuation_store import (
+    ContinuationState,
+    ContinuationStore,
+    default_legacy_continuation_db_paths,
+    doctor_store_selection,
+    legacy_residue_report,
+    migrate_all_legacy_stores,
+    migrate_legacy_store,
+)
 from .live.sanitize import safe_event_payload
 
 _DEFAULT_CONTRACTS_DIR = Path(__file__).resolve().parents[2] / "contracts"
@@ -86,6 +94,10 @@ def add_continuation_cli_args(sub: argparse._SubParsersAction) -> None:
     doctor = sub.add_parser("doctor")
     doctor.add_argument("--db", default="")
     doctor.add_argument("--fallback-db", default="")
+
+    migrate_store = sub.add_parser("migrate-store")
+    migrate_store.add_argument("--db", default="")
+    migrate_store.add_argument("--legacy-db", action="append", default=None)
 
 
 def run_continuation_ingest(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
@@ -234,4 +246,16 @@ def run_continuation_doctor(args: argparse.Namespace) -> tuple[int, dict[str, An
         canonical_path=Path(args.db) if args.db else None,
         fallback_path=Path(args.fallback_db) if args.fallback_db else None,
     )
+    # Report stale legacy state without requiring manual cleanup (plan
+    # section 10 item 6): every known legacy path's residue, even ones
+    # doctor_store_selection itself never inspects (e.g. the M26 needs-input
+    # watchdog DB).
+    result["legacy_residue"] = legacy_residue_report()
+    return (0 if result.get("success") else 2), result
+
+
+def run_continuation_migrate_store(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
+    canonical = ContinuationStore(Path(args.db)) if args.db else ContinuationStore.canonical()
+    legacy_paths = tuple(Path(p) for p in args.legacy_db) if args.legacy_db else default_legacy_continuation_db_paths()
+    result = migrate_all_legacy_stores(canonical=canonical, legacy_paths=legacy_paths)
     return (0 if result.get("success") else 2), result

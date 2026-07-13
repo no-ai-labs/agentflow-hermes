@@ -126,6 +126,49 @@ def test_doctor_reports_selected_store(tmp_path, capsys):
     assert rc == 0
     assert report["success"] is True
     assert "selected" in report
+    assert "legacy_residue" in report
+
+
+def test_migrate_store_cli_copies_from_explicit_legacy_db(tmp_path, capsys):
+    legacy_path = tmp_path / "legacy.sqlite"
+    legacy_store = ContinuationStore(legacy_path)
+    legacy_store.create_instance(
+        board="warroom-os", source_task_id="t_legacy", source_event_id="ev_legacy",
+        contract_ref="generic.owner-input.v1", continuation_kind="needs_input",
+    )
+
+    canonical_db = tmp_path / "canonical.sqlite"
+    rc = cli.main([
+        "continuation", "migrate-store", "--db", str(canonical_db), "--legacy-db", str(legacy_path),
+    ])
+    out = capsys.readouterr().out
+    report = json.loads(out.strip().splitlines()[-1])
+
+    assert rc == 0
+    assert report["success"] is True
+    assert len(report["results"]) == 1
+    assert report["results"][0]["counts"]["instances"] == 1
+
+    canonical = ContinuationStore(canonical_db)
+    assert len(canonical.list_instances()) == 1
+
+
+def test_migrate_store_cli_is_idempotent(tmp_path, capsys):
+    legacy_path = tmp_path / "legacy.sqlite"
+    ContinuationStore(legacy_path).create_instance(
+        board="warroom-os", source_task_id="t_legacy", source_event_id="ev_legacy",
+        contract_ref="generic.owner-input.v1", continuation_kind="needs_input",
+    )
+    canonical_db = tmp_path / "canonical.sqlite"
+    argv = ["continuation", "migrate-store", "--db", str(canonical_db), "--legacy-db", str(legacy_path)]
+
+    assert cli.main(argv) == 0
+    capsys.readouterr()
+    assert cli.main(argv) == 0
+    capsys.readouterr()
+
+    canonical = ContinuationStore(canonical_db)
+    assert len(canonical.list_instances()) == 1
 
 
 def test_retry_reconciles_pending_outbox_create_and_subscribe(tmp_path, capsys):

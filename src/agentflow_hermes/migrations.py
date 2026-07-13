@@ -252,6 +252,22 @@ create index if not exists idx_board_outbox_continuation on board_outbox(continu
 
 STEPS = [(1, SQL_V1), (2, SQL_V2), (3, SQL_V3), (4, SQL_V4), (5, SQL_V5)]
 
+# Portable continuation-ledger tables introduced by SQL_V5. This migration
+# chain is shared by both ``AgentFlowStore`` (jobs.db) and
+# ``ContinuationStore`` (agentflow.sqlite) — SCHEMA_VERSION cannot be bumped
+# per-store, so control-plane store consolidation (plan section 10:
+# ``agentflow-hermes continuation migrate-store``) copies exactly these
+# tables row-by-row between physical DB files rather than adding a new
+# migration step here. See ``continuation_store.migrate_legacy_store``.
+CONTINUATION_LEDGER_TABLES: tuple[str, ...] = (
+    "continuation_instances",
+    "continuation_steps",
+    "owner_input_receipts",
+    "continuation_events",
+    "board_cursors",
+    "board_outbox",
+)
+
 
 def migrate(con) -> int:
     """Apply pending migrations in order and return final schema version."""
