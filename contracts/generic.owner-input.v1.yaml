@@ -10,11 +10,24 @@ resume_transition: generic.owner-input.resume
 # owner input generically. It intentionally declares no artifacts: the generic
 # resume path materializes exactly one action/resume task carrying a sanitized
 # receipt reference rather than writing domain evidence files.
+#
+# dynamic_fields: true marks that this contract's field list is a template,
+# not a fixed pair of fields. At runtime, InputContract.dynamic_owner_input()
+# (see input_contract.py) derives the actual field list from the outcome's
+# ``requirements`` (RequirementKind FACT/EVIDENCE/PREFERENCE/AUTHORIZATION/
+# CORRECTION) so this contract can express "provide the URL", "choose A/B",
+# "confirm this artifact", or "correct this identifier" without a bespoke
+# domain contract. The static fields below remain only as the fallback shape
+# used when an outcome supplies no typed requirements at all (a bare
+# approve/reject decision with a confirming boolean).
+dynamic_fields: true
 
 fields:
   owner_decision:
     authority: owner
     type: enum
+    kind: preference
+    question: "승인/거절/수정 중 어떤 결정인가요?"
     allowed_values:
       - approve
       - reject
@@ -22,3 +35,5 @@ fields:
   owner_confirmation:
     authority: owner
     type: boolean
+    kind: authorization
+    question: "이 결정을 확정할까요?"

@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
+from .requirements import Requirement, RequirementKind
+
 
 class FieldAuthority(str, Enum):
     SYSTEM = "system"
@@ -27,6 +29,13 @@ class InputField:
     allowed_values: tuple[str, ...] = ()
     description: str = ""
     secret: bool = False
+    # Additional semantic axis (what KIND of thing this field is), independent
+    # of ``authority`` (WHO may set it) — see requirements.py. Natural-language
+    # question/answer_hint let a field be rendered/parsed as human prose
+    # without changing the typed validation contract below.
+    kind: RequirementKind = RequirementKind.FACT
+    question: str = ""
+    answer_hint: str = ""
 
 
 @dataclass(frozen=True)
@@ -52,6 +61,32 @@ class InputContract:
 
     def owner_fields(self) -> tuple[InputField, ...]:
         return tuple(f for f in self.fields if f.authority == FieldAuthority.OWNER)
+
+    @classmethod
+    def dynamic_owner_input(
+        cls,
+        *,
+        contract_ref: str,
+        owner_role: str,
+        resume_transition: str,
+        requirements: tuple[Requirement, ...],
+        version: int = 1,
+    ) -> "InputContract":
+        """Build an InputContract whose field list is a template derived at
+        runtime from the outcome's requirements, instead of one fixed
+        approve+boolean-only shape. Every requirement kind maps to an
+        InputField carrying the same natural-language question/answer_hint so
+        a generic contract can express "provide the URL", "choose A/B",
+        "confirm this artifact", or "correct this identifier" without a
+        bespoke domain contract."""
+        return cls(
+            contract_ref=contract_ref,
+            version=version,
+            owner_role=owner_role,
+            fields=tuple(_field_from_requirement(r) for r in requirements),
+            artifacts=(),
+            resume_transition=resume_transition,
+        )
 
     def validate_owner_submission(self, values: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
         """Validate a candidate owner submission against this contract.
@@ -87,3 +122,18 @@ class InputContract:
         if errors:
             return {}, errors
         return clean, []
+
+
+def _field_from_requirement(requirement: Requirement) -> InputField:
+    value_type = "enum" if requirement.allowed_values else "text"
+    return InputField(
+        name=requirement.name,
+        value_type=value_type,
+        authority=FieldAuthority(requirement.authority),
+        required=requirement.required,
+        allowed_values=requirement.allowed_values,
+        description=requirement.description,
+        kind=requirement.kind,
+        question=requirement.question,
+        answer_hint=requirement.answer_hint,
+    )
