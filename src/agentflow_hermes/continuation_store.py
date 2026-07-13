@@ -17,6 +17,48 @@ from typing import Any
 from .migrations import migrate
 from .store import default_db_path as fallback_job_db_path
 
+# Human Effort Resolver / Standing Policy control-plane tables (plan section
+# 10). Scoped to ContinuationStore only (not the shared jobs.db migration
+# chain in migrations.py, which AgentFlowStore also uses) — applied via
+# idempotent DDL rather than bumping the shared SCHEMA_VERSION. Refs, hashes,
+# and short sanitized values only; never raw transcripts.
+_REQUIREMENT_RESOLVER_DDL = """
+create table if not exists requirement_satisfactions (
+    id integer primary key autoincrement,
+    continuation_id integer not null,
+    field_name text not null,
+    value_json text not null default 'null',
+    source_kind text not null,
+    source_ref text not null default '',
+    policy_id text not null default '',
+    created_at real not null,
+    foreign key(continuation_id) references continuation_instances(id)
+);
+
+create table if not exists standing_policies (
+    id integer primary key autoincrement,
+    policy_id text not null,
+    version integer not null default 1,
+    owner_ref text not null default '',
+    project_scope text not null default '',
+    action_scope text not null default '',
+    conditions_json text not null default '{}',
+    decision_json text not null default '{}',
+    enabled integer not null default 1,
+    source_message_ref text not null default '',
+    created_at real not null
+);
+
+create unique index if not exists uniq_requirement_satisfaction
+    on requirement_satisfactions(continuation_id, field_name);
+create index if not exists idx_requirement_satisfactions_continuation
+    on requirement_satisfactions(continuation_id);
+create unique index if not exists uniq_standing_policy_version
+    on standing_policies(policy_id, version);
+create index if not exists idx_standing_policies_scope
+    on standing_policies(owner_ref, project_scope, action_scope, enabled);
+"""
+
 
 class ContinuationState(str, Enum):
     DETECTED = "detected"
@@ -87,6 +129,7 @@ class ContinuationStore:
     def init(self) -> None:
         with self.connect() as con:
             migrate(con)
+            con.executescript(_REQUIREMENT_RESOLVER_DDL)
 
     # -- instances -----------------------------------------------------
 
@@ -394,6 +437,117 @@ class ContinuationStore:
             else:
                 rows = con.execute("select * from board_outbox order by id").fetchall()
         return [dict(r) for r in rows]
+
+    # -- requirement satisfactions (requirement_resolver.py) --------------
+
+    def record_requirement_satisfaction(
+        self,
+        instance_id: int,
+        *,
+        field_name: str,
+        value: Any,
+        source_kind: str,
+        source_ref: str = "",
+        policy_id: str = "",
+    ) -> dict[str, Any]:
+        self.init()
+        now = time.time()
+        with self.connect() as con:
+            con.execute(
+                """
+                insert into requirement_satisfactions(
+                    continuation_id, field_name, value_json, source_kind, source_ref, policy_id, created_at
+                ) values(?, ?, ?, ?, ?, ?, ?)
+                on conflict(continuation_id, field_name) do update set
+                    value_json=excluded.value_json,
+                    source_kind=excluded.source_kind,
+                    source_ref=excluded.source_ref,
+                    policy_id=excluded.policy_id,
+                    created_at=excluded.created_at
+                """,
+                (instance_id, field_name, json.dumps(value, ensure_ascii=False), source_kind, source_ref, policy_id, now),
+            )
+            row = con.execute(
+                "select * from requirement_satisfactions where continuation_id=? and field_name=?",
+                (instance_id, field_name),
+            ).fetchone()
+        return self._satisfaction_row_to_dict(row)
+
+    def list_requirement_satisfactions(self, instance_id: int) -> list[dict[str, Any]]:
+        self.init()
+        with self.connect() as con:
+            rows = con.execute(
+                "select * from requirement_satisfactions where continuation_id=? order by id", (instance_id,)
+            ).fetchall()
+        return [self._satisfaction_row_to_dict(r) for r in rows]
+
+    @staticmethod
+    def _satisfaction_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+        d = dict(row)
+        d["value"] = json.loads(d.pop("value_json") or "null")
+        return d
+
+    # -- standing policies (standing_policy.py) ----------------------------
+
+    def create_standing_policy(
+        self,
+        *,
+        policy_id: str,
+        owner_ref: str,
+        project_scope: str,
+        action_scope: str,
+        conditions: dict[str, Any],
+        decision: dict[str, Any],
+        source_message_ref: str = "",
+        enabled: bool = True,
+    ) -> dict[str, Any]:
+        self.init()
+        now = time.time()
+        with self.connect() as con:
+            row = con.execute(
+                "select coalesce(max(version), 0) as v from standing_policies where policy_id=?", (policy_id,)
+            ).fetchone()
+            version = int(row["v"]) + 1
+            cur = con.execute(
+                """
+                insert into standing_policies(
+                    policy_id, version, owner_ref, project_scope, action_scope,
+                    conditions_json, decision_json, enabled, source_message_ref, created_at
+                ) values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    policy_id, version, owner_ref, project_scope, action_scope,
+                    json.dumps(conditions, ensure_ascii=False), json.dumps(decision, ensure_ascii=False),
+                    1 if enabled else 0, source_message_ref, now,
+                ),
+            )
+            row = con.execute("select * from standing_policies where id=?", (cur.lastrowid,)).fetchone()
+        return self._policy_row_to_dict(row)
+
+    def list_standing_policies(self, *, enabled_only: bool = False) -> list[dict[str, Any]]:
+        self.init()
+        with self.connect() as con:
+            if enabled_only:
+                rows = con.execute("select * from standing_policies where enabled=1 order by id").fetchall()
+            else:
+                rows = con.execute("select * from standing_policies order by id").fetchall()
+        return [self._policy_row_to_dict(r) for r in rows]
+
+    def latest_standing_policy(self, policy_id: str) -> dict[str, Any] | None:
+        self.init()
+        with self.connect() as con:
+            row = con.execute(
+                "select * from standing_policies where policy_id=? order by version desc limit 1", (policy_id,)
+            ).fetchone()
+        return self._policy_row_to_dict(row) if row else None
+
+    @staticmethod
+    def _policy_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+        d = dict(row)
+        d["conditions"] = json.loads(d.pop("conditions_json") or "{}")
+        d["decision"] = json.loads(d.pop("decision_json") or "{}")
+        d["enabled"] = bool(d["enabled"])
+        return d
 
 
 def _has_active_continuation_state(path: Path) -> bool:
