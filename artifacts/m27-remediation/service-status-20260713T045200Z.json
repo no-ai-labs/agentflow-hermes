@@ -1,0 +1,77 @@
+{
+  "commands": {
+    "cat_reconcile": {
+      "cmd": [
+        "systemctl",
+        "--user",
+        "cat",
+        "agentflow-reconcile.service"
+      ],
+      "rc": 0,
+      "stderr": "",
+      "stdout": "# /home/duckran/.config/systemd/user/agentflow-reconcile.service\n[Unit]\nDescription=AgentFlow Hermes reconciliation pass (quiet recovery path only)\n\n[Service]\nType=oneshot\nExecStart=python3 /home/duckran/dev/agentflow-hermes/scripts/agentflowd.py reconcile --boards-root /home/duckran/.hermes/kanban/boards --db /home/duckran/.hermes/agentflow/agentflow-daemon.sqlite --apply\n"
+    },
+    "cat_service": {
+      "cmd": [
+        "systemctl",
+        "--user",
+        "cat",
+        "agentflowd.service"
+      ],
+      "rc": 0,
+      "stderr": "",
+      "stdout": "# /home/duckran/.config/systemd/user/agentflowd.service\n[Unit]\nDescription=AgentFlow Hermes zero-ceremony continuation daemon\nAfter=network.target\n\n[Service]\nType=simple\nExecStart=python3 /home/duckran/dev/agentflow-hermes/scripts/agentflowd.py run --boards-root /home/duckran/.hermes/kanban/boards --db /home/duckran/.hermes/agentflow/agentflow-daemon.sqlite --apply\nRestart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n"
+    },
+    "is_active_service": {
+      "cmd": [
+        "systemctl",
+        "--user",
+        "is-active",
+        "agentflowd.service"
+      ],
+      "rc": 0,
+      "stderr": "",
+      "stdout": "active\n"
+    },
+    "is_active_timer": {
+      "cmd": [
+        "systemctl",
+        "--user",
+        "is-active",
+        "agentflow-reconcile.timer"
+      ],
+      "rc": 0,
+      "stderr": "",
+      "stdout": "active\n"
+    },
+    "main_pid": {
+      "cmd": [
+        "systemctl",
+        "--user",
+        "show",
+        "-p",
+        "MainPID",
+        "--value",
+        "agentflowd.service"
+      ],
+      "rc": 0,
+      "stderr": "",
+      "stdout": "206578\n"
+    },
+    "status": {
+      "cmd": [
+        "systemctl",
+        "--user",
+        "status",
+        "agentflowd.service",
+        "--no-pager"
+      ],
+      "rc": 0,
+      "stderr": "",
+      "stdout": "\u25cf agentflowd.service - AgentFlow Hermes zero-ceremony continuation daemon\n     Loaded: loaded (/home/duckran/.config/systemd/user/agentflowd.service; enabled; preset: enabled)\n     Active: active (running) since Mon 2026-07-13 04:52:00 UTC; 14s ago\n   Main PID: 206578 (python3)\n      Tasks: 1 (limit: 37391)\n     Memory: 31.9M (peak: 32.3M)\n        CPU: 5.254s\n     CGroup: /user.slice/user-1000.slice/user@1000.service/app.slice/agentflowd.service\n             \u2514\u2500206578 python3 /home/duckran/dev/agentflow-hermes/scripts/agentflowd.py run --boards-root /home/duckran/.hermes/kanban/boards --db /home/duckran/.hermes/agentflow/agentflow-daemon.sqlite --apply\n\nJul 13 04:52:00 devserver systemd[1410]: Started agentflowd.service - AgentFlow Hermes zero-ceremony continuation daemon.\n"
+    }
+  },
+  "reconcile_uses_apply": true,
+  "run_id": "20260713T045214Z",
+  "service_uses_apply": true
+}

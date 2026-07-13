@@ -27,7 +27,10 @@ durable artifacts:
 - `5cad87d` exposes guarded user-service management for the single
   `agentflowd.service` plus quiet `agentflow-reconcile.timer` path. On this
   host `systemctl --user status agentflowd.service` is active/running and
-  `agentflow-reconcile.timer` is active/waiting.
+  `agentflow-reconcile.timer` is active/waiting; the applied unit status is
+  archived at `artifacts/m27-remediation/service-status-20260713T045200Z.json`
+  and shows both daemon and reconcile service use the same `--apply` runtime
+  arguments against the deployed AgentFlow DB.
 - Live real-DB canary artifact:
   `artifacts/m27-remediation/live-canary-20260713T044721Z.json`. It inserted
   controlled source events and active-wake rows into the real
