@@ -136,18 +136,21 @@ AGENTFLOW_SUBMIT_INPUT_TEXT_SCHEMA = {
         "description": (
             "Submit the current user's natural-language reply for an interaction case (plan section "
             "7.2). Compiles the reply into typed candidate fields, validates them, and applies/resumes "
-            "on success. Raw text is never stored as the receipt — only a content hash/message ref."
+            "on success. Raw text is never stored as the receipt — only a content hash/message ref. "
+            "`endpoint` must be the current gateway session's own origin — the case is refused if it "
+            "does not belong to that origin."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "case_id": {"type": "string"},
+                "endpoint": {"type": "string", "description": "Current gateway session origin endpoint, e.g. discord:#channel."},
                 "text": {"type": "string", "description": "Raw current user reply."},
                 "owner_ref": {"type": "string"},
                 "source_ref": {"type": "string"},
                 "message_ref": {"type": "string"},
             },
-            "required": ["case_id", "text"],
+            "required": ["case_id", "endpoint", "text"],
         },
     },
 }
@@ -158,9 +161,17 @@ AGENTFLOW_INPUT_STATUS_SCHEMA = {
         "name": "agentflow_input_status",
         "description": (
             "Return the human-oriented state of an interaction case: waiting for you | resolved | "
-            "resumed | failed retryable (plan section 7.3)."
+            "resumed | failed retryable (plan section 7.3). `endpoint` must be the current gateway "
+            "session's own origin — the case is refused if it does not belong to that origin."
         ),
-        "parameters": {"type": "object", "properties": {"case_id": {"type": "string"}}, "required": ["case_id"]},
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "case_id": {"type": "string"},
+                "endpoint": {"type": "string", "description": "Current gateway session origin endpoint, e.g. discord:#channel."},
+            },
+            "required": ["case_id", "endpoint"],
+        },
     },
 }
 
@@ -314,6 +325,13 @@ def _handle_input_inbox(args: dict) -> str:
 
     if case_id:
         case = inbox.get_case(case_id)
+        # A case_id is caller-supplied and may name a case from another
+        # origin lane (leaked case id, stale link, cross-board confusion).
+        # Hard-bind to the current gateway session's own endpoint: a case
+        # that does not belong to it must fail closed, exactly like the
+        # multi-case listing path below already does via list_cases(endpoint=...).
+        if case is not None and endpoint is not None and case.origin_endpoint != endpoint:
+            case = None
         cases = (case,) if case is not None else ()
     else:
         cases = inbox.list_cases(endpoint=endpoint)
@@ -399,6 +417,7 @@ def _handle_submit_input_text(args: dict) -> str:
     from agentflow_hermes.interaction import STATE_APPLIED, InteractionInbox, requirement_from_dict
 
     case_id = str(args.get("case_id") or "")
+    endpoint = str(args.get("endpoint") or "")
     text = str(args.get("text") or "")
     owner_ref = str(args.get("owner_ref") or "")
     source_ref = str(args.get("source_ref") or "")
@@ -406,12 +425,18 @@ def _handle_submit_input_text(args: dict) -> str:
 
     if not case_id or not text:
         return json.dumps({"success": False, "error": "case_id_and_text_required"}, ensure_ascii=False)
+    if not endpoint:
+        return json.dumps({"success": False, "error": "endpoint_required"}, ensure_ascii=False)
 
     store = ContinuationStore.canonical()
     inbox = InteractionInbox(store=store)
     case = inbox.get_case(case_id)
     if case is None:
         return json.dumps({"success": False, "error": "unknown_case"}, ensure_ascii=False)
+    if case.origin_endpoint != endpoint:
+        # Fail closed: a case from another origin lane must never be
+        # transitioned or materialized just because its case_id is known.
+        return json.dumps({"success": False, "error": "origin_mismatch"}, ensure_ascii=False)
     if case.state == STATE_APPLIED:
         return json.dumps({"success": True, "status": "resumed", "case_id": case_id, "note": "already applied"}, ensure_ascii=False)
 
@@ -497,14 +522,20 @@ def _handle_input_status(args: dict) -> str:
     from agentflow_hermes.interaction import STATE_ANSWERED, STATE_APPLIED, InteractionInbox
 
     case_id = str(args.get("case_id") or "")
+    endpoint = str(args.get("endpoint") or "")
     if not case_id:
         return json.dumps({"success": False, "error": "case_id_required"}, ensure_ascii=False)
+    if not endpoint:
+        return json.dumps({"success": False, "error": "endpoint_required"}, ensure_ascii=False)
 
     store = ContinuationStore.canonical()
     inbox = InteractionInbox(store=store)
     case = inbox.get_case(case_id)
     if case is None:
         return json.dumps({"success": False, "error": "unknown_case"}, ensure_ascii=False)
+    if case.origin_endpoint != endpoint:
+        # Fail closed: never leak another origin lane's case status.
+        return json.dumps({"success": False, "error": "origin_mismatch"}, ensure_ascii=False)
 
     instances = [store.get_instance(cid) for cid in case.continuation_ids]
     instances = [i for i in instances if i is not None]

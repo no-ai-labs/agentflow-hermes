@@ -260,7 +260,7 @@ def test_13_3_h1_natural_reply_resumes_via_real_plugin_bridge(tmp_path, monkeypa
 
     submit_result = json.loads(
         _find_tool(ctx, "agentflow_submit_input_text")["handler"](
-            {"case_id": case_id, "text": "https://example.com/result-natural", "owner_ref": "operator-main"}
+            {"case_id": case_id, "endpoint": "discord:#research", "text": "https://example.com/result-natural", "owner_ref": "operator-main"}
         )
     )
     assert submit_result["success"] is True
@@ -314,7 +314,7 @@ def test_13_4_batched_case_one_question_resolves_three_with_no_duplicate_cards(t
     reply_text = "1 https://example.com/x, 2 recv_42, 3 looks good"
     submit_result = json.loads(
         _find_tool(ctx, "agentflow_submit_input_text")["handler"](
-            {"case_id": case_id, "text": reply_text, "owner_ref": "operator-main"}
+            {"case_id": case_id, "endpoint": "discord:#research", "text": reply_text, "owner_ref": "operator-main"}
         )
     )
     assert submit_result["success"] is True
@@ -356,7 +356,7 @@ def test_13_5_policy_reuse_second_equivalent_continuation_is_h0(tmp_path, monkey
     case_id = inbox_result["cases"][0]["case_id"]
     submit_result = json.loads(
         _find_tool(ctx, "agentflow_submit_input_text")["handler"](
-            {"case_id": case_id, "text": "approve", "owner_ref": "operator-main"}
+            {"case_id": case_id, "endpoint": "discord:#shaman", "text": "approve", "owner_ref": "operator-main"}
         )
     )
     assert submit_result["success"] is True
@@ -525,7 +525,7 @@ def test_13_8_three_board_canary_per_board_correctness(tmp_path, monkeypatch):
 
         submit_result = json.loads(
             _find_tool(ctx, "agentflow_submit_input_text")["handler"](
-                {"case_id": case_id, "text": f"https://example.com/{board}", "owner_ref": "operator-main"}
+                {"case_id": case_id, "endpoint": endpoint, "text": f"https://example.com/{board}", "owner_ref": "operator-main"}
             )
         )
         assert submit_result["success"] is True
@@ -536,3 +536,70 @@ def test_13_8_three_board_canary_per_board_correctness(tmp_path, monkeypatch):
     # No cross-board leakage: each board's own cursor advanced independently.
     for board in _BOARDS:
         assert store.get_cursor(board, board) >= 1
+
+
+def test_13_8b_three_board_canary_wrong_lane_reply_refuses(tmp_path, monkeypatch):
+    """A case_id from one board's lane must be refused (no transition, no
+    materialization) when submitted against a different board's origin
+    endpoint — the exact adversarial scenario BLOCK t_4d493bc2 flagged."""
+    boards_root = _boards_root_with(tmp_path, _BOARDS)
+    overrides = _write_overrides(tmp_path, _ENDPOINTS)
+    store_path = tmp_path / "agentflow.sqlite"
+    store = ContinuationStore(store_path)
+    config = DaemonConfig(
+        store=store, boards_root=boards_root, overrides_path=overrides, contracts_dir=_CONTRACTS_DIR,
+        reconcile_interval_seconds=999,
+    )
+    daemon = AgentflowDaemon(config)
+    daemon.tick()
+
+    for board in _BOARDS:
+        db_path = boards_root / board / "kanban.db"
+        metadata = _needs_input_metadata(
+            required_inputs=[{"name": "result_url", "kind": "fact", "authority": "owner"}]
+        )
+        _write_event(db_path, task_id=f"t_wronglane_{board}", metadata=metadata)
+    daemon.tick()
+
+    ctx = _plugin_ctx(monkeypatch, store_path, "hermes_agentflow_e2e_wronglane")
+    home_endpoint = _ENDPOINTS["warroom-os"]
+    other_endpoint = _ENDPOINTS["oracle-lab"]
+
+    home_inbox = json.loads(_find_tool(ctx, "agentflow_input_inbox")["handler"]({"endpoint": home_endpoint}))
+    home_case_id = home_inbox["cases"][0]["case_id"]
+    home_instance_id = store.list_interaction_members(home_case_id)[0]["continuation_id"]
+
+    # A gateway session bound to oracle-lab's #shaman lane must not be able
+    # to resolve warroom-os's case just because it knows the case_id.
+    other_inbox = json.loads(
+        _find_tool(ctx, "agentflow_input_inbox")["handler"]({"case_id": home_case_id, "endpoint": other_endpoint})
+    )
+    assert other_inbox["cases"] == []
+
+    other_status = json.loads(
+        _find_tool(ctx, "agentflow_input_status")["handler"]({"case_id": home_case_id, "endpoint": other_endpoint})
+    )
+    assert other_status["success"] is False
+    assert other_status["error"] == "origin_mismatch"
+
+    wrong_lane_submit = json.loads(
+        _find_tool(ctx, "agentflow_submit_input_text")["handler"](
+            {"case_id": home_case_id, "endpoint": other_endpoint, "text": "https://example.com/leak", "owner_ref": "intruder"}
+        )
+    )
+    assert wrong_lane_submit["success"] is False
+    assert wrong_lane_submit["error"] == "origin_mismatch"
+
+    instance = store.get_instance(home_instance_id)
+    assert instance["state"] != "materializing"
+    assert store.list_owner_receipts(home_instance_id) == []
+    assert store.list_inbound_reply_receipts(home_case_id) == []
+
+    # The correct lane can still resolve its own case afterward.
+    correct_submit = json.loads(
+        _find_tool(ctx, "agentflow_submit_input_text")["handler"](
+            {"case_id": home_case_id, "endpoint": home_endpoint, "text": "https://example.com/ok", "owner_ref": "operator-main"}
+        )
+    )
+    assert correct_submit["success"] is True
+    assert store.get_instance(home_instance_id)["state"] == "materializing"

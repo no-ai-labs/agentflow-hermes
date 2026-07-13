@@ -141,7 +141,9 @@ def test_submit_input_text_resumes_single_field_case(tmp_path, hermes_ctx):
 
     submit_tool = _find_tool(hermes_ctx, "agentflow_submit_input_text")
     result = json.loads(
-        submit_tool["handler"]({"case_id": case_id, "text": "https://example.com/result", "owner_ref": "operator-main"})
+        submit_tool["handler"](
+            {"case_id": case_id, "endpoint": "discord:#research", "text": "https://example.com/result", "owner_ref": "operator-main"}
+        )
     )
 
     assert result["success"] is True
@@ -160,7 +162,7 @@ def test_submit_input_text_never_persists_raw_text(tmp_path, hermes_ctx):
     submit_tool = _find_tool(hermes_ctx, "agentflow_submit_input_text")
     secret_text = "https://example.com/result my-secret-token-xyz"
 
-    json.loads(submit_tool["handler"]({"case_id": case_id, "text": secret_text, "owner_ref": "operator-main"}))
+    json.loads(submit_tool["handler"]({"case_id": case_id, "endpoint": "discord:#research", "text": secret_text, "owner_ref": "operator-main"}))
 
     receipts = store.list_inbound_reply_receipts(case_id)
     assert len(receipts) == 1
@@ -176,7 +178,7 @@ def test_submit_input_text_incomplete_reply_stays_waiting(tmp_path, hermes_ctx):
     # No URL/allowed-value shape recognizable text still applies as the raw
     # value for a single free-text field — use an empty reply instead to
     # force the "nothing compiled" path.
-    result = json.loads(submit_tool["handler"]({"case_id": case_id, "text": "   ", "owner_ref": "operator-main"}))
+    result = json.loads(submit_tool["handler"]({"case_id": case_id, "endpoint": "discord:#research", "text": "   ", "owner_ref": "operator-main"}))
 
     assert result["success"] is False
     assert result["status"] == "waiting for you"
@@ -217,7 +219,9 @@ def test_batched_reply_resumes_multiple_continuations(tmp_path, hermes_ctx):
 
     submit_tool = _find_tool(hermes_ctx, "agentflow_submit_input_text")
     result = json.loads(
-        submit_tool["handler"]({"case_id": case_id, "text": "1 https://example.com/x, 2 recv_42", "owner_ref": "operator-main"})
+        submit_tool["handler"](
+            {"case_id": case_id, "endpoint": "discord:#research", "text": "1 https://example.com/x, 2 recv_42", "owner_ref": "operator-main"}
+        )
     )
 
     assert result["success"] is True
@@ -231,17 +235,77 @@ def test_input_status_reports_waiting_then_resumed(tmp_path, hermes_ctx):
     instance_id, case_id = _open_single_field_case(store)
     status_tool = _find_tool(hermes_ctx, "agentflow_input_status")
 
-    before = json.loads(status_tool["handler"]({"case_id": case_id}))
+    before = json.loads(status_tool["handler"]({"case_id": case_id, "endpoint": "discord:#research"}))
     assert before["status"] == "waiting for you"
 
     submit_tool = _find_tool(hermes_ctx, "agentflow_submit_input_text")
-    json.loads(submit_tool["handler"]({"case_id": case_id, "text": "https://example.com/result", "owner_ref": "operator-main"}))
+    json.loads(
+        submit_tool["handler"](
+            {"case_id": case_id, "endpoint": "discord:#research", "text": "https://example.com/result", "owner_ref": "operator-main"}
+        )
+    )
 
-    after = json.loads(status_tool["handler"]({"case_id": case_id}))
+    after = json.loads(status_tool["handler"]({"case_id": case_id, "endpoint": "discord:#research"}))
     assert after["status"] == "resumed"
 
 
 def test_input_status_unknown_case_is_an_error(hermes_ctx):
     status_tool = _find_tool(hermes_ctx, "agentflow_input_status")
-    result = json.loads(status_tool["handler"]({"case_id": "ic_does_not_exist"}))
+    result = json.loads(status_tool["handler"]({"case_id": "ic_does_not_exist", "endpoint": "discord:#research"}))
     assert result["success"] is False
+
+
+def test_submit_input_text_wrong_lane_case_id_fails_closed(tmp_path, hermes_ctx):
+    store = _store(tmp_path)
+    instance_id, case_id = _open_single_field_case(store)
+
+    submit_tool = _find_tool(hermes_ctx, "agentflow_submit_input_text")
+    result = json.loads(
+        submit_tool["handler"](
+            {"case_id": case_id, "endpoint": "discord:#other-lane", "text": "https://example.com/result", "owner_ref": "operator-main"}
+        )
+    )
+
+    assert result["success"] is False
+    assert result["error"] == "origin_mismatch"
+    instance = store.get_instance(instance_id)
+    assert instance["state"] != ContinuationState.MATERIALIZING.value
+    assert store.list_owner_receipts(instance_id) == []
+    assert store.list_inbound_reply_receipts(case_id) == []
+
+
+def test_submit_input_text_missing_endpoint_fails_closed(tmp_path, hermes_ctx):
+    store = _store(tmp_path)
+    instance_id, case_id = _open_single_field_case(store)
+
+    submit_tool = _find_tool(hermes_ctx, "agentflow_submit_input_text")
+    result = json.loads(
+        submit_tool["handler"]({"case_id": case_id, "text": "https://example.com/result", "owner_ref": "operator-main"})
+    )
+
+    assert result["success"] is False
+    assert result["error"] == "endpoint_required"
+    instance = store.get_instance(instance_id)
+    assert instance["state"] != ContinuationState.MATERIALIZING.value
+
+
+def test_input_status_wrong_lane_case_id_fails_closed(tmp_path, hermes_ctx):
+    store = _store(tmp_path)
+    _instance_id, case_id = _open_single_field_case(store)
+    status_tool = _find_tool(hermes_ctx, "agentflow_input_status")
+
+    result = json.loads(status_tool["handler"]({"case_id": case_id, "endpoint": "discord:#other-lane"}))
+    assert result["success"] is False
+    assert result["error"] == "origin_mismatch"
+
+
+def test_input_inbox_case_id_from_other_lane_fails_closed(tmp_path, hermes_ctx):
+    store = _store(tmp_path)
+    _open_single_field_case(store)
+    case_id = store.list_interaction_cases()[0]["id"]
+
+    inbox_tool = _find_tool(hermes_ctx, "agentflow_input_inbox")
+    result = json.loads(inbox_tool["handler"]({"case_id": case_id, "endpoint": "discord:#other-lane"}))
+
+    assert result["success"] is True
+    assert result["cases"] == []

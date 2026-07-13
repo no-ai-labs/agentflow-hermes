@@ -55,20 +55,20 @@ def test_interaction_tools_are_registered_alongside_existing_tools():
         assert name in names
 
 
-def test_submit_input_text_schema_requires_case_id_and_text():
+def test_submit_input_text_schema_requires_case_id_text_and_endpoint():
     ctx = FakeHermesContext()
     plugin.register(ctx)
     tool = next(t for t in ctx.tools if t["name"] == "agentflow_submit_input_text")
     required = tool["schema"]["function"]["parameters"]["required"]
-    assert set(required) == {"case_id", "text"}
+    assert set(required) == {"case_id", "text", "endpoint"}
 
 
-def test_input_status_schema_requires_case_id():
+def test_input_status_schema_requires_case_id_and_endpoint():
     ctx = FakeHermesContext()
     plugin.register(ctx)
     tool = next(t for t in ctx.tools if t["name"] == "agentflow_input_status")
     required = tool["schema"]["function"]["parameters"]["required"]
-    assert set(required) == {"case_id"}
+    assert set(required) == {"case_id", "endpoint"}
 
 
 def test_input_inbox_schema_has_no_required_fields():
