@@ -186,9 +186,78 @@ Behavior:
   declared once, in `config/boards.yaml`.
 - Every board mutation flows through the durable, idempotent outbox.
 
+## Zero-ceremony autopilot (`agentflowd`, M27)
+
+`agentflowd` is the long-lived event-driven runtime that replaced the
+per-kind cron watchdogs: one process discovers boards, routes every
+terminal event through a single unified handler (GO / code-fix /
+needs-input / approval / external-wait), resolves as much of each
+continuation as it can from evidence or standing policy, batches the
+genuine owner questions that remain, and resumes automatically once a
+reply lands. The 5-minute watchdog still exists, but only as a quiet
+reconciliation pass for missed events and process restarts — it is never
+the primary path.
+
+**How zero-ceremony works, in one paragraph:** before anything is ever
+asked of an owner, the runtime tries — in order — to derive the value from
+trusted system state, reuse an existing verified artifact, apply a scoped
+standing policy the owner already stated once, or infer it from session
+context. Only the irreducible remainder becomes one concise natural-language
+question; a plain-language reply is compiled into typed fields, validated
+against the contract, and the continuation resumes. See
+[Zero-Ceremony AgentFlow Autopilot](docs/plans/2026-07-12-zero-ceremony-agentflow-autopilot.md)
+for the full design and [the M27 canary report](docs/m27-zero-ceremony-canary.md)
+for what has actually been proven so far.
+
+**Board auto-discovery:** `agentflowd` scans `~/.hermes/kanban/boards/*/kanban.db`
+by default and enrolls every board it finds — no per-board registry edit
+required to onboard a new board. `config/boards.yaml` remains an *override*
+catalog (disable a board, pin an endpoint, override a contract), not an
+allowlist.
+
+```bash
+# Run the daemon (dry-run by default; --apply mutates the real shared boards).
+python scripts/agentflowd.py run
+python scripts/agentflowd.py run --apply
+
+# One wake cycle or one reconciliation pass, then exit (debugging).
+python scripts/agentflowd.py tick
+python scripts/agentflowd.py reconcile
+```
+
+**Inspection commands** (the system works without these; they exist for
+debugging, not for driving normal operation):
+
+```bash
+agentflow-hermes autopilot status              # per-board event/H0/H1/waiting/outbox counts
+agentflow-hermes autopilot waiting             # every open owner question, rendered
+agentflow-hermes autopilot explain <case-or-task>   # why a continuation/case is where it is
+agentflow-hermes autopilot policies            # every standing policy on file
+agentflow-hermes autopilot reconcile           # run one recovery pass now
+```
+
+**Canonical control-plane store:** every continuation, requirement
+satisfaction, standing policy, and interaction case lives in one store,
+`~/.hermes/agentflow/agentflow.sqlite` (override with `HERMES_CONTINUATION_DB`).
+Earlier milestones left state split across that path, the M26 watchdog's
+`~/.hermes/state/agentflow_needs_input_continuations.sqlite`, and the older
+`~/.agentflow/agentflow.db` jobs store. `agentflow-hermes continuation
+migrate-store` copies instances/steps/receipts/events/cursors/outbox from
+every known legacy path into the canonical store, is safe to re-run (no
+duplicate rows), writes a migration receipt, and never deletes or mutates
+the legacy DB. `agentflow-hermes continuation doctor` reports which store is
+selected plus any legacy residue still sitting around, without requiring
+manual cleanup:
+
+```bash
+agentflow-hermes continuation migrate-store
+agentflow-hermes continuation doctor
+```
+
 ## Design documents
 
 - [Zero-Ceremony AgentFlow Autopilot](docs/plans/2026-07-12-zero-ceremony-agentflow-autopilot.md) — event-driven continuation, automatic requirement resolution, batched owner questions, natural-language replies, standing policies, and the human-effort budget.
+- [M27 zero-ceremony canary report](docs/m27-zero-ceremony-canary.md) — what the M27 milestone actually proved (hermetic tests) versus what still needs a live three-board production run.
 - [Needs-Input Continuation Engine](docs/plans/2026-07-10-needs-input-continuation-engine-design.md) — typed `GO`/code-fix/operator-input continuations, owner-anchor workflows, and the Warroom G4.21 vertical implementation plan.
 - [M26 Global needs_input rollout](docs/m26-global-needs-input-rollout.md) — one board-aware scan loop across the canonical board catalog, live sqlite event source, and the registry-driven watchdog.
 
