@@ -435,3 +435,74 @@ def test_service_install_status_and_uninstall_roundtrip(tmp_path):
     real = service_install.uninstall(str(unit_dir), write=True)
     assert set(real["removed"]) == set(dry["present"])
     assert not (unit_dir / service_install.SERVICE_NAME).exists()
+
+
+def test_service_install_extra_args_applied_to_both_service_units(tmp_path):
+    script = tmp_path / "agentflowd.py"
+    script.write_text("# stub\n")
+
+    plan = service_install.render_install_plan(str(script), extra_args="--boards-root /x --db /y/agentflow.sqlite")
+
+    service_unit = plan["units"][service_install.SERVICE_NAME]
+    reconcile_unit = plan["units"][service_install.RECONCILE_SERVICE_NAME]
+    assert "--boards-root /x --db /y/agentflow.sqlite" in service_unit
+    assert "--boards-root /x --db /y/agentflow.sqlite" in reconcile_unit
+
+
+def test_service_install_enable_requires_units_present(tmp_path):
+    unit_dir = tmp_path / "units"
+    unit_dir.mkdir()
+    try:
+        service_install.enable(unit_dir=str(unit_dir))
+        assert False, "expected ServiceRenderError for missing unit files"
+    except service_install.ServiceRenderError:
+        pass
+
+
+def test_service_install_enable_dry_run_never_calls_systemctl(tmp_path, monkeypatch):
+    script = tmp_path / "agentflowd.py"
+    script.write_text("# stub\n")
+    unit_dir = tmp_path / "units"
+    service_install.install(str(script), unit_dir=str(unit_dir), write_files=True)
+
+    def _boom(*a, **kw):
+        raise AssertionError("dry-run enable must never call subprocess.run")
+
+    monkeypatch.setattr(service_install.subprocess, "run", _boom)
+
+    result = service_install.enable(unit_dir=str(unit_dir))
+    assert result["applied"] is False
+    assert result["commands"][0] == ["systemctl", "--user", "daemon-reload"]
+    assert result["commands"][1][:3] == ["systemctl", "--user", "enable"]
+    assert service_install.SERVICE_NAME in result["commands"][1]
+    assert service_install.RECONCILE_TIMER_NAME in result["commands"][1]
+    assert service_install.RECONCILE_SERVICE_NAME not in result["commands"][1], (
+        "the reconcile oneshot service must only ever run via its timer, never enabled directly"
+    )
+
+
+def test_service_install_enable_apply_invokes_systemctl(tmp_path, monkeypatch):
+    script = tmp_path / "agentflowd.py"
+    script.write_text("# stub\n")
+    unit_dir = tmp_path / "units"
+    service_install.install(str(script), unit_dir=str(unit_dir), write_files=True)
+
+    calls = []
+
+    class _FakeProc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def _fake_run(command, **kw):
+        calls.append(command)
+        return _FakeProc()
+
+    monkeypatch.setattr(service_install.subprocess, "run", _fake_run)
+
+    result = service_install.enable(unit_dir=str(unit_dir), apply=True, now=True)
+    assert result["success"] is True
+    assert result["applied"] is True
+    assert len(calls) == 2
+    assert "--now" in calls[1]
+    assert len(result["results"]) == 2

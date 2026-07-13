@@ -1,15 +1,17 @@
 """systemd user service/timer install for ``agentflowd`` (plan 9.5/12).
 
-Follows the exact render/print-by-default, write-only-with-explicit-dir
-pattern already established in ``maintenance/units.py``/``maintenance/installer.py``:
-this module never calls ``systemctl`` and never writes outside an explicit
-``--unit-dir``. ``status``/``uninstall`` are file-presence checks only — they
-do not talk to systemd either, so all of this is testable without a real
+The safe default is still render/print only, and file writes still require an
+explicit ``--unit-dir``. The M27 live rollout path additionally exposes a
+guarded ``enable(..., apply=True)`` helper that runs the exact
+``systemctl --user`` commands needed to enable/start the single long-lived
+``agentflowd.service`` plus the quiet reconciliation timer. ``status`` and
+``uninstall`` remain file-presence helpers so most tests do not need a real
 service manager.
 """
 from __future__ import annotations
 
 import re
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -76,11 +78,17 @@ def render_agentflowd_service_unit(
     )
 
 
-def render_reconcile_service_unit(script_path: Path | str, *, python_exec: str = "python3") -> str:
-    """Render the reconciliation oneshot service, invoked by the timer below."""
+def render_reconcile_service_unit(script_path: Path | str, *, python_exec: str = "python3", extra_args: str = "") -> str:
+    """Render the reconciliation oneshot service, invoked by the timer below.
+    Shares the same ``extra_args`` (``--boards-root``/``--db``/etc.) as the
+    long-lived service unit so both units point at the same store/boards."""
     validated_script = _validate_absolute(script_path, label="script path")
     _validate_exec_name(python_exec.rsplit("/", 1)[-1])
     exec_start = f"{python_exec} {validated_script} reconcile"
+    if extra_args:
+        if _UNSAFE_CHARS_RE.search(extra_args.replace(" ", "")):
+            raise ServiceRenderError("extra_args contains unsafe control characters")
+        exec_start = f"{exec_start} {extra_args}"
     return (
         "[Unit]\n"
         "Description=AgentFlow Hermes reconciliation pass (quiet recovery path only)\n"
@@ -116,7 +124,7 @@ class RenderedServiceUnits:
 def render_units(script_path: Path | str, *, python_exec: str = "python3", extra_args: str = "") -> RenderedServiceUnits:
     return RenderedServiceUnits(
         service_unit=render_agentflowd_service_unit(script_path, python_exec=python_exec, extra_args=extra_args),
-        reconcile_service_unit=render_reconcile_service_unit(script_path, python_exec=python_exec),
+        reconcile_service_unit=render_reconcile_service_unit(script_path, python_exec=python_exec, extra_args=extra_args),
         reconcile_timer_unit=render_reconcile_timer_unit(),
     )
 
@@ -156,9 +164,11 @@ def install(
     write_files: bool = False,
     extra_args: str = "",
 ) -> dict[str, Any]:
-    """Render (and optionally write) agentflowd units. Never executes
-    systemctl — enabling/starting the units remains an explicit separate
-    operator action outside this tool's scope."""
+    """Render (and optionally write) agentflowd units.
+
+    This function itself never executes ``systemctl``; callers that want the
+    explicit live rollout path must call :func:`enable` separately.
+    """
     plan = render_install_plan(script_file, extra_args=extra_args)
     written_files: list[str] = []
     if write_files:
@@ -182,6 +192,48 @@ def status(unit_dir: str) -> dict[str, Any]:
         "installed": installed,
         "fully_installed": all(installed.values()),
     }
+
+
+def enable(*, unit_dir: str, apply: bool = False, now: bool = False) -> dict[str, Any]:
+    """Guarded ``systemctl --user`` path: daemon-reload + enable the long-
+    lived ``agentflowd.service`` and the quiet ``agentflow-reconcile.timer``
+    (never the reconcile *service* directly — that only runs via the
+    timer). Dry-run by default (returns the exact commands without running
+    them); pass ``apply=True`` to actually invoke systemctl. ``now=True``
+    additionally starts the units immediately (``--now``) instead of only
+    enabling them for next boot/login.
+
+    Requires the unit files to already exist in ``unit_dir`` (via
+    :func:`install` with ``write_files=True``) and requires that
+    ``unit_dir`` be a real systemd user unit search path
+    (``~/.config/systemd/user`` or an ``XDG_CONFIG_HOME`` equivalent) for
+    ``systemctl --user`` to find them by name."""
+    dir_path = _validate_absolute(unit_dir, label="unit dir")
+    names = (SERVICE_NAME, RECONCILE_SERVICE_NAME, RECONCILE_TIMER_NAME)
+    missing = [name for name in names if not (dir_path / name).exists()]
+    if missing:
+        raise ServiceRenderError(f"cannot enable — missing unit files in {dir_path}: {missing}")
+
+    enable_targets = [SERVICE_NAME, RECONCILE_TIMER_NAME]
+    now_flag = ["--now"] if now else []
+    commands = [
+        ["systemctl", "--user", "daemon-reload"],
+        ["systemctl", "--user", "enable", *now_flag, *enable_targets],
+    ]
+    result: dict[str, Any] = {"success": True, "unit_dir": str(dir_path), "commands": commands, "applied": False, "results": []}
+    if not apply:
+        return result
+
+    result["applied"] = True
+    for command in commands:
+        proc = subprocess.run(command, capture_output=True, text=True, timeout=30)
+        result["results"].append(
+            {"command": command, "returncode": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr}
+        )
+        if proc.returncode != 0:
+            result["success"] = False
+            break
+    return result
 
 
 def uninstall(unit_dir: str, *, write: bool = False) -> dict[str, Any]:

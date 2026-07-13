@@ -41,6 +41,7 @@ from agentflow_hermes.daemon import (  # noqa: E402
     default_runtime_dir,
 )
 from agentflow_hermes.continuation_store import ContinuationStore  # noqa: E402
+from agentflow_hermes import service_install  # noqa: E402
 
 _DEFAULT_OVERRIDES = _REPO_ROOT / "config" / "boards.yaml"
 _DEFAULT_CONTRACTS_DIR = _REPO_ROOT / "contracts"
@@ -85,6 +86,24 @@ def main(argv: list[str] | None = None) -> int:
     reconcile_p = sub.add_parser("reconcile", help="Run one reconciliation pass and exit.")
     _add_common_args(reconcile_p)
 
+    _default_unit_dir = str(Path.home() / ".config" / "systemd" / "user")
+    service_p = sub.add_parser("service", help="Install/enable the one user-level agentflowd systemd units.")
+    service_sub = service_p.add_subparsers(dest="service_cmd", required=True)
+
+    install_p = service_sub.add_parser("install", help="Render (and optionally write) the unit files.")
+    install_p.add_argument("--script", default=str(Path(__file__).resolve()))
+    install_p.add_argument("--unit-dir", default=_default_unit_dir)
+    install_p.add_argument("--write-files", action="store_true", help="Write unit files to --unit-dir (default: render only).")
+    install_p.add_argument("--extra-args", default="")
+
+    enable_p = service_sub.add_parser("enable", help="systemctl --user daemon-reload + enable the units.")
+    enable_p.add_argument("--unit-dir", default=_default_unit_dir)
+    enable_p.add_argument("--apply", action="store_true", help="Actually run systemctl (default: print the commands only).")
+    enable_p.add_argument("--now", action="store_true", help="Also start the units immediately (systemctl --now).")
+
+    status_p = service_sub.add_parser("status", help="File-presence status of the unit files in --unit-dir.")
+    status_p.add_argument("--unit-dir", default=_default_unit_dir)
+
     args = parser.parse_args(argv)
 
     if args.cmd == "run":
@@ -110,6 +129,22 @@ def main(argv: list[str] | None = None) -> int:
         report = daemon.reconcile()
         print(report)
         return 0
+
+    if args.cmd == "service":
+        if args.service_cmd == "install":
+            plan = service_install.install(
+                args.script, unit_dir=args.unit_dir, write_files=args.write_files, extra_args=args.extra_args
+            )
+            print(plan)
+            return 0
+        if args.service_cmd == "enable":
+            result = service_install.enable(unit_dir=args.unit_dir, apply=args.apply, now=args.now)
+            print(result)
+            return 0 if result["success"] else 1
+        if args.service_cmd == "status":
+            print(service_install.status(args.unit_dir))
+            return 0
+        raise AssertionError(args.service_cmd)
 
     raise AssertionError(args.cmd)
 
