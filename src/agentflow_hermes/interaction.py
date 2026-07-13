@@ -56,7 +56,7 @@ def make_batch_key(*, origin_endpoint: str, owner_ref: str, project_scope: str, 
     return "|".join((origin_endpoint, owner_ref, project_scope, authority_class))
 
 
-def _requirement_to_dict(requirement: Requirement) -> dict[str, Any]:
+def requirement_to_dict(requirement: Requirement) -> dict[str, Any]:
     return {
         "name": requirement.name,
         "kind": requirement.kind.value,
@@ -69,7 +69,7 @@ def _requirement_to_dict(requirement: Requirement) -> dict[str, Any]:
     }
 
 
-def _requirement_from_dict(payload: dict[str, Any]) -> Requirement:
+def requirement_from_dict(payload: dict[str, Any]) -> Requirement:
     return Requirement(
         name=str(payload["name"]),
         kind=RequirementKind(str(payload.get("kind") or "fact")),
@@ -158,7 +158,7 @@ class InteractionInbox:
         )
         now = self.clock()
         existing = self._find_open_batch(batch_key, now)
-        requirement_dicts = [_requirement_to_dict(r) for r in unresolved_fields]
+        requirement_dicts = [requirement_to_dict(r) for r in unresolved_fields]
 
         if existing is not None:
             case_id = existing["id"]
@@ -190,7 +190,7 @@ class InteractionInbox:
         unresolved: list[Requirement] = []
         for member in members:
             for item in member["requirements"]:
-                unresolved.append(_requirement_from_dict(item))
+                unresolved.append(requirement_from_dict(item))
         return InteractionCase(
             id=row["id"],
             origin_endpoint=row["endpoint"],

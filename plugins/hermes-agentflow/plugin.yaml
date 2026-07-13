@@ -1,7 +1,8 @@
 manifest_version: 1
 name: agentflow
-version: 0.2.0
+version: 0.3.0
 description: >-
   AgentFlow toolset for Hermes: durable handoffs, ACK receipts,
-  and dry-run supervisor dispatch.
+  dry-run supervisor dispatch, and the natural-language owner
+  interaction inbox (list/reply/status).
 kind: toolset

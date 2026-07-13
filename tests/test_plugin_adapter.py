@@ -63,6 +63,9 @@ def test_register_loads_tools_without_crashing(hermes_ctx):
         "agentflow_doctor",
         "agentflow_bridge_cron",
         "agentflow_live_status",
+        "agentflow_input_inbox",
+        "agentflow_submit_input_text",
+        "agentflow_input_status",
     }
 
 
