@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import os
 import sys
 from pathlib import Path
@@ -40,15 +41,38 @@ from agentflow_hermes.daemon import (  # noqa: E402
     default_boards_root,
     default_runtime_dir,
 )
-from agentflow_hermes.continuation_store import ContinuationStore  # noqa: E402
+from agentflow_hermes.continuation_store import ContinuationStore, isolated_preview_store  # noqa: E402
 from agentflow_hermes import service_install  # noqa: E402
 
 _DEFAULT_OVERRIDES = _REPO_ROOT / "config" / "boards.yaml"
 _DEFAULT_CONTRACTS_DIR = _REPO_ROOT / "contracts"
 
 
-def build_daemon(args: argparse.Namespace) -> AgentflowDaemon:
-    store = ContinuationStore(Path(args.db)) if args.db else ContinuationStore.canonical()
+def _configured_store(args: argparse.Namespace) -> ContinuationStore:
+    return ContinuationStore(Path(args.db)) if args.db else ContinuationStore.canonical()
+
+
+@contextlib.contextmanager
+def effective_store(args: argparse.Namespace):
+    """Yield the store the daemon should run against for this invocation.
+
+    ``--apply`` (the live systemd service) uses the configured durable/canonical
+    store directly. Without ``--apply`` the run/tick/reconcile paths must be
+    strictly side-effect-free against that durable store (plan M27 blocker 1):
+    the daemon is handed an isolated throwaway copy instead, so a dry-run
+    diagnostic never advances a cursor or leaks a continuation/outbox row into
+    the canonical ledger (the exact failure that produced the legacy incident
+    rows). The copy is deleted when the invocation ends."""
+    configured = _configured_store(args)
+    if args.apply:
+        yield configured
+    else:
+        with isolated_preview_store(configured.path) as preview:
+            yield preview
+
+
+def build_daemon(args: argparse.Namespace, store: ContinuationStore | None = None) -> AgentflowDaemon:
+    store = store if store is not None else _configured_store(args)
     config = DaemonConfig(
         store=store,
         boards_root=Path(args.boards_root),
@@ -112,21 +136,22 @@ def main(argv: list[str] | None = None) -> int:
             print("agentflowd: another instance already holds the lock", file=sys.stderr)
             return 2
         try:
-            daemon = build_daemon(args)
-            asyncio.run(daemon.run(max_ticks=args.max_ticks))
+            with effective_store(args) as store:
+                daemon = build_daemon(args, store)
+                asyncio.run(daemon.run(max_ticks=args.max_ticks))
         finally:
             lock.release()
         return 0
 
     if args.cmd == "tick":
-        daemon = build_daemon(args)
-        report = daemon.tick()
+        with effective_store(args) as store:
+            report = build_daemon(args, store).tick()
         print(report)
         return 0
 
     if args.cmd == "reconcile":
-        daemon = build_daemon(args)
-        report = daemon.reconcile()
+        with effective_store(args) as store:
+            report = build_daemon(args, store).reconcile()
         print(report)
         return 0
 

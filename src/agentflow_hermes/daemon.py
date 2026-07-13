@@ -209,6 +209,21 @@ class AgentflowDaemon:
     config: DaemonConfig
     _contracts: ContractRegistry | None = field(default=None, init=False, repr=False)
 
+    def _store(self) -> ContinuationStore:
+        """The store every wake cycle reads/writes: always the configured store.
+
+        The daemon persists to exactly the store it was handed — this is what
+        the restart/exactly-once guarantees (plan 13.7) and the zero-ceremony
+        e2e harness depend on. Strictly side-effect-free ``apply=false``
+        dry-runs against the *durable/canonical* ledger are enforced one level
+        up, at the CLI entrypoint (``scripts/agentflowd.py``), which hands this
+        daemon an isolated preview copy instead of the durable store when
+        ``--apply`` was not passed (plan M27 blocker 1). Keeping the boundary
+        there means a test/e2e daemon given its own throwaway store still
+        persists normally, while the production dry-run never touches the
+        canonical file."""
+        return self.config.store
+
     def _contract_registry(self) -> ContractRegistry:
         if self._contracts is None:
             contracts_dir = self.config.contracts_dir
@@ -226,10 +241,11 @@ class AgentflowDaemon:
         event, poll due external-wait conditions. This is the function every
         test exercises directly — the async loop below only decides *when*
         to call it."""
+        store = self._store()
         registry = discover_boards(boards_root=self.config.boards_root, overrides_path=self.config.overrides_path)
         contracts = self._contract_registry()
         adapter_factory = self._adapter_factory()
-        interaction_inbox = InteractionInbox(store=self.config.store)
+        interaction_inbox = InteractionInbox(store=store)
 
         board_reports = []
         for board, entry in registry.items():
@@ -238,14 +254,14 @@ class AgentflowDaemon:
                 route_board_events(
                     board=board,
                     entry=entry,
-                    store=self.config.store,
+                    store=store,
                     contract_registry=contracts,
                     adapter=adapter,
                     interaction_inbox=interaction_inbox,
                     source_factory=self.config.source_factory,
                 )
             )
-        wait_report = poll_external_wait_conditions(self.config.store, checker=self.config.external_wait_checker)
+        wait_report = poll_external_wait_conditions(store, checker=self.config.external_wait_checker)
         return {"success": True, "boards": board_reports, "external_wait": wait_report, "ts": time.time()}
 
     def reconcile(self) -> dict[str, Any]:
@@ -256,7 +272,7 @@ class AgentflowDaemon:
         registry = discover_boards(boards_root=self.config.boards_root, overrides_path=self.config.overrides_path)
         adapter_factory = self._adapter_factory()
         adapter_by_board = {board: adapter_factory(board, entry) for board, entry in registry.items()}
-        report["outbox"] = reconcile_outbox(self.config.store, adapter_by_board=adapter_by_board)
+        report["outbox"] = reconcile_outbox(self._store(), adapter_by_board=adapter_by_board)
         return report
 
     def _watch_targets(self) -> list[Path]:

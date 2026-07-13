@@ -53,8 +53,9 @@ from agentflow_hermes.continuation_engine import (
     live_source_factory,
     real_adapter_factory,
 )
-from agentflow_hermes.continuation_store import ContinuationStore
+from agentflow_hermes.continuation_store import ContinuationStore, isolated_preview_store
 from agentflow_hermes.outcome import ContinuationKind
+import contextlib
 
 _DEFAULT_REGISTRY = _REPO_ROOT / "config" / "boards.yaml"
 _DEFAULT_CONTRACTS_DIR = _REPO_ROOT / "contracts"
@@ -100,21 +101,29 @@ def run_once(
     if not registry:
         return 2, "BLOCK empty_or_unreadable_board_registry"
 
-    store = ContinuationStore(db_path)
     contracts = _contract_registry()
     adapter_factory = real_adapter_factory if apply else _fake_adapter_factory
     handle_kinds = None if all_kinds else (ContinuationKind.NEEDS_INPUT,)
 
-    result = ingest_all_boards(
-        registry=registry,
-        store=store,
-        contract_registry=contracts,
-        source_factory=live_source_factory,
-        adapter_factory=adapter_factory,
-        handle_kinds=handle_kinds,
-    )
-
-    lines = _material_lines(result)
+    # apply=false must be strictly side-effect-free (plan M27 blocker 1): route
+    # against an isolated throwaway copy of the durable ledger so cursors/
+    # instances/receipts/outbox/interaction rows are never mutated, while a
+    # genuinely new live event still previews correctly. apply=true uses the
+    # real durable store unchanged.
+    with contextlib.ExitStack() as stack:
+        if apply:
+            store = ContinuationStore(db_path)
+        else:
+            store = stack.enter_context(isolated_preview_store(db_path))
+        result = ingest_all_boards(
+            registry=registry,
+            store=store,
+            contract_registry=contracts,
+            source_factory=live_source_factory,
+            adapter_factory=adapter_factory,
+            handle_kinds=handle_kinds,
+        )
+        lines = _material_lines(result)
     return 0, "\n".join(lines)
 
 

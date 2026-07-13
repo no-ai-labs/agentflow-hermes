@@ -21,17 +21,21 @@ def test_watchdog_seeds_then_silent_on_no_new_events(tmp_path, capsys):
     wd = _load_watchdog()
     db = tmp_path / "agentflow.sqlite"
 
-    # First cadence: every real board is seen for the first time -> seeded to
-    # current max, no replay, no material creation -> silent.
+    # apply=false is a strictly side-effect-free preview (plan M27 blocker 1):
+    # every real board's dry-run runs against an isolated throwaway copy, so a
+    # first-sight board previews nothing (seeded-only) and stays silent...
     code1, out1 = wd.run_once(registry_path=wd._DEFAULT_REGISTRY, db_path=db, apply=False, all_kinds=False)
     assert code1 == 0
     assert out1 == ""
 
-    # Second cadence: no genuinely new terminal events beyond the seed in this
-    # test window -> still silent.
+    # ...and the durable db_path is never even created by a dry-run.
+    assert not db.exists()
+
+    # Second cadence: still silent, still no durable side effects.
     code2, out2 = wd.run_once(registry_path=wd._DEFAULT_REGISTRY, db_path=db, apply=False, all_kinds=False)
     assert code2 == 0
     assert out2 == ""
+    assert not db.exists()
 
 
 def test_watchdog_blocks_on_empty_registry(tmp_path):

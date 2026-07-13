@@ -65,7 +65,29 @@ def _write_needs_input_run(db_path: Path, *, task_id: str) -> None:
     con.close()
 
 
-def test_needs_input_watchdog_is_silent_reconciliation_when_nothing_new(tmp_path):
+def _durable_snapshot(db_path: Path) -> dict:
+    """Count + content hash of every table in the durable ledger. Identical
+    before/after a dry-run proves apply=false was strictly side-effect-free."""
+    import hashlib
+
+    con = sqlite3.connect(db_path)
+    try:
+        snap = {"__user_version__": con.execute("pragma user_version").fetchone()[0]}
+        for (table,) in con.execute("select name from sqlite_master where type='table' order by name"):
+            rows = con.execute(f"select * from {table}").fetchall()
+            digest = hashlib.sha256()
+            for row in rows:
+                digest.update(repr(row).encode("utf-8"))
+            snap[table] = (len(rows), digest.hexdigest())
+        return snap
+    finally:
+        con.close()
+
+
+def test_needs_input_watchdog_dryrun_is_silent_when_nothing_new(tmp_path):
+    """apply=false is a pure, side-effect-free preview (plan M27 blocker 1): a
+    board with no events past its durable cursor previews nothing and stays
+    silent, and the durable ledger is never mutated by the dry-run itself."""
     wd = _load_module("agentflow_needs_input_watchdog_compat", _REPO / "scripts" / "agentflow_needs_input_watchdog.py")
     boards_root = tmp_path / "boards"
     db_path = _write_kanban_board(boards_root, "compat-board")
@@ -73,20 +95,27 @@ def test_needs_input_watchdog_is_silent_reconciliation_when_nothing_new(tmp_path
     registry_path.write_text(f"boards:\n  compat-board:\n    db_path: {db_path}\n    enabled: true\n")
     db = tmp_path / "agentflow.sqlite"
 
-    # First cadence: board seen for the first time, no historical replay.
+    # Prime the durable cursor via an apply seed (first sight seeds only, no
+    # board adapter is ever built when there are no events to process).
+    code0, out0 = wd.run_once(registry_path=registry_path, db_path=db, apply=True, all_kinds=False)
+    assert (code0, out0) == (0, "")
+    before = _durable_snapshot(db)
+
+    # No new events on the board -> dry-run previews nothing -> silent.
     code1, out1 = wd.run_once(registry_path=registry_path, db_path=db, apply=False, all_kinds=False)
     assert (code1, out1) == (0, "")
-
-    # No new events between cadences: still silent (reconciliation, not a
-    # primary/real-time actor — it only catches up a durable cursor).
+    # Idempotent: repeating the dry-run is still silent and still durable-safe.
     code2, out2 = wd.run_once(registry_path=registry_path, db_path=db, apply=False, all_kinds=False)
     assert (code2, out2) == (0, "")
+    assert _durable_snapshot(db) == before
 
 
-def test_needs_input_watchdog_still_catches_a_real_needs_input_event(tmp_path):
-    """Proves the reconciliation pass is still fully correct, not merely
-    disabled — the same router agentflowd uses still produces one owner-input
-    creation for one genuine new event."""
+def test_needs_input_watchdog_dryrun_previews_real_event_without_persisting(tmp_path):
+    """Proves the reconciliation router is still fully correct, not merely
+    disabled — the same router agentflowd uses previews one owner-input line
+    for one genuine new event — while apply=false leaves the durable ledger
+    byte-for-byte unchanged, and repeated dry-runs re-preview idempotently
+    (a preview never advances the durable cursor)."""
     wd = _load_module("agentflow_needs_input_watchdog_compat2", _REPO / "scripts" / "agentflow_needs_input_watchdog.py")
     boards_root = tmp_path / "boards"
     db_path = _write_kanban_board(boards_root, "compat-board")
@@ -94,32 +123,37 @@ def test_needs_input_watchdog_still_catches_a_real_needs_input_event(tmp_path):
     registry_path.write_text(f"boards:\n  compat-board:\n    db_path: {db_path}\n    enabled: true\n")
     db = tmp_path / "agentflow.sqlite"
 
-    wd.run_once(registry_path=registry_path, db_path=db, apply=False, all_kinds=False)  # seed
+    wd.run_once(registry_path=registry_path, db_path=db, apply=True, all_kinds=False)  # seed durable cursor
+    before = _durable_snapshot(db)
 
     _write_needs_input_run(db_path, task_id="t1")
     code, out = wd.run_once(registry_path=registry_path, db_path=db, apply=False, all_kinds=False)
-
     assert code == 0
     assert "OWNER-INPUT board=compat-board" in out
+    assert _durable_snapshot(db) == before  # dry-run mutated nothing durable
 
-    # Immediately re-running with nothing new is silent again (idempotent
-    # cursor advance, not a re-processed duplicate).
+    # A dry-run is a stateless preview: the durable cursor never advanced, so
+    # re-running previews the same still-pending event again (not a persisted
+    # duplicate) and again touches nothing durable.
     code2, out2 = wd.run_once(registry_path=registry_path, db_path=db, apply=False, all_kinds=False)
-    assert (code2, out2) == (0, "")
+    assert code2 == 0
+    assert "OWNER-INPUT board=compat-board" in out2
+    assert _durable_snapshot(db) == before
 
 
 def test_needs_input_watchdog_all_kinds_flag_reaches_go_and_code_fix_too(tmp_path):
     """``--all-kinds`` routes through the exact same unified router as
     agentflowd, so GO/CODE_FIX are also reachable from this reconciliation
     cadence, not just needs_input — proving no behavior was silently dropped
-    by keeping this script around."""
+    by keeping this script around. Still a side-effect-free dry-run preview."""
     wd = _load_module("agentflow_needs_input_watchdog_compat3", _REPO / "scripts" / "agentflow_needs_input_watchdog.py")
     boards_root = tmp_path / "boards"
     db_path = _write_kanban_board(boards_root, "compat-board")
     registry_path = tmp_path / "boards.yaml"
     registry_path.write_text(f"boards:\n  compat-board:\n    db_path: {db_path}\n    enabled: true\n")
     db = tmp_path / "agentflow.sqlite"
-    wd.run_once(registry_path=registry_path, db_path=db, apply=False, all_kinds=True)  # seed
+    wd.run_once(registry_path=registry_path, db_path=db, apply=True, all_kinds=True)  # seed durable cursor
+    before = _durable_snapshot(db)
 
     con = sqlite3.connect(db_path)
     con.execute("insert or replace into tasks(id, title, assignee) values('t_go', 'demo', 'agent')")
@@ -133,6 +167,7 @@ def test_needs_input_watchdog_all_kinds_flag_reaches_go_and_code_fix_too(tmp_pat
     code, out = wd.run_once(registry_path=registry_path, db_path=db, apply=False, all_kinds=True)
     assert code == 0
     assert "GO board=compat-board" in out
+    assert _durable_snapshot(db) == before  # dry-run mutated nothing durable
 
 
 # -- auto-remediation watchdog: unchanged legacy reconciliation semantics ---

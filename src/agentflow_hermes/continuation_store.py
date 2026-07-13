@@ -5,10 +5,14 @@ than silently split across two default DB paths (see ``doctor_store_selection``)
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
+import shutil
 import sqlite3
+import tempfile
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -798,6 +802,39 @@ class ContinuationStore:
         d["counts"] = json.loads(d.pop("counts_json") or "{}")
         d["verification"] = json.loads(d.pop("verification_json") or "{}")
         return d
+
+
+@contextlib.contextmanager
+def isolated_preview_store(source_path: Path | str) -> Iterator[ContinuationStore]:
+    """Yield a ``ContinuationStore`` backed by an ephemeral throwaway copy of
+    ``source_path`` for strictly side-effect-free dry-runs (plan M27 blocker 1).
+
+    ``apply=false`` cadences must never mutate the durable/legacy continuation
+    ledger, yet must still see its prior state so preview output is realistic
+    (a new live event past an existing cursor still previews as OWNER-INPUT).
+    This copies the source ledger's *committed* content — via sqlite's backup
+    API, so WAL-pending rows are included — into a temp DB, hands back a store
+    pointed at the copy, and deletes the copy on exit. The durable
+    ``source_path`` is opened read-only (backup source) and never written; when
+    it does not exist yet, a fresh empty temp DB is used and the durable file is
+    never created."""
+    source_path = Path(source_path)
+    tmpdir = Path(tempfile.mkdtemp(prefix="agentflow-preview-"))
+    try:
+        preview_path = tmpdir / "preview.sqlite"
+        if source_path.exists():
+            src = sqlite3.connect(f"file:{source_path}?mode=ro", uri=True)
+            try:
+                dst = sqlite3.connect(preview_path)
+                try:
+                    src.backup(dst)
+                finally:
+                    dst.close()
+            finally:
+                src.close()
+        yield ContinuationStore(preview_path)
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def _has_active_continuation_state(path: Path) -> bool:

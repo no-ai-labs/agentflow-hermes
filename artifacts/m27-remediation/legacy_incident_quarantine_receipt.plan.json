@@ -1,0 +1,321 @@
+{
+  "success": true,
+  "quarantined": false,
+  "apply": false,
+  "legacy_db": "/home/duckran/.hermes/state/agentflow_needs_input_continuations.sqlite",
+  "incident_task_prefix": "t_m27live_",
+  "incident_instance_ids": [
+    6,
+    7,
+    8
+  ],
+  "incident_outbox_ids": [
+    17,
+    18,
+    19,
+    20,
+    21,
+    22
+  ],
+  "preserved_legit_instances": [
+    {
+      "id": 1,
+      "board": "agentflow-hermes",
+      "source_task_id": "t_4e1cd2b8",
+      "state": "materializing"
+    },
+    {
+      "id": 2,
+      "board": "agentflow-hermes",
+      "source_task_id": "t_e5930ee3",
+      "state": "waiting_owner"
+    },
+    {
+      "id": 3,
+      "board": "agentflow-hermes",
+      "source_task_id": "t_66b85df2",
+      "state": "waiting_owner"
+    },
+    {
+      "id": 4,
+      "board": "warroom-os",
+      "source_task_id": "t_cb9f75b5",
+      "state": "materializing"
+    },
+    {
+      "id": 5,
+      "board": "oracle-lab",
+      "source_task_id": "t_57878949",
+      "state": "materializing"
+    }
+  ],
+  "moved_rows": {
+    "continuation_instances": [
+      {
+        "id": 6,
+        "board": "agentflow-hermes",
+        "source_task_id": "t_m27live_20260713T044721Z_agentflow_hermes",
+        "source_event_id": "kanban-event-2728",
+        "source_graph_id": "m27-live-canary",
+        "contract_ref": "generic.owner-input.v1",
+        "verdict": "BLOCK",
+        "continuation_kind": "needs_input",
+        "state": "waiting_owner",
+        "origin_ref": "discord:1497895797579190357",
+        "return_to_ref": "discord:1497895797579190357",
+        "workspace_ref": "/home/duckran/dev/agentflow-hermes",
+        "idempotency_key": "continuation:agentflow-hermes:t_m27live_20260713T044721Z_agentflow_hermes:kanban-event-2728:generic.owner-input.v1",
+        "created_at": 1783918149.3110533,
+        "updated_at": 1783918149.3141518
+      },
+      {
+        "id": 7,
+        "board": "warroom-os",
+        "source_task_id": "t_m27live_20260713T044721Z_warroom_os",
+        "source_event_id": "kanban-event-5423",
+        "source_graph_id": "m27-live-canary",
+        "contract_ref": "generic.owner-input.v1",
+        "verdict": "BLOCK",
+        "continuation_kind": "needs_input",
+        "state": "waiting_owner",
+        "origin_ref": "discord:1499390151393284106",
+        "return_to_ref": "discord:1499390151393284106",
+        "workspace_ref": "/home/duckran/dev/agentflow-hermes",
+        "idempotency_key": "continuation:warroom-os:t_m27live_20260713T044721Z_warroom_os:kanban-event-5423:generic.owner-input.v1",
+        "created_at": 1783918149.3394837,
+        "updated_at": 1783918149.3414834
+      },
+      {
+        "id": 8,
+        "board": "oracle-lab",
+        "source_task_id": "t_m27live_20260713T044721Z_oracle_lab",
+        "source_event_id": "kanban-event-3638",
+        "source_graph_id": "m27-live-canary",
+        "contract_ref": "generic.owner-input.v1",
+        "verdict": "BLOCK",
+        "continuation_kind": "needs_input",
+        "state": "waiting_owner",
+        "origin_ref": "discord:1500539609413849200",
+        "return_to_ref": "discord:1500539609413849200",
+        "workspace_ref": "/home/duckran/dev/agentflow-hermes",
+        "idempotency_key": "continuation:oracle-lab:t_m27live_20260713T044721Z_oracle_lab:kanban-event-3638:generic.owner-input.v1",
+        "created_at": 1783918149.3625941,
+        "updated_at": 1783918149.3652985
+      }
+    ],
+    "board_outbox": [
+      {
+        "id": 17,
+        "continuation_id": 6,
+        "step_id": "9",
+        "operation": "create_task",
+        "payload_json": "{\"kind\": \"owner_anchor\", \"title\": \"[owner-input] generic.owner-input.v1 evidence/approval anchor\", \"idempotency_key\": \"owner_anchor:f1894da6a039367e\", \"status\": \"blocked\", \"blocked_reason\": \"awaiting_owner_input\", \"assignee\": \"board-owner\", \"origin_ref\": \"discord:1497895797579190357\", \"return_to_ref\": \"discord:1497895797579190357\", \"contract_ref\": \"generic.owner-input.v1\", \"required_owner_fields\": [\"result_url\"], \"owner_anchor\": true}",
+        "idempotency_key": "owner_anchor:f1894da6a039367e",
+        "state": "applied",
+        "board_task_id": "task:b677e183f393",
+        "attempts": 1,
+        "created_at": 1783918149.3203595,
+        "updated_at": 1783918149.3231587
+      },
+      {
+        "id": 18,
+        "continuation_id": 6,
+        "step_id": "9",
+        "operation": "subscribe",
+        "payload_json": "{\"task_id\": \"task:b677e183f393\", \"endpoint\": \"discord:1497895797579190357\"}",
+        "idempotency_key": "subscribe:owner_anchor:f1894da6a039367e:discord:1497895797579190357",
+        "state": "applied",
+        "board_task_id": "",
+        "attempts": 1,
+        "created_at": 1783918149.327841,
+        "updated_at": 1783918149.3315308
+      },
+      {
+        "id": 19,
+        "continuation_id": 7,
+        "step_id": "10",
+        "operation": "create_task",
+        "payload_json": "{\"kind\": \"owner_anchor\", \"title\": \"[owner-input] generic.owner-input.v1 evidence/approval anchor\", \"idempotency_key\": \"owner_anchor:4e4149e481d1668d\", \"status\": \"blocked\", \"blocked_reason\": \"awaiting_owner_input\", \"assignee\": \"board-owner\", \"origin_ref\": \"discord:1499390151393284106\", \"return_to_ref\": \"discord:1499390151393284106\", \"contract_ref\": \"generic.owner-input.v1\", \"required_owner_fields\": [\"result_url\"], \"owner_anchor\": true}",
+        "idempotency_key": "owner_anchor:4e4149e481d1668d",
+        "state": "applied",
+        "board_task_id": "task:6216389f4030",
+        "attempts": 1,
+        "created_at": 1783918149.3460922,
+        "updated_at": 1783918149.3482451
+      },
+      {
+        "id": 20,
+        "continuation_id": 7,
+        "step_id": "10",
+        "operation": "subscribe",
+        "payload_json": "{\"task_id\": \"task:6216389f4030\", \"endpoint\": \"discord:1499390151393284106\"}",
+        "idempotency_key": "subscribe:owner_anchor:4e4149e481d1668d:discord:1499390151393284106",
+        "state": "applied",
+        "board_task_id": "",
+        "attempts": 1,
+        "created_at": 1783918149.3523953,
+        "updated_at": 1783918149.3542948
+      },
+      {
+        "id": 21,
+        "continuation_id": 8,
+        "step_id": "11",
+        "operation": "create_task",
+        "payload_json": "{\"kind\": \"owner_anchor\", \"title\": \"[owner-input] generic.owner-input.v1 evidence/approval anchor\", \"idempotency_key\": \"owner_anchor:e076f3b2e477f1d7\", \"status\": \"blocked\", \"blocked_reason\": \"awaiting_owner_input\", \"assignee\": \"board-owner\", \"origin_ref\": \"discord:1500539609413849200\", \"return_to_ref\": \"discord:1500539609413849200\", \"contract_ref\": \"generic.owner-input.v1\", \"required_owner_fields\": [\"result_url\"], \"owner_anchor\": true}",
+        "idempotency_key": "owner_anchor:e076f3b2e477f1d7",
+        "state": "applied",
+        "board_task_id": "task:43b4f8b6047b",
+        "attempts": 1,
+        "created_at": 1783918149.3710241,
+        "updated_at": 1783918149.3727524
+      },
+      {
+        "id": 22,
+        "continuation_id": 8,
+        "step_id": "11",
+        "operation": "subscribe",
+        "payload_json": "{\"task_id\": \"task:43b4f8b6047b\", \"endpoint\": \"discord:1500539609413849200\"}",
+        "idempotency_key": "subscribe:owner_anchor:e076f3b2e477f1d7:discord:1500539609413849200",
+        "state": "applied",
+        "board_task_id": "",
+        "attempts": 1,
+        "created_at": 1783918149.3767774,
+        "updated_at": 1783918149.3794785
+      }
+    ],
+    "continuation_events": [
+      {
+        "id": 20,
+        "continuation_id": 6,
+        "seq": 1,
+        "kind": "created",
+        "payload_json": "{\"state\": \"detected\"}",
+        "created_at": 1783918149.3117151
+      },
+      {
+        "id": 21,
+        "continuation_id": 6,
+        "seq": 2,
+        "kind": "state_transition",
+        "payload_json": "{\"from\": \"detected\", \"to\": \"waiting_owner\", \"reason\": \"needs_input_detected\"}",
+        "created_at": 1783918149.3145037
+      },
+      {
+        "id": 22,
+        "continuation_id": 7,
+        "seq": 1,
+        "kind": "created",
+        "payload_json": "{\"state\": \"detected\"}",
+        "created_at": 1783918149.3397694
+      },
+      {
+        "id": 23,
+        "continuation_id": 7,
+        "seq": 2,
+        "kind": "state_transition",
+        "payload_json": "{\"from\": \"detected\", \"to\": \"waiting_owner\", \"reason\": \"needs_input_detected\"}",
+        "created_at": 1783918149.3417468
+      },
+      {
+        "id": 24,
+        "continuation_id": 8,
+        "seq": 1,
+        "kind": "created",
+        "payload_json": "{\"state\": \"detected\"}",
+        "created_at": 1783918149.3630269
+      },
+      {
+        "id": 25,
+        "continuation_id": 8,
+        "seq": 2,
+        "kind": "state_transition",
+        "payload_json": "{\"from\": \"detected\", \"to\": \"waiting_owner\", \"reason\": \"needs_input_detected\"}",
+        "created_at": 1783918149.36565
+      }
+    ],
+    "continuation_steps": [
+      {
+        "id": 9,
+        "continuation_id": 6,
+        "step_kind": "owner_anchor",
+        "state": "applied",
+        "board_task_id": "task:b677e183f393",
+        "parent_step_id": null,
+        "idempotency_key": "owner_anchor:f1894da6a039367e",
+        "created_at": 1783918149.317744,
+        "updated_at": 1783918149.3251517
+      },
+      {
+        "id": 10,
+        "continuation_id": 7,
+        "step_kind": "owner_anchor",
+        "state": "applied",
+        "board_task_id": "task:6216389f4030",
+        "parent_step_id": null,
+        "idempotency_key": "owner_anchor:4e4149e481d1668d",
+        "created_at": 1783918149.3439353,
+        "updated_at": 1783918149.3499794
+      },
+      {
+        "id": 11,
+        "continuation_id": 8,
+        "step_kind": "owner_anchor",
+        "state": "applied",
+        "board_task_id": "task:43b4f8b6047b",
+        "parent_step_id": null,
+        "idempotency_key": "owner_anchor:e076f3b2e477f1d7",
+        "created_at": 1783918149.3691897,
+        "updated_at": 1783918149.3747199
+      }
+    ]
+  },
+  "counts_before": {
+    "agentflow_meta": 0,
+    "board_cursors": 3,
+    "board_outbox": 22,
+    "continuation_events": 25,
+    "continuation_instances": 8,
+    "continuation_steps": 11,
+    "deadletter": 0,
+    "idempotency_keys": 0,
+    "inbound_reply_receipts": 0,
+    "interaction_cases": 0,
+    "interaction_members": 0,
+    "job_events": 0,
+    "jobs": 0,
+    "maintenance_cycles": 0,
+    "maintenance_deadletter": 0,
+    "maintenance_state": 0,
+    "operator_receipts": 0,
+    "owner_input_receipts": 3,
+    "requirement_satisfactions": 0,
+    "sqlite_sequence": 5,
+    "standing_policies": 0,
+    "store_migration_receipts": 0
+  },
+  "counts_after": {
+    "agentflow_meta": 0,
+    "board_cursors": 3,
+    "board_outbox": 22,
+    "continuation_events": 25,
+    "continuation_instances": 8,
+    "continuation_steps": 11,
+    "deadletter": 0,
+    "idempotency_keys": 0,
+    "inbound_reply_receipts": 0,
+    "interaction_cases": 0,
+    "interaction_members": 0,
+    "job_events": 0,
+    "jobs": 0,
+    "maintenance_cycles": 0,
+    "maintenance_deadletter": 0,
+    "maintenance_state": 0,
+    "operator_receipts": 0,
+    "owner_input_receipts": 3,
+    "requirement_satisfactions": 0,
+    "sqlite_sequence": 5,
+    "standing_policies": 0,
+    "store_migration_receipts": 0
+  },
+  "generated_at": 1783919764.46115
+}
