@@ -5,14 +5,16 @@
 handler router in ``agentflow_hermes.daemon``, and runs a periodic
 reconciliation pass.
 
-Wake source: Linux inotify is not wired here because it would require a
-non-stdlib dependency (or hand-rolled ctypes syscall bindings) for marginal
-benefit over a short coalescing poll loop; the plan explicitly allows "a
-one-second async scan if inotify unavailable" as the fallback (section 9.3),
-so this daemon always runs that fallback with a short interval
-(``--poll-interval-seconds``, default 0.5s) as its primary wake source. The
+Wake source: a real Linux inotify watch (hand-rolled ctypes syscall
+bindings in ``agentflow_hermes.inotify_watch`` — no non-stdlib dependency)
+on every discovered board's ``kanban.db`` (and its WAL/journal/shm
+siblings) is the primary wake source; ``AgentflowDaemon.run`` wakes and
+ticks as soon as any board file is written to. The short poll interval
+(``--poll-interval-seconds``, default 0.5s) remains the fallback wake
+source per plan section 9.3, used whenever inotify is unavailable (non-
+Linux, sandboxed) or simply hasn't fired within one interval. The
 five-minute reconciliation timer (``--reconcile-interval-seconds``) is the
-real recovery path per plan section 2.6, independent of the poll cadence.
+real recovery path per plan section 2.6, independent of either wake path.
 
 Safety: dry-run (in-memory FakeBoardAdapter) by default; ``--apply`` switches
 to the real gated CLI adapter that mutates the shared Kanban boards.

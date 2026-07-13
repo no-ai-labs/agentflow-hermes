@@ -1,9 +1,12 @@
 """agentflowd: the unified event-driven continuation runtime (plan section 9).
 
 This module is the "one runtime, many handlers" implementation: board
-discovery, a fast wake source (short polling loop; real inotify hardware is
-not required by the plan — see module docstring in ``scripts/agentflowd.py``),
-and a durable outbox/cursor reconciliation pass that also runs on every wake.
+discovery, a real Linux inotify primary wake source watching every
+discovered board's ``kanban.db`` (plus its WAL/journal/shm siblings —
+``inotify_watch.py``) with the short poll-interval loop kept as the
+fallback wake source when inotify is unavailable (non-Linux, sandboxed, or
+the syscall setup fails for any reason), and a durable outbox/cursor
+reconciliation pass that also runs on every wake.
 ``AgentflowDaemon.tick()`` is the synchronous core — the async loop in
 ``run()`` is a thin wrapper around it so tests can exercise routing/latency
 without any real asyncio sleeping.
@@ -256,9 +259,52 @@ class AgentflowDaemon:
         report["outbox"] = reconcile_outbox(self.config.store, adapter_by_board=adapter_by_board)
         return report
 
+    def _watch_targets(self) -> list[Path]:
+        """Every path an inotify watch should cover this tick: the boards
+        root itself (so a newly created board's directory triggers a
+        re-scan next loop) plus each currently discovered board's
+        kanban.db."""
+        targets = [self.config.boards_root]
+        registry = discover_boards(boards_root=self.config.boards_root, overrides_path=self.config.overrides_path)
+        for entry in registry.values():
+            targets.append(Path(entry.db_path))
+        return targets
+
+    def _start_watcher(self, loop: asyncio.AbstractEventLoop, wake_event: asyncio.Event):
+        """Best-effort real inotify primary wake source. Returns None (and
+        the caller falls back to poll-interval-only wake, exactly the prior
+        behavior) on any platform/syscall failure."""
+        try:
+            from .inotify_watch import InotifyUnavailable, InotifyWatcher
+
+            watcher = InotifyWatcher()
+        except Exception:
+            return None
+
+        def _on_readable() -> None:
+            if watcher.drain():
+                wake_event.set()
+
+        try:
+            loop.add_reader(watcher.fd, _on_readable)
+        except (NotImplementedError, OSError):
+            watcher.close()
+            return None
+        return watcher
+
+    def _refresh_watches(self, watcher) -> None:
+        if watcher is None:
+            return
+        watcher.watch(self.config.boards_root)
+        for target in self._watch_targets()[1:]:
+            watcher.watch_board_db(target)
+
     async def run(self, *, stop_event: asyncio.Event | None = None, max_ticks: int | None = None) -> None:
-        """Async wake loop: a short coalescing poll (fallback per plan 9.3 —
-        no inotify hardware dependency required) plus a periodic
+        """Async wake loop: a real Linux inotify primary wake source
+        (``inotify_watch.py``) watching every discovered board's kanban.db
+        for a write, with the short coalescing poll kept as the fallback
+        wake source (plan 9.3) whenever inotify is unavailable or simply
+        hasn't fired within one poll interval, plus a periodic
         reconciliation pass. Stops on ``stop_event``, SIGTERM/SIGINT, or
         after ``max_ticks`` (test-only escape hatch)."""
         stop_event = stop_event or asyncio.Event()
@@ -267,16 +313,39 @@ class AgentflowDaemon:
             with contextlib.suppress(NotImplementedError, ValueError):
                 loop.add_signal_handler(sig, stop_event.set)
 
+        wake_event = asyncio.Event()
+        watcher = self._start_watcher(loop, wake_event)
+
         last_reconcile = 0.0
         ticks = 0
-        while not stop_event.is_set():
-            self.tick()
-            ticks += 1
-            now = time.time()
-            if now - last_reconcile >= self.config.reconcile_interval_seconds:
-                self.reconcile()
-                last_reconcile = now
-            if max_ticks is not None and ticks >= max_ticks:
-                return
-            with contextlib.suppress(asyncio.TimeoutError):
-                await asyncio.wait_for(stop_event.wait(), timeout=self.config.poll_interval_seconds)
+        try:
+            while not stop_event.is_set():
+                self._refresh_watches(watcher)
+                self.tick()
+                ticks += 1
+                now = time.time()
+                if now - last_reconcile >= self.config.reconcile_interval_seconds:
+                    self.reconcile()
+                    last_reconcile = now
+                if max_ticks is not None and ticks >= max_ticks:
+                    return
+                wake_event.clear()
+                stop_wait = asyncio.ensure_future(stop_event.wait())
+                wake_wait = asyncio.ensure_future(wake_event.wait())
+                try:
+                    await asyncio.wait(
+                        {stop_wait, wake_wait},
+                        timeout=self.config.poll_interval_seconds,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                finally:
+                    for pending in (stop_wait, wake_wait):
+                        if not pending.done():
+                            pending.cancel()
+                            with contextlib.suppress(asyncio.CancelledError):
+                                await pending
+        finally:
+            if watcher is not None:
+                with contextlib.suppress(Exception):
+                    loop.remove_reader(watcher.fd)
+                watcher.close()
