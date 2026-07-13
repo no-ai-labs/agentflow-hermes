@@ -174,3 +174,25 @@ def test_doctor_blocks_on_split_brain_both_active(tmp_path):
     result = doctor_store_selection(canonical_path=canonical, fallback_path=fallback)
     assert result["success"] is False
     assert result["error"] == "split_store_both_active"
+
+
+def test_doctor_ignores_jobs_only_fallback_collision(tmp_path):
+    import sqlite3
+
+    canonical = tmp_path / "canonical.sqlite"
+    fallback = tmp_path / "fallback.db"
+    _make_instance(ContinuationStore(canonical))
+    with sqlite3.connect(fallback) as con:
+        con.executescript(
+            """
+            create table jobs(id text primary key, status text not null);
+            insert into jobs(id, status) values('job_collision', 'queued');
+            """
+        )
+
+    result = doctor_store_selection(canonical_path=canonical, fallback_path=fallback)
+
+    assert result["success"] is True
+    assert result["split_brain"] is False
+    assert result["selected"] == str(canonical)
+    assert result["fallback_active"] is False

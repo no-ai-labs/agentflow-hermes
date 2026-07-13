@@ -238,8 +238,12 @@ agentflow-hermes autopilot reconcile           # run one recovery pass now
 
 **Canonical control-plane store:** every continuation, requirement
 satisfaction, standing policy, and interaction case lives in one store,
-`~/.hermes/agentflow/agentflow.sqlite` (override with `HERMES_CONTINUATION_DB`).
-Earlier milestones left state split across that path, the M26 watchdog's
+`~/.hermes/agentflow/agentflow-control-plane.sqlite` (override with
+`HERMES_CONTINUATION_DB`). Earlier milestones left state split across the
+M27 live daemon's `~/.hermes/agentflow/agentflow-daemon.sqlite`, the
+pre-control-plane default `~/.hermes/agentflow/agentflow.sqlite` (on some
+hosts this path collides with an older, unrelated AgentFlow jobs DB —
+migration treats it as a no-op and leaves it untouched), the M26 watchdog's
 `~/.hermes/state/agentflow_needs_input_continuations.sqlite`, and the older
 `~/.agentflow/agentflow.db` jobs store. `agentflow-hermes continuation
 migrate-store` copies instances/steps/receipts/events/cursors/outbox from

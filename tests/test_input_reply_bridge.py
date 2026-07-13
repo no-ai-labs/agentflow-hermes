@@ -115,6 +115,23 @@ def test_register_includes_interaction_tools(hermes_ctx):
     assert {"agentflow_input_inbox", "agentflow_submit_input_text", "agentflow_input_status"} <= names
 
 
+def test_plugin_canonical_store_uses_control_plane_default_and_sees_cases(tmp_path, monkeypatch):
+    monkeypatch.delenv("HERMES_CONTINUATION_DB", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    ctx = FakeHermesContext()
+    plugin.register(ctx)
+    store = ContinuationStore.canonical()
+    assert store.path == tmp_path / ".hermes" / "agentflow" / "agentflow-control-plane.sqlite"
+    _open_single_field_case(store)
+
+    inbox_tool = _find_tool(ctx, "agentflow_input_inbox")
+    result = json.loads(inbox_tool["handler"]({"endpoint": "discord:#research"}))
+
+    assert result["success"] is True
+    assert len(result["cases"]) == 1
+    assert result["cases"][0]["endpoint"] == "discord:#research"
+
+
 def test_input_inbox_lists_case_and_transitions_to_asked(tmp_path, hermes_ctx):
     store = _store(tmp_path)
     _open_single_field_case(store)

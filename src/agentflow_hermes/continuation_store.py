@@ -172,11 +172,30 @@ def default_continuation_db_path() -> Path:
     explicit = os.environ.get("HERMES_CONTINUATION_DB")
     if explicit:
         return Path(explicit)
-    return default_continuation_home() / "agentflow" / "agentflow.sqlite"
+    return default_continuation_home() / "agentflow" / "agentflow-control-plane.sqlite"
 
 
 def fallback_continuation_db_path() -> Path:
     return fallback_job_db_path()
+
+
+def legacy_daemon_db_path() -> Path:
+    """The M27 live daemon's DB path (``agentflowd.py run/reconcile --db``):
+    a pre-cutover physical location that held canonical continuation state
+    before this path became the control-plane canonical. Same shape as the
+    canonical store, just a different file — only read via ``continuation
+    migrate-store``/``doctor``, never written implicitly."""
+    return default_continuation_home() / "agentflow" / "agentflow-daemon.sqlite"
+
+
+def legacy_pre_control_plane_db_path() -> Path:
+    """The old canonical default (``agentflow.sqlite``) from before the
+    control-plane cutover. In practice this path is also shared with an
+    older, unrelated AgentFlow jobs DB that has a conflicting jobs/job_events
+    schema on some hosts; ``migrate_legacy_store`` treats anything without a
+    ``continuation_instances`` table as a no-op so that collision is never
+    mutated (see plan: preserve old agentflow.sqlite untouched)."""
+    return default_continuation_home() / "agentflow" / "agentflow.sqlite"
 
 
 def legacy_needs_input_db_path() -> Path:
@@ -194,10 +213,18 @@ def legacy_needs_input_db_path() -> Path:
 
 def default_legacy_continuation_db_paths() -> tuple[Path, ...]:
     """Every known historical continuation-store location (plan 1.7): the
-    M26 needs-input watchdog DB and the older shared jobs.db fallback path.
-    Deduplicated and never including the canonical path itself."""
+    M27 live daemon DB, the pre-control-plane ``agentflow.sqlite`` default
+    (which may collide with an unrelated older jobs DB on some hosts — see
+    ``legacy_pre_control_plane_db_path``), the M26 needs-input watchdog DB,
+    and the older shared jobs.db fallback path. Deduplicated and never
+    including the canonical path itself."""
     canonical = default_continuation_db_path()
-    candidates = (legacy_needs_input_db_path(), fallback_continuation_db_path())
+    candidates = (
+        legacy_daemon_db_path(),
+        legacy_pre_control_plane_db_path(),
+        legacy_needs_input_db_path(),
+        fallback_continuation_db_path(),
+    )
     seen: list[Path] = []
     for path in candidates:
         if path != canonical and path not in seen:
@@ -852,11 +879,6 @@ def _has_active_continuation_state(path: Path) -> bool:
                 f"select count(*) as n from continuation_instances where state not in ({placeholders})", terminal
             ).fetchone()
             active = active or int(row["n"]) > 0
-        if "jobs" in tables:
-            row = con.execute(
-                "select count(*) as n from jobs where status not in ('succeeded','failed')"
-            ).fetchone()
-            active = active or int(row["n"]) > 0
         return active
     finally:
         con.close()
@@ -997,7 +1019,20 @@ def migrate_legacy_store(*, canonical: "ContinuationStore", legacy_path: Path) -
             return {"success": True, "migrated": False, "reason": "no_continuation_tables", "legacy_path": str(legacy_path)}
 
         id_map: dict[int, int] = {}
-        counts = {"instances": 0, "steps": 0, "receipts": 0, "events": 0, "cursors": 0, "outbox": 0}
+        counts = {
+            "instances": 0,
+            "steps": 0,
+            "receipts": 0,
+            "events": 0,
+            "cursors": 0,
+            "outbox": 0,
+            "satisfactions": 0,
+            "standing_policies": 0,
+            "interaction_cases": 0,
+            "interaction_members": 0,
+            "inbound_reply_receipts": 0,
+            "idempotency_keys": 0,
+        }
 
         with canonical.connect() as con:
             for row in legacy_con.execute("select * from continuation_instances order by id"):
@@ -1026,84 +1061,180 @@ def migrate_legacy_store(*, canonical: "ContinuationStore", legacy_path: Path) -
                 id_map[row["id"]] = cur.lastrowid
                 counts["instances"] += 1
 
-            for row in legacy_con.execute("select * from continuation_steps order by id"):
-                new_cid = id_map.get(row["continuation_id"])
-                if new_cid is None:
-                    continue
-                cur = con.execute(
-                    """
-                    insert or ignore into continuation_steps(
-                        continuation_id, step_kind, state, board_task_id, parent_step_id, idempotency_key,
-                        created_at, updated_at
-                    ) values(?,?,?,?,?,?,?,?)
-                    """,
-                    (new_cid, row["step_kind"], row["state"], row["board_task_id"], row["parent_step_id"],
-                     row["idempotency_key"], row["created_at"], row["updated_at"]),
-                )
-                counts["steps"] += max(cur.rowcount, 0)
+            if "continuation_steps" in tables:
+                for row in legacy_con.execute("select * from continuation_steps order by id"):
+                    new_cid = id_map.get(row["continuation_id"])
+                    if new_cid is None:
+                        continue
+                    cur = con.execute(
+                        """
+                        insert or ignore into continuation_steps(
+                            continuation_id, step_kind, state, board_task_id, parent_step_id, idempotency_key,
+                            created_at, updated_at
+                        ) values(?,?,?,?,?,?,?,?)
+                        """,
+                        (new_cid, row["step_kind"], row["state"], row["board_task_id"], row["parent_step_id"],
+                         row["idempotency_key"], row["created_at"], row["updated_at"]),
+                    )
+                    counts["steps"] += max(cur.rowcount, 0)
 
-            for row in legacy_con.execute("select * from owner_input_receipts order by id"):
-                new_cid = id_map.get(row["continuation_id"])
-                if new_cid is None:
-                    continue
-                cur = con.execute(
-                    """
-                    insert or ignore into owner_input_receipts(
-                        continuation_id, version, owner_ref, fields_json, source_ref, created_at, supersedes_receipt_id
-                    ) values(?,?,?,?,?,?,?)
-                    """,
-                    (new_cid, row["version"], row["owner_ref"], row["fields_json"], row["source_ref"],
-                     row["created_at"], row["supersedes_receipt_id"]),
-                )
-                counts["receipts"] += max(cur.rowcount, 0)
+            if "owner_input_receipts" in tables:
+                for row in legacy_con.execute("select * from owner_input_receipts order by id"):
+                    new_cid = id_map.get(row["continuation_id"])
+                    if new_cid is None:
+                        continue
+                    cur = con.execute(
+                        """
+                        insert or ignore into owner_input_receipts(
+                            continuation_id, version, owner_ref, fields_json, source_ref, created_at, supersedes_receipt_id
+                        ) values(?,?,?,?,?,?,?)
+                        """,
+                        (new_cid, row["version"], row["owner_ref"], row["fields_json"], row["source_ref"],
+                         row["created_at"], row["supersedes_receipt_id"]),
+                    )
+                    counts["receipts"] += max(cur.rowcount, 0)
 
-            for row in legacy_con.execute("select * from continuation_events order by id"):
-                new_cid = id_map.get(row["continuation_id"])
-                if new_cid is None:
-                    continue
-                cur = con.execute(
-                    """
-                    insert or ignore into continuation_events(
-                        continuation_id, seq, kind, payload_json, created_at
-                    ) values(?,?,?,?,?)
-                    """,
-                    (new_cid, row["seq"], row["kind"], row["payload_json"], row["created_at"]),
-                )
-                counts["events"] += max(cur.rowcount, 0)
+            if "continuation_events" in tables:
+                for row in legacy_con.execute("select * from continuation_events order by id"):
+                    new_cid = id_map.get(row["continuation_id"])
+                    if new_cid is None:
+                        continue
+                    cur = con.execute(
+                        """
+                        insert or ignore into continuation_events(
+                            continuation_id, seq, kind, payload_json, created_at
+                        ) values(?,?,?,?,?)
+                        """,
+                        (new_cid, row["seq"], row["kind"], row["payload_json"], row["created_at"]),
+                    )
+                    counts["events"] += max(cur.rowcount, 0)
 
-            for row in legacy_con.execute("select * from board_cursors"):
-                existing = con.execute(
-                    "select last_event_id from board_cursors where board=? and db_identity=?",
-                    (row["board"], row["db_identity"]),
-                ).fetchone()
-                new_value = max(int(existing["last_event_id"]) if existing else 0, int(row["last_event_id"]))
-                con.execute(
-                    """
-                    insert into board_cursors(board, db_identity, last_event_id, updated_at) values(?,?,?,?)
-                    on conflict(board, db_identity) do update set
-                        last_event_id = excluded.last_event_id,
-                        updated_at = excluded.updated_at
-                    where excluded.last_event_id > board_cursors.last_event_id
-                    """,
-                    (row["board"], row["db_identity"], new_value, row["updated_at"]),
-                )
-                counts["cursors"] += 1
+            if "board_cursors" in tables:
+                for row in legacy_con.execute("select * from board_cursors"):
+                    existing = con.execute(
+                        "select last_event_id from board_cursors where board=? and db_identity=?",
+                        (row["board"], row["db_identity"]),
+                    ).fetchone()
+                    new_value = max(int(existing["last_event_id"]) if existing else 0, int(row["last_event_id"]))
+                    con.execute(
+                        """
+                        insert into board_cursors(board, db_identity, last_event_id, updated_at) values(?,?,?,?)
+                        on conflict(board, db_identity) do update set
+                            last_event_id = excluded.last_event_id,
+                            updated_at = excluded.updated_at
+                        where excluded.last_event_id > board_cursors.last_event_id
+                        """,
+                        (row["board"], row["db_identity"], new_value, row["updated_at"]),
+                    )
+                    counts["cursors"] += 1
 
-            for row in legacy_con.execute("select * from board_outbox order by id"):
-                new_cid = id_map.get(row["continuation_id"])
-                if new_cid is None:
-                    continue
-                cur = con.execute(
-                    """
-                    insert or ignore into board_outbox(
-                        continuation_id, step_id, operation, payload_json, idempotency_key, state, board_task_id,
-                        attempts, created_at, updated_at
-                    ) values(?,?,?,?,?,?,?,?,?,?)
-                    """,
-                    (new_cid, row["step_id"], row["operation"], row["payload_json"], row["idempotency_key"],
-                     row["state"], row["board_task_id"], row["attempts"], row["created_at"], row["updated_at"]),
-                )
-                counts["outbox"] += max(cur.rowcount, 0)
+            if "board_outbox" in tables:
+                for row in legacy_con.execute("select * from board_outbox order by id"):
+                    new_cid = id_map.get(row["continuation_id"])
+                    if new_cid is None:
+                        continue
+                    cur = con.execute(
+                        """
+                        insert or ignore into board_outbox(
+                            continuation_id, step_id, operation, payload_json, idempotency_key, state, board_task_id,
+                            attempts, created_at, updated_at
+                        ) values(?,?,?,?,?,?,?,?,?,?)
+                        """,
+                        (new_cid, row["step_id"], row["operation"], row["payload_json"], row["idempotency_key"],
+                         row["state"], row["board_task_id"], row["attempts"], row["created_at"], row["updated_at"]),
+                    )
+                    counts["outbox"] += max(cur.rowcount, 0)
+
+            if "requirement_satisfactions" in tables:
+                for row in legacy_con.execute("select * from requirement_satisfactions order by id"):
+                    new_cid = id_map.get(row["continuation_id"])
+                    if new_cid is None:
+                        continue
+                    cur = con.execute(
+                        """
+                        insert or ignore into requirement_satisfactions(
+                            continuation_id, field_name, value_json, source_kind, source_ref, policy_id, created_at
+                        ) values(?,?,?,?,?,?,?)
+                        """,
+                        (new_cid, row["field_name"], row["value_json"], row["source_kind"], row["source_ref"],
+                         row["policy_id"], row["created_at"]),
+                    )
+                    counts["satisfactions"] += max(cur.rowcount, 0)
+
+            if "standing_policies" in tables:
+                for row in legacy_con.execute("select * from standing_policies order by id"):
+                    cur = con.execute(
+                        """
+                        insert or ignore into standing_policies(
+                            policy_id, version, owner_ref, project_scope, action_scope,
+                            conditions_json, decision_json, enabled, source_message_ref, created_at
+                        ) values(?,?,?,?,?,?,?,?,?,?)
+                        """,
+                        (row["policy_id"], row["version"], row["owner_ref"], row["project_scope"], row["action_scope"],
+                         row["conditions_json"], row["decision_json"], row["enabled"], row["source_message_ref"], row["created_at"]),
+                    )
+                    counts["standing_policies"] += max(cur.rowcount, 0)
+
+            if "interaction_cases" in tables:
+                for row in legacy_con.execute("select * from interaction_cases order by created_at, id"):
+                    cur = con.execute(
+                        """
+                        insert or ignore into interaction_cases(
+                            id, endpoint, batch_key, state, question_count, created_at, asked_at, answered_at, applied_at
+                        ) values(?,?,?,?,?,?,?,?,?)
+                        """,
+                        (row["id"], row["endpoint"], row["batch_key"], row["state"], row["question_count"],
+                         row["created_at"], row["asked_at"], row["answered_at"], row["applied_at"]),
+                    )
+                    counts["interaction_cases"] += max(cur.rowcount, 0)
+
+            if "interaction_members" in tables:
+                for row in legacy_con.execute("select * from interaction_members order by id"):
+                    new_cid = id_map.get(row["continuation_id"])
+                    if new_cid is None:
+                        continue
+                    cur = con.execute(
+                        """
+                        insert or ignore into interaction_members(
+                            case_id, continuation_id, requirement_names_json, created_at
+                        ) values(?,?,?,?)
+                        """,
+                        (row["case_id"], new_cid, row["requirement_names_json"], row["created_at"]),
+                    )
+                    counts["interaction_members"] += max(cur.rowcount, 0)
+
+            if "inbound_reply_receipts" in tables:
+                for row in legacy_con.execute("select * from inbound_reply_receipts order by id"):
+                    existing = con.execute(
+                        """
+                        select id from inbound_reply_receipts
+                        where case_id=? and message_ref=? and content_sha256=?
+                        """,
+                        (row["case_id"], row["message_ref"], row["content_sha256"]),
+                    ).fetchone()
+                    if existing is not None:
+                        continue
+                    cur = con.execute(
+                        """
+                        insert into inbound_reply_receipts(
+                            case_id, message_ref, content_sha256, compile_result_json, created_at
+                        ) values(?,?,?,?,?)
+                        """,
+                        (row["case_id"], row["message_ref"], row["content_sha256"], row["compile_result_json"], row["created_at"]),
+                    )
+                    counts["inbound_reply_receipts"] += max(cur.rowcount, 0)
+
+            if "idempotency_keys" in tables:
+                for row in legacy_con.execute("select * from idempotency_keys order by key"):
+                    cur = con.execute(
+                        """
+                        insert or ignore into idempotency_keys(
+                            key, job_id, channel, target, delivery_ref, created_at
+                        ) values(?,?,?,?,?,?)
+                        """,
+                        (row["key"], row["job_id"], row["channel"], row["target"], row["delivery_ref"], row["created_at"]),
+                    )
+                    counts["idempotency_keys"] += max(cur.rowcount, 0)
     finally:
         legacy_con.close()
 

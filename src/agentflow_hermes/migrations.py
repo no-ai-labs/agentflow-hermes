@@ -254,7 +254,7 @@ STEPS = [(1, SQL_V1), (2, SQL_V2), (3, SQL_V3), (4, SQL_V4), (5, SQL_V5)]
 
 # Portable continuation-ledger tables introduced by SQL_V5. This migration
 # chain is shared by both ``AgentFlowStore`` (jobs.db) and
-# ``ContinuationStore`` (agentflow.sqlite) — SCHEMA_VERSION cannot be bumped
+# ``ContinuationStore`` (agentflow-control-plane.sqlite) — SCHEMA_VERSION cannot be bumped
 # per-store, so control-plane store consolidation (plan section 10:
 # ``agentflow-hermes continuation migrate-store``) copies exactly these
 # tables row-by-row between physical DB files rather than adding a new

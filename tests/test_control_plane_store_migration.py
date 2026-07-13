@@ -12,7 +12,9 @@ from agentflow_hermes.continuation_store import (
     ContinuationStore,
     default_continuation_db_path,
     default_legacy_continuation_db_paths,
+    legacy_daemon_db_path,
     legacy_needs_input_db_path,
+    legacy_pre_control_plane_db_path,
     legacy_residue_report,
     migrate_all_legacy_stores,
     migrate_legacy_store,
@@ -25,7 +27,7 @@ def test_default_continuation_db_path_is_canonical(monkeypatch, tmp_path):
 
     path = default_continuation_db_path()
 
-    assert path == tmp_path / ".hermes" / "agentflow" / "agentflow.sqlite"
+    assert path == tmp_path / ".hermes" / "agentflow" / "agentflow-control-plane.sqlite"
 
 
 def test_legacy_needs_input_db_path_respects_env_and_default(monkeypatch, tmp_path):
@@ -47,6 +49,39 @@ def test_default_legacy_paths_exclude_canonical_and_dedupe(monkeypatch, tmp_path
 
     assert default_continuation_db_path() not in paths
     assert len(paths) == len(set(paths))
+    assert legacy_daemon_db_path() in paths
+    assert legacy_pre_control_plane_db_path() in paths
+
+
+def test_pre_control_plane_jobs_schema_collision_is_noop_and_untouched(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    old_path = legacy_pre_control_plane_db_path()
+    old_path.parent.mkdir(parents=True)
+
+    import sqlite3
+
+    with sqlite3.connect(old_path) as con:
+        con.executescript(
+            """
+            create table jobs(id text primary key, status text not null);
+            create table job_events(id integer primary key autoincrement, job_id text not null, kind text not null);
+            insert into jobs(id, status) values('job_legacy', 'queued');
+            insert into job_events(job_id, kind) values('job_legacy', 'enqueued');
+            pragma user_version = 123;
+            """
+        )
+    before = old_path.read_bytes()
+
+    report = migrate_legacy_store(canonical=ContinuationStore(default_continuation_db_path()), legacy_path=old_path)
+
+    assert report["success"] is True
+    assert report["migrated"] is False
+    assert report["reason"] == "no_continuation_tables"
+    assert old_path.read_bytes() == before
+    with sqlite3.connect(old_path) as con:
+        tables = {r[0] for r in con.execute("select name from sqlite_master where type='table'")}
+        assert "continuation_instances" not in tables
+        assert con.execute("select status from jobs where id='job_legacy'").fetchone()[0] == "queued"
 
 
 def _seed_legacy_store(path: Path) -> ContinuationStore:
@@ -60,6 +95,20 @@ def _seed_legacy_store(path: Path) -> ContinuationStore:
     legacy.transition(instance_id, ContinuationState.WAITING_OWNER, reason="seed")
     legacy.add_step(instance_id, step_kind="owner_anchor", idempotency_key="anchor:1", board_task_id="bt_1")
     legacy.add_owner_receipt(instance_id, owner_ref="operator-main", fields={"result_url": "https://example.com/x"})
+    legacy.record_requirement_satisfaction(
+        instance_id, field_name="result_url", value="https://example.com/x", source_kind="owner", source_ref="receipt:1"
+    )
+    legacy.create_interaction_case(
+        id="ic_legacy", endpoint="discord:#research", batch_key="discord:#research|owner|project|fact",
+    )
+    legacy.add_interaction_member(
+        "ic_legacy",
+        continuation_id=instance_id,
+        requirements=[{"name": "result_url", "kind": "fact", "authority": "owner", "question": "URL?"}],
+    )
+    legacy.record_inbound_reply_receipt(
+        "ic_legacy", message_ref="discord-msg-1", content_sha256="abc123", compile_result={"result_url": "https://example.com/x"}
+    )
     legacy.advance_cursor("warroom-os", "warroom-os-db", 42)
     legacy.outbox_enqueue(
         instance_id, step_id="1", operation="create_task", payload={"title": "x"}, idempotency_key="ob:1"
@@ -77,7 +126,15 @@ def test_migrate_legacy_store_copies_rows_with_source_ids_preserved(tmp_path):
 
     assert report["success"] is True
     assert report["migrated"] is True
-    assert report["counts"] == {"instances": 1, "steps": 1, "receipts": 1, "events": report["counts"]["events"], "cursors": 1, "outbox": 1}
+    assert report["counts"]["instances"] == 1
+    assert report["counts"]["steps"] == 1
+    assert report["counts"]["receipts"] == 1
+    assert report["counts"]["cursors"] == 1
+    assert report["counts"]["outbox"] == 1
+    assert report["counts"]["satisfactions"] == 1
+    assert report["counts"]["interaction_cases"] == 1
+    assert report["counts"]["interaction_members"] == 1
+    assert report["counts"]["inbound_reply_receipts"] == 1
     assert report["counts"]["events"] > 0
     assert report["verification"]["ok"] is True
 
@@ -96,6 +153,10 @@ def test_migrate_legacy_store_copies_rows_with_source_ids_preserved(tmp_path):
 
     assert canonical.get_cursor("warroom-os", "warroom-os-db") == 42
     assert len(canonical.list_outbox()) == 1
+    assert len(canonical.list_requirement_satisfactions(migrated[0]["id"])) == 1
+    assert canonical.list_interaction_cases()[0]["id"] == "ic_legacy"
+    assert canonical.list_interaction_members("ic_legacy")[0]["continuation_id"] == migrated[0]["id"]
+    assert canonical.list_inbound_reply_receipts("ic_legacy")[0]["message_ref"] == "discord-msg-1"
 
 
 def test_migrate_legacy_store_is_idempotent(tmp_path):
@@ -116,6 +177,10 @@ def test_migrate_legacy_store_is_idempotent(tmp_path):
     assert second["counts"]["steps"] == 0
     assert second["counts"]["receipts"] == 0
     assert second["counts"]["outbox"] == 0
+    assert second["counts"]["satisfactions"] == 0
+    assert second["counts"]["interaction_cases"] == 0
+    assert second["counts"]["interaction_members"] == 0
+    assert second["counts"]["inbound_reply_receipts"] == 0
 
 
 def test_migrate_legacy_store_writes_a_migration_receipt(tmp_path):

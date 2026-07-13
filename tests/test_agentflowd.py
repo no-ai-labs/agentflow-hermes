@@ -400,6 +400,8 @@ def test_service_install_render_never_writes(tmp_path):
     assert plan["success"] is True
     assert service_install.SERVICE_NAME in plan["units"]
     assert "ExecStart=" in plan["units"][service_install.SERVICE_NAME]
+    assert "agentflow-daemon.sqlite" not in plan["units"][service_install.SERVICE_NAME]
+    assert "agentflow.sqlite" not in plan["units"][service_install.SERVICE_NAME]
     assert not (tmp_path / service_install.SERVICE_NAME).exists()
 
 

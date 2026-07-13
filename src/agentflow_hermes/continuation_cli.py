@@ -44,7 +44,8 @@ def _load_registry(contract_files: list[str] | None) -> ContractRegistry:
 
 
 def _store(args: argparse.Namespace) -> ContinuationStore:
-    return ContinuationStore(Path(args.db))
+    db = str(getattr(args, "db", "") or "")
+    return ContinuationStore(Path(db)) if db else ContinuationStore.canonical()
 
 
 def _adapter(args: argparse.Namespace):
@@ -65,15 +66,15 @@ def add_continuation_cli_args(sub: argparse._SubParsersAction) -> None:
     ingest.add_argument("--contract-file", action="append", default=None)
     ingest.add_argument("--adapter-mode", choices=["fake", "real"], default="fake")
     ingest.add_argument("--hermes-bin", default="hermes")
-    ingest.add_argument("--db", required=True)
+    ingest.add_argument("--db", default="")
 
     listp = sub.add_parser("list")
     listp.add_argument("--state", default="")
-    listp.add_argument("--db", required=True)
+    listp.add_argument("--db", default="")
 
     show = sub.add_parser("show")
     show.add_argument("instance_id", type=int)
-    show.add_argument("--db", required=True)
+    show.add_argument("--db", default="")
 
     submit = sub.add_parser("submit")
     submit.add_argument("instance_id", type=int)
@@ -82,14 +83,14 @@ def add_continuation_cli_args(sub: argparse._SubParsersAction) -> None:
     submit.add_argument("--adapter-mode", choices=["fake", "real"], default="fake")
     submit.add_argument("--hermes-bin", default="hermes")
     submit.add_argument("--board", default="")
-    submit.add_argument("--db", required=True)
+    submit.add_argument("--db", default="")
 
     retry = sub.add_parser("retry")
     retry.add_argument("instance_id", type=int)
     retry.add_argument("--adapter-mode", choices=["fake", "real"], default="fake")
     retry.add_argument("--hermes-bin", default="hermes")
     retry.add_argument("--board", default="")
-    retry.add_argument("--db", required=True)
+    retry.add_argument("--db", default="")
 
     doctor = sub.add_parser("doctor")
     doctor.add_argument("--db", default="")
