@@ -1,0 +1,308 @@
+{
+  "stamp": "20260714T185828Z",
+  "items": [
+    {
+      "board": "agentflow-hermes",
+      "source_task": "t_0494334c",
+      "event_ref": "kanban-event-3020",
+      "receipt_key": "ref:sha256:36b365a73d3e46b2",
+      "created_task_ids": [
+        "t_bfada18b",
+        "t_381e3449",
+        "t_8c2ce937"
+      ],
+      "latency_seconds": 1.478,
+      "rows": [
+        {
+          "task_id": "t_bfada18b",
+          "notify": [
+            {
+              "platform": "discord",
+              "chat_id": "1497895797579190357",
+              "thread_id": "",
+              "trigger_agent": 1
+            }
+          ],
+          "ack": [
+            {
+              "id": 168,
+              "platform": "discord",
+              "chat_id": "1497895797579190357",
+              "thread_id": "",
+              "desired_delivery_mode": "passive+active_wake",
+              "active_wake_required": 1
+            }
+          ],
+          "wake": [
+            {
+              "id": 167,
+              "subscription_id": 168,
+              "status": "pending",
+              "correlation_id": "roadmap-autopromote:agentflow-hermes:t_bfada18b:discord:1497895797579190357:"
+            }
+          ]
+        },
+        {
+          "task_id": "t_381e3449",
+          "notify": [
+            {
+              "platform": "discord",
+              "chat_id": "1497895797579190357",
+              "thread_id": "",
+              "trigger_agent": 1
+            }
+          ],
+          "ack": [
+            {
+              "id": 169,
+              "platform": "discord",
+              "chat_id": "1497895797579190357",
+              "thread_id": "",
+              "desired_delivery_mode": "passive+active_wake",
+              "active_wake_required": 1
+            }
+          ],
+          "wake": [
+            {
+              "id": 168,
+              "subscription_id": 169,
+              "status": "pending",
+              "correlation_id": "roadmap-autopromote:agentflow-hermes:t_381e3449:discord:1497895797579190357:"
+            }
+          ]
+        },
+        {
+          "task_id": "t_8c2ce937",
+          "notify": [
+            {
+              "platform": "discord",
+              "chat_id": "1497895797579190357",
+              "thread_id": "",
+              "trigger_agent": 1
+            }
+          ],
+          "ack": [
+            {
+              "id": 170,
+              "platform": "discord",
+              "chat_id": "1497895797579190357",
+              "thread_id": "",
+              "desired_delivery_mode": "passive+active_wake",
+              "active_wake_required": 1
+            }
+          ],
+          "wake": [
+            {
+              "id": 169,
+              "subscription_id": 170,
+              "status": "pending",
+              "correlation_id": "roadmap-autopromote:agentflow-hermes:t_8c2ce937:discord:1497895797579190357:"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "board": "warroom-os",
+      "source_task": "t_a103a007",
+      "event_ref": "kanban-event-6749",
+      "receipt_key": "roadmap:research.roadmap:promote:research.default.impl_review:1:9273e3f75f3e312f",
+      "created_task_ids": [
+        "t_9ccea3da",
+        "t_a50bc619",
+        "t_d44b397c"
+      ],
+      "latency_seconds": 1.721,
+      "rows": [
+        {
+          "task_id": "t_9ccea3da",
+          "notify": [
+            {
+              "platform": "discord",
+              "chat_id": "1499390151393284106",
+              "thread_id": "",
+              "trigger_agent": 1
+            }
+          ],
+          "ack": [
+            {
+              "id": 167,
+              "platform": "discord",
+              "chat_id": "1499390151393284106",
+              "thread_id": "",
+              "desired_delivery_mode": "passive+active_wake",
+              "active_wake_required": 1
+            }
+          ],
+          "wake": [
+            {
+              "id": 21,
+              "subscription_id": 167,
+              "status": "pending",
+              "correlation_id": "roadmap-autopromote:warroom-os:t_9ccea3da:discord:1499390151393284106:"
+            }
+          ]
+        },
+        {
+          "task_id": "t_a50bc619",
+          "notify": [
+            {
+              "platform": "discord",
+              "chat_id": "1499390151393284106",
+              "thread_id": "",
+              "trigger_agent": 1
+            }
+          ],
+          "ack": [
+            {
+              "id": 168,
+              "platform": "discord",
+              "chat_id": "1499390151393284106",
+              "thread_id": "",
+              "desired_delivery_mode": "passive+active_wake",
+              "active_wake_required": 1
+            }
+          ],
+          "wake": [
+            {
+              "id": 22,
+              "subscription_id": 168,
+              "status": "pending",
+              "correlation_id": "roadmap-autopromote:warroom-os:t_a50bc619:discord:1499390151393284106:"
+            }
+          ]
+        },
+        {
+          "task_id": "t_d44b397c",
+          "notify": [
+            {
+              "platform": "discord",
+              "chat_id": "1499390151393284106",
+              "thread_id": "",
+              "trigger_agent": 1
+            }
+          ],
+          "ack": [
+            {
+              "id": 169,
+              "platform": "discord",
+              "chat_id": "1499390151393284106",
+              "thread_id": "",
+              "desired_delivery_mode": "passive+active_wake",
+              "active_wake_required": 1
+            }
+          ],
+          "wake": [
+            {
+              "id": 23,
+              "subscription_id": 169,
+              "status": "pending",
+              "correlation_id": "roadmap-autopromote:warroom-os:t_d44b397c:discord:1499390151393284106:"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "board": "oracle-lab",
+      "source_task": "t_3c34a33b",
+      "event_ref": "kanban-event-4425",
+      "receipt_key": "roadmap:shaman.roadmap:promote:shaman.default.impl_review:1:95d0d2175d2b5530",
+      "created_task_ids": [
+        "t_ef3b751f",
+        "t_390415cb",
+        "t_9fb42440"
+      ],
+      "latency_seconds": 1.811,
+      "rows": [
+        {
+          "task_id": "t_ef3b751f",
+          "notify": [
+            {
+              "platform": "discord",
+              "chat_id": "1500539609413849200",
+              "thread_id": "",
+              "trigger_agent": 1
+            }
+          ],
+          "ack": [
+            {
+              "id": 122,
+              "platform": "discord",
+              "chat_id": "1500539609413849200",
+              "thread_id": "",
+              "desired_delivery_mode": "passive+active_wake",
+              "active_wake_required": 1
+            }
+          ],
+          "wake": [
+            {
+              "id": 111,
+              "subscription_id": 122,
+              "status": "pending",
+              "correlation_id": "roadmap-autopromote:oracle-lab:t_ef3b751f:discord:1500539609413849200:"
+            }
+          ]
+        },
+        {
+          "task_id": "t_390415cb",
+          "notify": [
+            {
+              "platform": "discord",
+              "chat_id": "1500539609413849200",
+              "thread_id": "",
+              "trigger_agent": 1
+            }
+          ],
+          "ack": [
+            {
+              "id": 123,
+              "platform": "discord",
+              "chat_id": "1500539609413849200",
+              "thread_id": "",
+              "desired_delivery_mode": "passive+active_wake",
+              "active_wake_required": 1
+            }
+          ],
+          "wake": [
+            {
+              "id": 112,
+              "subscription_id": 123,
+              "status": "pending",
+              "correlation_id": "roadmap-autopromote:oracle-lab:t_390415cb:discord:1500539609413849200:"
+            }
+          ]
+        },
+        {
+          "task_id": "t_9fb42440",
+          "notify": [
+            {
+              "platform": "discord",
+              "chat_id": "1500539609413849200",
+              "thread_id": "",
+              "trigger_agent": 1
+            }
+          ],
+          "ack": [
+            {
+              "id": 124,
+              "platform": "discord",
+              "chat_id": "1500539609413849200",
+              "thread_id": "",
+              "desired_delivery_mode": "passive+active_wake",
+              "active_wake_required": 1
+            }
+          ],
+          "wake": [
+            {
+              "id": 113,
+              "subscription_id": 124,
+              "status": "pending",
+              "correlation_id": "roadmap-autopromote:oracle-lab:t_9fb42440:discord:1500539609413849200:"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

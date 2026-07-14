@@ -5,7 +5,9 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -355,11 +357,119 @@ class RealKanbanGraphAdapter:
             return {"success": False, "error": "cli_subscribe_runner_error", "mutations": []}
         if returncode != 0:
             return {"success": False, "error": "cli_subscribe_failed", "mutations": []}
-        return {"success": True, "mutations": [{"op": "notify_subscribe", "task_id": task_id, "endpoint": endpoint}]}
+        ack_result = self._ensure_active_wake_ack(task_id, flags)
+        if ack_result.get("success") is False:
+            return {"success": False, "error": ack_result.get("error") or "ack_ensure_failed", "mutations": []}
+        mutations = [{"op": "notify_subscribe", "task_id": task_id, "endpoint": endpoint}]
+        if ack_result.get("active_wake_ack"):
+            mutations.append({"op": "ack_active_wake", "task_id": task_id, "endpoint": endpoint})
+        return {"success": True, "mutations": mutations}
+
+    def _ensure_active_wake_ack(self, task_id: str, flags: dict[str, str]) -> dict[str, Any]:
+        """Idempotently create/repair durable ACK active-wake rows when the
+        target board exposes the ACK schema.
+
+        Some Hermes CLI versions only write ``kanban_notify_subs`` for
+        ``notify-subscribe``. Roadmap GO autopromotion should not call a graph
+        fully subscribed while the board endpoint contract's ACK wake rows are
+        absent, so repair them immediately after the CLI subscription succeeds.
+        Boards without ACK tables remain compatible no-ops.
+        """
+        db_path = Path(_board_db_path_for_cli(self.board))
+        if not db_path.exists():
+            return {"success": True, "active_wake_ack": False}
+        try:
+            con = sqlite3.connect(db_path)
+        except Exception:
+            return {"success": False, "error": "ack_db_connect_failed"}
+        try:
+            if not _sqlite_table_exists(con, "ack_subscription") or not _sqlite_table_exists(con, "ack_active_wake"):
+                return {"success": True, "active_wake_ack": False}
+            platform = short_text(flags.get("platform", ""))
+            chat_id = short_text(flags.get("chat_id", ""))
+            thread_id = short_text(flags.get("thread_id", ""))
+            notifier_profile = "default"
+            now = int(time.time())
+
+            notify_cols = _sqlite_table_columns(con, "kanban_notify_subs") if _sqlite_table_exists(con, "kanban_notify_subs") else set()
+            if notify_cols:
+                existing_notify = con.execute(
+                    "SELECT task_id FROM kanban_notify_subs WHERE task_id=? AND platform=? AND chat_id=? AND thread_id=?",
+                    (task_id, platform, chat_id, thread_id),
+                ).fetchone()
+                if existing_notify:
+                    if "trigger_agent" in notify_cols:
+                        con.execute(
+                            "UPDATE kanban_notify_subs SET trigger_agent=1, notifier_profile=? WHERE task_id=? AND platform=? AND chat_id=? AND thread_id=?",
+                            (notifier_profile, task_id, platform, chat_id, thread_id),
+                        )
+                else:
+                    cols = ["task_id", "platform", "chat_id", "thread_id", "notifier_profile", "created_at"]
+                    vals: list[Any] = [task_id, platform, chat_id, thread_id, notifier_profile, now]
+                    if "trigger_agent" in notify_cols:
+                        cols.insert(5, "trigger_agent")
+                        vals.insert(5, 1)
+                    con.execute(
+                        f"INSERT INTO kanban_notify_subs({', '.join(cols)}) VALUES({', '.join('?' for _ in cols)})",
+                        vals,
+                    )
+
+            sub = con.execute(
+                """
+                SELECT id FROM ack_subscription
+                 WHERE task_id=? AND platform=? AND chat_id=? AND thread_id=? AND notifier_profile=?
+                """,
+                (task_id, platform, chat_id, thread_id, notifier_profile),
+            ).fetchone()
+            if sub:
+                sub_id = int(sub[0])
+                con.execute(
+                    "UPDATE ack_subscription SET desired_delivery_mode=?, active_wake_required=1 WHERE id=?",
+                    ("passive+active_wake", sub_id),
+                )
+            else:
+                cur = con.execute(
+                    """
+                    INSERT INTO ack_subscription(
+                        task_id, platform, chat_id, thread_id, notifier_profile,
+                        desired_delivery_mode, active_wake_required, operator_receipt_required, created_at
+                    ) VALUES(?, ?, ?, ?, ?, ?, 1, 0, ?)
+                    """,
+                    (task_id, platform, chat_id, thread_id, notifier_profile, "passive+active_wake", now),
+                )
+                sub_id = int(cur.lastrowid or 0)
+
+            correlation_id = f"roadmap-autopromote:{self.board}:{task_id}:{platform}:{chat_id}:{thread_id}"
+            wake = con.execute(
+                "SELECT id FROM ack_active_wake WHERE task_id=? AND subscription_id=? AND correlation_id=?",
+                (task_id, sub_id, correlation_id),
+            ).fetchone()
+            if not wake:
+                con.execute(
+                    """
+                    INSERT INTO ack_active_wake(task_id, subscription_id, triggered_agent, correlation_id, status, created_at)
+                    VALUES(?, ?, 0, ?, ?, ?)
+                    """,
+                    (task_id, sub_id, correlation_id, "pending", now),
+                )
+            con.commit()
+            return {"success": True, "active_wake_ack": True}
+        except Exception:
+            return {"success": False, "error": "ack_ensure_failed"}
+        finally:
+            con.close()
 
 
 def _task_id_from_result(result: dict[str, Any]) -> str:
     return short_text(str(result.get("task_id") or result.get("id") or result.get("task") or ""))
+
+
+def _sqlite_table_exists(con: sqlite3.Connection, name: str) -> bool:
+    return con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone() is not None
+
+
+def _sqlite_table_columns(con: sqlite3.Connection, name: str) -> set[str]:
+    return {str(row[1]) for row in con.execute(f"PRAGMA table_info({name})")}
 
 
 def _resolve_hermes_bin(hermes_bin: str = "hermes") -> str:

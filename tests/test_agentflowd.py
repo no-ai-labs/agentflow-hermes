@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+from typing import Any
 
 from agentflow_hermes.board_adapter import FakeBoardAdapter
 from agentflow_hermes.board_events import BoardEvent, FakeBoardEventSource
@@ -285,6 +286,67 @@ def test_router_configured_go_applies_graph_and_replay_is_deduped(tmp_path):
     assert replay_roadmap["reason"] == "duplicate_graph"
     assert replay_roadmap["created_task_ids"] == roadmap["created_task_ids"]
     assert replay_adapter.create_calls == []
+
+
+class _FailingKanbanGraphAdapter:
+    """Always refuses create_graph, like a real adapter whose CLI create or
+    notify-subscribe call failed (reviewer BLOCK t_2463a93c)."""
+
+    def __init__(self) -> None:
+        self.create_calls: list[Any] = []
+
+    def create_graph(self, intent: Any) -> dict[str, Any]:
+        self.create_calls.append(intent)
+        return {"success": False, "error": "adapter_create_failed", "mutations": []}
+
+
+def test_router_configured_go_adapter_failure_leaves_cursor_retryable(tmp_path):
+    """Reviewer BLOCK t_2463a93c: a roadmap apply whose adapter create/subscribe
+    call fails must leave the board cursor unchanged (retryable) rather than
+    advancing past the failed event — otherwise the failed GO is silently
+    dropped forever with no durable retry/outbox receipt."""
+    receipts = tmp_path / "receipts.json"
+    roadmap_config = load_repo_roadmap_config(_roadmap_config_file(tmp_path))
+    contracts = _contracts_with_generic()
+    entry = BoardRegistryEntry(board="b1", db_identity="b1", default_endpoint="discord:1")
+    store = ContinuationStore(tmp_path / "agentflow.sqlite")
+
+    failing_adapter = _FailingKanbanGraphAdapter()
+    first = _route_primed(
+        board="b1", entry=entry, store=store, contract_registry=contracts, adapter=FakeBoardAdapter(),
+        events=[_roadmap_go_event()], roadmap_config=roadmap_config, roadmap_receipts_file=str(receipts),
+        roadmap_graph_adapter=failing_adapter, apply=True,
+    )
+
+    item = first["results"][0]
+    assert item["router_success"] is False
+    assert item["roadmap"]["applied"] is False
+    assert item["roadmap"]["created_task_ids"] == []
+    # Cursor must not have advanced past the failed event: it stays at the
+    # pre-event value the test primed (0), so the same event replays on the
+    # next tick instead of being silently skipped.
+    assert store.get_cursor("b1", "b1-db") == 0
+    saved = json.loads(receipts.read_text(encoding="utf-8"))
+    assert saved == {}
+
+    # Retry the exact same event with a working adapter: exactly one graph is
+    # created and exactly one receipt is recorded (no duplicate from the
+    # earlier failed attempt, since the apply ledger was never poisoned).
+    working_adapter = FakeKanbanGraphAdapter()
+    second = _route_primed(
+        board="b1", entry=entry, store=store, contract_registry=contracts, adapter=FakeBoardAdapter(),
+        events=[_roadmap_go_event()], roadmap_config=roadmap_config, roadmap_receipts_file=str(receipts),
+        roadmap_graph_adapter=working_adapter, apply=True,
+    )
+
+    retry_item = second["results"][0]
+    assert retry_item["router_success"] is True
+    assert retry_item["roadmap"]["applied"] is True
+    assert len(retry_item["roadmap"]["created_task_ids"]) == 3
+    assert len(working_adapter.create_calls) == 3
+    assert store.get_cursor("b1", "b1-db") == 1
+    saved_after_retry = json.loads(receipts.read_text(encoding="utf-8"))
+    assert len(saved_after_retry) == 1
 
 
 def test_router_needs_input_h1_creates_owner_anchor_when_unresolved(tmp_path):

@@ -379,7 +379,6 @@ def ingest_board_once(
     max_seq = last_seq
 
     for event in events:
-        max_seq = max(max_seq, event.event_seq)
         # Generic return-endpoint resolution: the source task's own typed
         # endpoint (carried on the event) wins; otherwise the board's declared
         # default endpoint. No per-channel branch.
@@ -404,6 +403,7 @@ def ingest_board_once(
 
         if allowed_kinds is not None and envelope.continuation_kind not in allowed_kinds:
             results.append({"event_id": event.event_id, "action": "noop", "reason": "kind_not_handled"})
+            max_seq = max(max_seq, event.event_seq)
             continue
 
         if envelope.continuation_kind in (ContinuationKind.NEEDS_INPUT, ContinuationKind.APPROVAL_REQUIRED):
@@ -418,6 +418,7 @@ def ingest_board_once(
                 interaction_inbox=interaction_inbox,
             )
             results.append({"event_id": event.event_id, **outcome})
+            max_seq = max(max_seq, event.event_seq)
         elif envelope.continuation_kind in (ContinuationKind.ROADMAP_NEXT, ContinuationKind.COMPLETE):
             if roadmap_config is None and explicit_roadmap_router:
                 result = roadmap_router(
@@ -453,12 +454,25 @@ def ingest_board_once(
                 )
                 if roadmap_receipts_file:
                     _persist_roadmap_apply_ledger(ledger, roadmap_receipts_file)
+            router_success = bool(result.get("success"))
             results.append({
                 "event_id": event.event_id,
                 "action": "roadmap_routed",
-                "router_success": bool(result.get("success")),
+                "router_success": router_success,
                 "roadmap": result,
             })
+            if not router_success:
+                # Fail-closed (reviewer BLOCK t_2463a93c): an adapter
+                # create/subscribe failure must not advance the cursor past
+                # this event — it stays retryable and every later event in
+                # this batch is left unprocessed too, so ordering is
+                # preserved on the next tick's replay. The apply ledger
+                # itself already refuses to record anything for a failed
+                # apply (roadmap.py's fail-closed result), so a later retry
+                # with a working adapter is not deduped against a phantom
+                # receipt.
+                break
+            max_seq = max(max_seq, event.event_seq)
         elif envelope.continuation_kind == ContinuationKind.CODE_FIX:
             result = code_fix_router(
                 event.summary,
@@ -472,9 +486,11 @@ def ingest_board_once(
                 "action": "code_fix_routed",
                 "router_success": bool(result.get("success")),
             })
+            max_seq = max(max_seq, event.event_seq)
         elif envelope.continuation_kind == ContinuationKind.EXTERNAL_WAIT:
             outcome = _handle_external_wait(envelope=envelope, event_run_metadata=event.run_metadata, store=store)
             results.append({"event_id": event.event_id, **outcome})
+            max_seq = max(max_seq, event.event_seq)
         else:
             results.append({
                 "event_id": event.event_id,
@@ -482,12 +498,13 @@ def ingest_board_once(
                 "reason": "unknown_outcome",
                 "confidence": envelope.confidence,
             })
+            max_seq = max(max_seq, event.event_seq)
 
     store.advance_cursor(board, db_identity, max_seq)
     return {
         "success": True,
         "board": board,
-        "processed": len(events),
+        "processed": len(results),
         "results": results,
         "cursor": max_seq,
     }

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from typing import Any
 
 from agentflow_hermes.graph_creator import (
@@ -489,6 +490,107 @@ def test_partial_failure_after_first_create_fails_closed_no_ledger_poison():
     retry = _apply(_summary(), adapter=retry_adapter, apply_ledger=apply_ledger, event_id="evt-retry")
     assert retry["applied"] is True
     assert len(retry["created_task_ids"]) == 3
+
+
+class _SubscribeFailingCliRunner:
+    """Fake CLI runner: every `create` succeeds, every `notify-subscribe` fails
+    with a nonzero exit — reproduces RealKanbanGraphAdapter surfacing a real
+    subscribe failure as success=False (reviewer BLOCK t_2463a93c)."""
+
+    def __init__(self) -> None:
+        self.calls: list[list[str]] = []
+
+    def __call__(self, argv: list[str]) -> tuple[int, str, str]:
+        self.calls.append(list(argv))
+        if "notify-subscribe" in argv:
+            return 1, "", "subscribe failed"
+        task_id = f"t_real_{len(self.calls)}"
+        return 0, json.dumps({"success": True, "task_id": task_id}), ""
+
+
+def test_subscribe_failure_fails_closed_no_ledger_poison_then_retry_succeeds():
+    apply_ledger = InMemoryRoadmapApplyLedger()
+    failing_runner = _SubscribeFailingCliRunner()
+    adapter = RealKanbanGraphAdapter(failing_runner, board="main")
+
+    result = _apply(_summary(), adapter=adapter, apply_ledger=apply_ledger)
+
+    assert result["success"] is False
+    assert result["applied"] is False
+    assert result["reason"] == "adapter_create_failed"
+    assert result["created_task_ids"] == []
+    assert result["mutations"] == []
+    # The task was created board-side before the subscribe call failed, but
+    # RealKanbanGraphAdapter surfaces the whole create+subscribe operation as a
+    # single failed candidate, so apply_roadmap_promotion never learns a task
+    # id exists to create for it — it is not committed/idempotency-recorded
+    # either way, so a later retry is not deduped against a partial write.
+    assert result["uncommitted_task_ids"] == []
+    key = result["idempotency_key"]
+    assert not apply_ledger.has(key)
+
+    retry_runner = _RecordingCliRunner()
+    retry_adapter = RealKanbanGraphAdapter(retry_runner, board="main")
+    retry = _apply(_summary(), adapter=retry_adapter, apply_ledger=apply_ledger, event_id="evt-retry")
+
+    assert retry["applied"] is True
+    assert len(retry["created_task_ids"]) == 3
+
+
+def test_real_graph_adapter_repairs_notify_and_active_wake_ack_rows(tmp_path, monkeypatch):
+    board_db = tmp_path / "boards" / "main" / "kanban.db"
+    board_db.parent.mkdir(parents=True)
+    con = sqlite3.connect(board_db)
+    con.executescript(
+        """
+        CREATE TABLE kanban_notify_subs(
+            task_id TEXT NOT NULL,
+            platform TEXT NOT NULL,
+            chat_id TEXT NOT NULL,
+            thread_id TEXT NOT NULL DEFAULT '',
+            notifier_profile TEXT,
+            trigger_agent INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL,
+            last_event_id INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(task_id, platform, chat_id, thread_id)
+        );
+        CREATE TABLE ack_subscription(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL,
+            subscription_id INTEGER,
+            platform TEXT,
+            chat_id TEXT,
+            thread_id TEXT,
+            notifier_profile TEXT,
+            desired_delivery_mode TEXT,
+            active_wake_required INTEGER NOT NULL DEFAULT 0,
+            operator_receipt_required INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL
+        );
+        CREATE TABLE ack_active_wake(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL,
+            subscription_id INTEGER,
+            triggered_agent INTEGER NOT NULL DEFAULT 0,
+            correlation_id TEXT,
+            status TEXT,
+            created_at INTEGER NOT NULL
+        );
+        """
+    )
+    con.close()
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(board_db))
+
+    runner = _RecordingCliRunner()
+    adapter = RealKanbanGraphAdapter(runner, board="main", subscription_endpoint="discord:12345")
+    result = _apply(_summary(), adapter=adapter, apply_ledger=InMemoryRoadmapApplyLedger())
+
+    assert result["applied"] is True
+    con = sqlite3.connect(board_db)
+    assert con.execute("SELECT count(*) FROM kanban_notify_subs WHERE trigger_agent=1").fetchone()[0] == 3
+    assert con.execute("SELECT count(*) FROM ack_subscription WHERE active_wake_required=1 AND desired_delivery_mode='passive+active_wake'").fetchone()[0] == 3
+    assert con.execute("SELECT count(*) FROM ack_active_wake WHERE status='pending'").fetchone()[0] == 3
+    con.close()
 
 
 def _research_registry() -> RoadmapTransitionRegistry:

@@ -1,0 +1,388 @@
+{
+  "schema": "m27_3_backlog_audit_v1",
+  "created_at": 1784055174.8872535,
+  "created_by": "ccsupervisor:t_b7a51ddb",
+  "scope": "ROADMAP GO transition events since 2026-07-14 18:00 across agentflow-hermes/warroom-os/oracle-lab",
+  "boards": {
+    "agentflow-hermes": {
+      "db_path": "/home/duckran/.hermes/kanban/boards/agentflow-hermes/kanban.db",
+      "receipts_path": "/home/duckran/dev/agentflow-hermes/.agentflow-roadmap-receipts.json",
+      "receipt_count": 5,
+      "events": [
+        {
+          "event_ref": "kanban-event-2853",
+          "task_id": "t_585fc102",
+          "run_id": 237,
+          "title": "M27.3 canary source 20260714T180323Z agentflow-hermes",
+          "status": "archived",
+          "has_receipt": false,
+          "receipt_keys": [],
+          "classification": "quarantined_canary_archive"
+        },
+        {
+          "event_ref": "kanban-event-2857",
+          "task_id": "t_9d13065a",
+          "run_id": 238,
+          "title": "M27.3 canary source 20260714T180444Z agentflow-hermes",
+          "status": "archived",
+          "has_receipt": false,
+          "receipt_keys": [],
+          "classification": "quarantined_canary_archive"
+        },
+        {
+          "event_ref": "kanban-event-2861",
+          "task_id": "t_a0a3d3a9",
+          "run_id": 239,
+          "title": "M27.3 canary source 20260714T180611Z agentflow-hermes",
+          "status": "archived",
+          "has_receipt": false,
+          "receipt_keys": [],
+          "classification": "quarantined_canary_archive"
+        },
+        {
+          "event_ref": "kanban-event-2864",
+          "task_id": "t_279661d4",
+          "run_id": 240,
+          "title": "M27.3 canary source 20260714T180736Z agentflow-hermes",
+          "status": "archived",
+          "has_receipt": true,
+          "receipt_keys": [
+            "ref:sha256:6a2135466b62eb30"
+          ],
+          "classification": "receipt_present"
+        },
+        {
+          "event_ref": "kanban-event-2890",
+          "task_id": "t_03a7d18a",
+          "run_id": 242,
+          "title": "M27.3 live canary source 20260714T181535Z agentflow-hermes",
+          "status": "archived",
+          "has_receipt": true,
+          "receipt_keys": [
+            "ref:sha256:70070fd9af4cf53d"
+          ],
+          "classification": "receipt_present"
+        },
+        {
+          "event_ref": "kanban-event-2907",
+          "task_id": "t_31d75bc1",
+          "run_id": 244,
+          "title": "M27.3 live canary source 20260714T181830Z agentflow-hermes",
+          "status": "archived",
+          "has_receipt": false,
+          "receipt_keys": [],
+          "classification": "quarantined_canary_archive"
+        },
+        {
+          "event_ref": "kanban-event-2916",
+          "task_id": "t_ff532853",
+          "run_id": 245,
+          "title": "M27.3 live canary source 20260714T182207Z-80723a agentflow-hermes",
+          "status": "archived",
+          "has_receipt": true,
+          "receipt_keys": [
+            "ref:sha256:9f16cc51517b0ec7"
+          ],
+          "classification": "receipt_present"
+        },
+        {
+          "event_ref": "kanban-event-2921",
+          "task_id": "t_e91e3da9",
+          "run_id": 246,
+          "title": "M27.3 live canary source 20260714T182207Z-80723a warroom-os",
+          "status": "archived",
+          "has_receipt": false,
+          "receipt_keys": [],
+          "classification": "quarantined_canary_archive"
+        },
+        {
+          "event_ref": "kanban-event-2959",
+          "task_id": "t_3ca76b93",
+          "run_id": 249,
+          "title": "M27.3 subscribed canary source 20260714T182944Z-5bbe28 agentflow-hermes",
+          "status": "archived",
+          "has_receipt": true,
+          "receipt_keys": [
+            "ref:sha256:b04c2c984d785fc5"
+          ],
+          "classification": "receipt_present"
+        },
+        {
+          "event_ref": "kanban-event-2984",
+          "task_id": "t_8a81d337",
+          "run_id": 252,
+          "title": "M27.3 reviewer subscription canary source review-subcheck-20260714T183820Z-4028153 agentflow-hermes",
+          "status": "archived",
+          "has_receipt": true,
+          "receipt_keys": [
+            "ref:sha256:79446e83544c94cf"
+          ],
+          "classification": "receipt_present"
+        }
+      ]
+    },
+    "warroom-os": {
+      "db_path": "/home/duckran/.hermes/kanban/boards/warroom-os/kanban.db",
+      "receipts_path": "/home/duckran/.hermes/agentflow/roadmaps/research-receipts.json",
+      "receipt_count": 3,
+      "events": [
+        {
+          "event_ref": "kanban-event-6685",
+          "task_id": "t_8a3af9f8",
+          "run_id": 619,
+          "title": "M27.3 canary source 20260714T180323Z warroom-os",
+          "status": "archived",
+          "has_receipt": false,
+          "receipt_keys": [],
+          "classification": "quarantined_canary_archive"
+        },
+        {
+          "event_ref": "kanban-event-6687",
+          "task_id": "t_728cc758",
+          "run_id": 620,
+          "title": "M27.3 canary source 20260714T180444Z warroom-os",
+          "status": "archived",
+          "has_receipt": false,
+          "receipt_keys": [],
+          "classification": "quarantined_canary_archive"
+        },
+        {
+          "event_ref": "kanban-event-6689",
+          "task_id": "t_d935967e",
+          "run_id": 621,
+          "title": "M27.3 canary source 20260714T180611Z warroom-os",
+          "status": "archived",
+          "has_receipt": false,
+          "receipt_keys": [],
+          "classification": "quarantined_canary_archive"
+        },
+        {
+          "event_ref": "kanban-event-6692",
+          "task_id": "t_1046e8d8",
+          "run_id": 622,
+          "title": "M27.3 canary source 20260714T180736Z warroom-os",
+          "status": "archived",
+          "has_receipt": true,
+          "receipt_keys": [
+            "roadmap:research.roadmap:promote:research.default.impl_review:1:70278f87b1202f37"
+          ],
+          "classification": "receipt_present"
+        },
+        {
+          "event_ref": "kanban-event-6703",
+          "task_id": "t_da139685",
+          "run_id": 623,
+          "title": "M27.3 live canary source 20260714T182322Z-8ad969 warroom-os",
+          "status": "archived",
+          "has_receipt": true,
+          "receipt_keys": [
+            "roadmap:research.roadmap:promote:research.default.impl_review:1:38cac376a6698398"
+          ],
+          "classification": "receipt_present"
+        },
+        {
+          "event_ref": "kanban-event-6717",
+          "task_id": "t_47cc7893",
+          "run_id": 624,
+          "title": "M27.3 subscribed canary source 20260714T182944Z-5bbe28 warroom-os",
+          "status": "archived",
+          "has_receipt": true,
+          "receipt_keys": [
+            "roadmap:research.roadmap:promote:research.default.impl_review:1:009d9d39abe7d25a"
+          ],
+          "classification": "receipt_present"
+        }
+      ]
+    },
+    "oracle-lab": {
+      "db_path": "/home/duckran/.hermes/kanban/boards/oracle-lab/kanban.db",
+      "receipts_path": "/home/duckran/.hermes/agentflow/roadmaps/shaman-receipts.json",
+      "receipt_count": 3,
+      "events": [
+        {
+          "event_ref": "kanban-event-4284",
+          "task_id": "t_9b1cfc54",
+          "run_id": 900052,
+          "title": "M27.3 canary source 20260714T180323Z oracle-lab",
+          "status": "archived",
+          "has_receipt": false,
+          "receipt_keys": [],
+          "classification": "quarantined_canary_archive"
+        },
+        {
+          "event_ref": "kanban-event-4288",
+          "task_id": "t_4fbeec22",
+          "run_id": 900053,
+          "title": "M27.3 canary source 20260714T180444Z oracle-lab",
+          "status": "archived",
+          "has_receipt": false,
+          "receipt_keys": [],
+          "classification": "quarantined_canary_archive"
+        },
+        {
+          "event_ref": "kanban-event-4294",
+          "task_id": "t_ed1425e5",
+          "run_id": 900054,
+          "title": "M27.3 canary source 20260714T180611Z oracle-lab",
+          "status": "archived",
+          "has_receipt": false,
+          "receipt_keys": [],
+          "classification": "quarantined_canary_archive"
+        },
+        {
+          "event_ref": "kanban-event-4304",
+          "task_id": "t_17cb5ec4",
+          "run_id": 900056,
+          "title": "M27.3 canary source 20260714T180736Z oracle-lab",
+          "status": "archived",
+          "has_receipt": true,
+          "receipt_keys": [
+            "roadmap:shaman.roadmap:promote:shaman.default.impl_review:1:20d68b38543d2390"
+          ],
+          "classification": "receipt_present"
+        },
+        {
+          "event_ref": "kanban-event-4333",
+          "task_id": "t_64328fb2",
+          "run_id": 900057,
+          "title": "M27.3 live canary source 20260714T182322Z-8ad969 oracle-lab",
+          "status": "archived",
+          "has_receipt": true,
+          "receipt_keys": [
+            "roadmap:shaman.roadmap:promote:shaman.default.impl_review:1:47d486800098d5ae"
+          ],
+          "classification": "receipt_present"
+        },
+        {
+          "event_ref": "kanban-event-4367",
+          "task_id": "t_d8cc7b2c",
+          "run_id": 900060,
+          "title": "M27.3 subscribed canary source 20260714T182944Z-5bbe28 oracle-lab",
+          "status": "archived",
+          "has_receipt": true,
+          "receipt_keys": [
+            "roadmap:shaman.roadmap:promote:shaman.default.impl_review:1:c54d8489cb3a6fad"
+          ],
+          "classification": "receipt_present"
+        }
+      ]
+    }
+  },
+  "backfilled": [],
+  "quarantined_canary_events": [
+    {
+      "board": "agentflow-hermes",
+      "event_ref": "kanban-event-2853",
+      "task_id": "t_585fc102",
+      "title": "M27.3 canary source 20260714T180323Z agentflow-hermes",
+      "status": "archived"
+    },
+    {
+      "board": "agentflow-hermes",
+      "event_ref": "kanban-event-2857",
+      "task_id": "t_9d13065a",
+      "title": "M27.3 canary source 20260714T180444Z agentflow-hermes",
+      "status": "archived"
+    },
+    {
+      "board": "agentflow-hermes",
+      "event_ref": "kanban-event-2861",
+      "task_id": "t_a0a3d3a9",
+      "title": "M27.3 canary source 20260714T180611Z agentflow-hermes",
+      "status": "archived"
+    },
+    {
+      "board": "agentflow-hermes",
+      "event_ref": "kanban-event-2907",
+      "task_id": "t_31d75bc1",
+      "title": "M27.3 live canary source 20260714T181830Z agentflow-hermes",
+      "status": "archived"
+    },
+    {
+      "board": "agentflow-hermes",
+      "event_ref": "kanban-event-2921",
+      "task_id": "t_e91e3da9",
+      "title": "M27.3 live canary source 20260714T182207Z-80723a warroom-os",
+      "status": "archived"
+    },
+    {
+      "board": "warroom-os",
+      "event_ref": "kanban-event-6685",
+      "task_id": "t_8a3af9f8",
+      "title": "M27.3 canary source 20260714T180323Z warroom-os",
+      "status": "archived"
+    },
+    {
+      "board": "warroom-os",
+      "event_ref": "kanban-event-6687",
+      "task_id": "t_728cc758",
+      "title": "M27.3 canary source 20260714T180444Z warroom-os",
+      "status": "archived"
+    },
+    {
+      "board": "warroom-os",
+      "event_ref": "kanban-event-6689",
+      "task_id": "t_d935967e",
+      "title": "M27.3 canary source 20260714T180611Z warroom-os",
+      "status": "archived"
+    },
+    {
+      "board": "oracle-lab",
+      "event_ref": "kanban-event-4284",
+      "task_id": "t_9b1cfc54",
+      "title": "M27.3 canary source 20260714T180323Z oracle-lab",
+      "status": "archived"
+    },
+    {
+      "board": "oracle-lab",
+      "event_ref": "kanban-event-4288",
+      "task_id": "t_4fbeec22",
+      "title": "M27.3 canary source 20260714T180444Z oracle-lab",
+      "status": "archived"
+    },
+    {
+      "board": "oracle-lab",
+      "event_ref": "kanban-event-4294",
+      "task_id": "t_ed1425e5",
+      "title": "M27.3 canary source 20260714T180611Z oracle-lab",
+      "status": "archived"
+    }
+  ],
+  "legitimate_unpromoted_events": [],
+  "duplicate_suppression": {
+    "agentflow-hermes": {
+      "receipt_keys_unique": true,
+      "receipt_count": 5,
+      "event_refs_with_receipts": [
+        "kanban-event-2864",
+        "kanban-event-2890",
+        "kanban-event-2916",
+        "kanban-event-2959",
+        "kanban-event-2984"
+      ]
+    },
+    "warroom-os": {
+      "receipt_keys_unique": true,
+      "receipt_count": 3,
+      "event_refs_with_receipts": [
+        "kanban-event-6692",
+        "kanban-event-6703",
+        "kanban-event-6717"
+      ]
+    },
+    "oracle-lab": {
+      "receipt_keys_unique": true,
+      "receipt_count": 3,
+      "event_refs_with_receipts": [
+        "kanban-event-4304",
+        "kanban-event-4333",
+        "kanban-event-4367"
+      ]
+    }
+  },
+  "summary": {
+    "quarantined_canary_count": 11,
+    "legitimate_unpromoted_count": 0,
+    "backfilled_count": 0
+  }
+}
