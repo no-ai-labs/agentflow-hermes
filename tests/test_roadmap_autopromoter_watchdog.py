@@ -105,6 +105,8 @@ class _RecordingCliRunner:
             self._create_seq += 1
             task_id = f"t_wd_{self._create_seq}"
             return 0, json.dumps({"success": True, "task_id": task_id}), ""
+        if "notify-subscribe" in argv:
+            return 0, "", ""
         raise AssertionError(f"unexpected argv: {argv}")
 
 
@@ -137,7 +139,7 @@ def test_roadmap_promote_creates_impl_review_fanin_graph_via_real_adapter(monkey
     assert roadmap["created_task_ids"] == ["t_wd_1", "t_wd_2", "t_wd_3"]
     create_calls = [c for c in runner.calls if "create" in c]
     assert len(create_calls) == 3
-    assert all(c[:4] == ["hermes", "kanban", "--board", "agentflow-hermes"] for c in create_calls)
+    assert all(c[1:4] == ["kanban", "--board", "agentflow-hermes"] for c in create_calls)
 
 
 def test_roadmap_promote_reads_summary_from_latest_completed_run_when_task_summary_null(monkeypatch, tmp_path):
@@ -397,7 +399,7 @@ def test_roadmap_promote_cross_board_never_used_show_or_create_use_config_board(
     _run(["roadmap", "promote", "--config", config_path, "--task", "t_final_1", "--apply"], monkeypatch, tmp_path)
 
     for call in runner.calls:
-        assert call[:4] == ["hermes", "kanban", "--board", "agentflow-hermes"]
+        assert call[1:4] == ["kanban", "--board", "agentflow-hermes"]
 
 
 def test_roadmap_promote_no_board_client_fails_closed(monkeypatch, tmp_path):
@@ -434,7 +436,7 @@ def test_roadmap_promote_committed_yaml_config_loads_and_evaluates(monkeypatch, 
     assert roadmap["applied"] is True
     assert len(roadmap["created_task_ids"]) == 3
     create_calls = [c for c in runner.calls if "create" in c]
-    assert all(c[:4] == ["hermes", "kanban", "--board", "agentflow-hermes"] for c in create_calls)
+    assert all(c[1:4] == ["kanban", "--board", "agentflow-hermes"] for c in create_calls)
 
 
 def test_roadmap_promote_research_preset_request_only_canary(monkeypatch, tmp_path):

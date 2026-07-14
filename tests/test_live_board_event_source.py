@@ -90,6 +90,41 @@ def test_live_source_cursor_bounds_exclude_seen(tmp_path):
     assert source.fetch_events_since(41) == []
 
 
+def test_live_source_defers_terminal_event_until_run_row_is_visible(tmp_path):
+    db = tmp_path / "kanban.db"
+    _make_db(db)
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute(
+            "insert into tasks(id, title, status, assignee, workspace_path) values(?,?,?,?,?)",
+            ("t_race", "race terminal", "done", "ccreviewer", "/tmp/ws"),
+        )
+        conn.execute(
+            "insert into task_events(id, task_id, run_id, kind, payload, created_at) values(?,?,?,?,?,?)",
+            (43, "t_race", 999, "completed", json.dumps({"summary": "Verdict: GO"}), 1002),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    source = LiveBoardEventSource(board="warroom-os", db_path=db, db_identity="warroom-os")
+    assert [ev.event_seq for ev in source.fetch_events_since(41)] == []
+
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute(
+            "insert into task_runs(id, task_id, step_key, status, summary, metadata) values(?,?,?,?,?,?)",
+            (999, "t_race", "review", "completed", "Verdict: GO\nRoadmap-Transition: research.default.impl_review", "{}"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    events = source.fetch_events_since(41)
+    assert [ev.event_seq for ev in events] == [43]
+    assert "Roadmap-Transition: research.default.impl_review" in events[0].summary
+
+
 def test_live_source_typed_endpoint_wins_over_default(tmp_path):
     db = tmp_path / "kanban.db"
     _make_db(db)

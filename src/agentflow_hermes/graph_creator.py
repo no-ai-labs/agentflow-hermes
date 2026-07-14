@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import shutil
 import subprocess
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable
 
 from .live.sanitize import safe_durable_ref, safe_event_payload, short_text
@@ -165,9 +168,34 @@ class FakeKanbanGraphAdapter:
 KanbanCliRunner = Callable[[list[str]], tuple[int, str, str]]
 
 
+def _board_db_path_for_cli(board: str) -> str:
+    inherited_db = os.environ.get("HERMES_KANBAN_DB")
+    if inherited_db:
+        from pathlib import Path
+
+        inherited = Path(inherited_db)
+        if inherited.name == "kanban.db" and inherited.parent.parent.name == "boards":
+            return str(inherited.parent.parent / board / "kanban.db")
+    from pathlib import Path
+
+    return str(Path.home() / ".hermes" / "kanban" / "boards" / board / "kanban.db")
+
+
 def _default_cli_runner(argv: list[str]) -> tuple[int, str, str]:
-    """Invoke the real `hermes` CLI as a subprocess. Never used unless armed."""
-    proc = subprocess.run(argv, capture_output=True, text=True, timeout=30, check=False)
+    """Invoke the real `hermes` CLI as a subprocess. Never used unless armed.
+
+    Pin the target Kanban board in the child env. Kanban workers often inherit
+    HERMES_KANBAN_DB for their current board, and that env can outrank an
+    explicit ``--board`` flag in some Hermes CLI paths.
+    """
+    env = dict(os.environ)
+    if "--board" in argv:
+        idx = argv.index("--board")
+        if idx + 1 < len(argv):
+            board = argv[idx + 1]
+            env["HERMES_KANBAN_BOARD"] = board
+            env["HERMES_KANBAN_DB"] = _board_db_path_for_cli(board)
+    proc = subprocess.run(argv, capture_output=True, text=True, timeout=30, check=False, env=env)
     return proc.returncode, proc.stdout, proc.stderr
 
 
@@ -233,12 +261,14 @@ class RealKanbanGraphAdapter:
         source_task_id: str = "",
         created_by: str = "",
         hermes_bin: str = "hermes",
+        subscription_endpoint: str = "",
     ) -> None:
         self.runner = runner or _default_cli_runner
         self.board = short_text(board)
         self.source_task_id = short_text(source_task_id)
         self.created_by = short_text(created_by)
-        self.hermes_bin = hermes_bin or "hermes"
+        self.hermes_bin = (hermes_bin or "hermes") if runner is not None else _resolve_hermes_bin(hermes_bin)
+        self.subscription_endpoint = short_text(subscription_endpoint)
         self.create_calls: list[GraphIntentCandidate] = []
         self._key_to_task_id: dict[str, str] = {}
 
@@ -266,18 +296,6 @@ class RealKanbanGraphAdapter:
         if self.created_by:
             argv += ["--created-by", self.created_by]
 
-        origin_flags = _map_origin_to_flags(intent.origin, intent.return_to)
-        if origin_flags:
-            argv += ["--origin-platform", origin_flags["platform"], "--origin-chat-id", origin_flags["chat_id"]]
-            if origin_flags.get("thread_id"):
-                argv += ["--origin-thread-id", origin_flags["thread_id"]]
-            if origin_flags.get("user_id"):
-                argv += ["--origin-user-id", origin_flags["user_id"]]
-
-        ack_agent = str(metadata.get("ack_trigger_agent") or "")
-        if ack_agent:
-            argv += ["--ack-trigger-agent"]
-
         argv += ["--json"]
         return argv
 
@@ -300,18 +318,62 @@ class RealKanbanGraphAdapter:
         task_id = _task_id_from_result(result)
         if not task_id:
             return {"success": False, "error": "cli_missing_task_id", "mutations": []}
+        subscribe_result = self._subscribe_if_needed(intent, task_id)
+        if subscribe_result.get("success") is False:
+            return {
+                "success": False,
+                "error": subscribe_result.get("error") or "cli_subscribe_failed",
+                "mutations": [{"op": "create_task", "task_id": task_id}],
+            }
         self._key_to_task_id[intent.idempotency_key] = task_id
         return {
             "success": True,
             "action": "real_create",
             "task_id": task_id,
             "idempotency_key": intent.idempotency_key,
-            "mutations": [{"op": "create_task", "task_id": task_id}],
+            "mutations": [{"op": "create_task", "task_id": task_id}, *subscribe_result.get("mutations", [])],
         }
+
+    def _subscribe_if_needed(self, intent: GraphIntentCandidate, task_id: str) -> dict[str, Any]:
+        if not intent.subscription_required:
+            return {"success": True, "mutations": []}
+        endpoint = self.subscription_endpoint or intent.return_to or intent.origin
+        flags = _map_origin_to_flags(endpoint)
+        if not flags:
+            return {"success": False, "error": "subscription_endpoint_unresolved", "mutations": []}
+        argv = [
+            self.hermes_bin, "kanban", "--board", self.board, "notify-subscribe", task_id,
+            "--platform", flags["platform"], "--chat-id", flags["chat_id"],
+        ]
+        if flags.get("thread_id"):
+            argv += ["--thread-id", flags["thread_id"]]
+        if flags.get("user_id"):
+            argv += ["--user-id", flags["user_id"]]
+        try:
+            returncode, _stdout, _stderr = self.runner(argv)
+        except Exception:
+            return {"success": False, "error": "cli_subscribe_runner_error", "mutations": []}
+        if returncode != 0:
+            return {"success": False, "error": "cli_subscribe_failed", "mutations": []}
+        return {"success": True, "mutations": [{"op": "notify_subscribe", "task_id": task_id, "endpoint": endpoint}]}
 
 
 def _task_id_from_result(result: dict[str, Any]) -> str:
     return short_text(str(result.get("task_id") or result.get("id") or result.get("task") or ""))
+
+
+def _resolve_hermes_bin(hermes_bin: str = "hermes") -> str:
+    requested = hermes_bin or "hermes"
+    if requested != "hermes":
+        return requested
+    env_bin = os.environ.get("HERMES_BIN")
+    if env_bin:
+        return env_bin
+    found = shutil.which("hermes")
+    if found:
+        return found
+    user_bin = Path.home() / ".local" / "bin" / "hermes"
+    return str(user_bin) if user_bin.exists() else "hermes"
 
 
 def _coerce_policy(policy: RemediationGraphPolicy | None) -> RemediationGraphPolicy:

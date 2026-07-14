@@ -136,12 +136,14 @@ class LiveBoardEventSource:
                     t.workspace_path as workspace_path,
                     t.workflow_template_id as workflow_template_id,
                     r.step_key as step_key,
+                    r.id as joined_run_id,
                     r.summary as run_summary,
                     r.metadata as run_metadata
                 from task_events e
                 join tasks t on t.id = e.task_id
                 left join task_runs r on r.id = e.run_id
                 where e.id > ? and e.kind in ({placeholders})
+                  and (e.run_id is null or r.id is not null)
                 order by e.id asc
                 limit ?
             """
@@ -240,6 +242,8 @@ class BoardRegistryEntry:
     enabled: bool = True
     default_endpoint: str = ""
     db_path: str = ""
+    roadmap_config_path: str = ""
+    roadmap_receipts_file: str = ""
 
 
 def load_board_registry(path: str | Path) -> dict[str, BoardRegistryEntry]:
@@ -265,5 +269,7 @@ def load_board_registry(path: str | Path) -> dict[str, BoardRegistryEntry]:
             enabled=enabled if isinstance(enabled, bool) else True,
             default_endpoint=str(spec.get("default_endpoint") or ""),
             db_path=str(spec.get("db_path") or ""),
+            roadmap_config_path=str(spec.get("roadmap_config_path") or spec.get("roadmap_config") or ""),
+            roadmap_receipts_file=str(spec.get("roadmap_receipts_file") or spec.get("roadmap_receipts") or ""),
         )
     return registry

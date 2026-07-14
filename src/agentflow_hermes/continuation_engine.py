@@ -16,7 +16,9 @@ maintaining its own parallel copy (plan 14, commit 7 item 1).
 
 from __future__ import annotations
 
+import json
 import time
+from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from .board_events import BoardEventSource, BoardRegistryEntry, LiveBoardEventSource
@@ -29,6 +31,8 @@ from .input_contract import InputContract
 from .interaction import InteractionInbox
 from .outcome import GENERIC_OWNER_INPUT_CONTRACT, ContinuationKind
 from .outcome_compiler import compile_outcome
+from .roadmap import InMemoryRoadmapApplyLedger, InMemoryRoadmapPromotionLedger, RoadmapPromotionPolicy, apply_roadmap_promotion
+from .roadmap_config import RepoRoadmapConfig, build_registry
 from .requirement_resolver import HumanEffortResolver
 from .requirements import Requirement
 
@@ -356,7 +360,13 @@ def ingest_board_once(
     handle_kinds: Iterable[ContinuationKind] | None = None,
     default_endpoint: str = "",
     interaction_inbox: InteractionInbox | None = None,
+    roadmap_config: RepoRoadmapConfig | None = None,
+    roadmap_apply_ledger: InMemoryRoadmapApplyLedger | None = None,
+    roadmap_receipts_file: str = "",
+    roadmap_graph_adapter: Any = None,
+    apply: bool = False,
 ) -> dict[str, Any]:
+    explicit_roadmap_router = roadmap_router is not None
     roadmap_router = roadmap_router or propose_next_slice_graph
     code_fix_router = code_fix_router or propose_remediation_graph
     allowed_kinds = set(handle_kinds) if handle_kinds is not None else None
@@ -409,19 +419,45 @@ def ingest_board_once(
             )
             results.append({"event_id": event.event_id, **outcome})
         elif envelope.continuation_kind in (ContinuationKind.ROADMAP_NEXT, ContinuationKind.COMPLETE):
-            result = roadmap_router(
-                event.summary,
-                event_id=event.event_id,
-                source_final_ref=event.source_task_id,
-                origin=origin_ref,
-                return_to=return_to_ref,
-                occurred_at=event.occurred_at,
-                adapter=None,
-            )
+            if roadmap_config is None and explicit_roadmap_router:
+                result = roadmap_router(
+                    event.summary,
+                    event_id=event.event_id,
+                    source_final_ref=event.source_task_id,
+                    origin=origin_ref,
+                    return_to=return_to_ref,
+                    occurred_at=event.occurred_at,
+                    adapter=None,
+                )
+            elif roadmap_config is None:
+                result = {"success": True, "action": "noop", "reason": "no_transition_config", "created_task_ids": []}
+            elif not roadmap_config.enabled or roadmap_config.kill_switch:
+                result = {"success": True, "action": "noop", "reason": "transition_config_disabled", "created_task_ids": []}
+            else:
+                ledger = roadmap_apply_ledger or load_roadmap_apply_ledger(roadmap_receipts_file)
+                result = apply_roadmap_promotion(
+                    event.summary,
+                    event_id=event.event_id,
+                    source_final_ref=event.source_task_id,
+                    source_assignee=event.assignee,
+                    origin=roadmap_config.expected_origin or origin_ref,
+                    return_to=roadmap_config.expected_return_to or return_to_ref,
+                    subscription_status=_summary_marker(event.summary, "Subscription-Status") or "unverified",
+                    policy_resolution_ref=_summary_marker(event.summary, "Policy-Resolution-Ref"),
+                    occurred_at=event.occurred_at,
+                    registry=build_registry(roadmap_config),
+                    ledger=InMemoryRoadmapPromotionLedger(),
+                    apply_ledger=ledger,
+                    policy=_roadmap_policy_from_config(roadmap_config, apply=apply),
+                    adapter=roadmap_graph_adapter if apply else None,
+                )
+                if roadmap_receipts_file:
+                    _persist_roadmap_apply_ledger(ledger, roadmap_receipts_file)
             results.append({
                 "event_id": event.event_id,
                 "action": "roadmap_routed",
                 "router_success": bool(result.get("success")),
+                "roadmap": result,
             })
         elif envelope.continuation_kind == ContinuationKind.CODE_FIX:
             result = code_fix_router(
@@ -455,6 +491,58 @@ def ingest_board_once(
         "results": results,
         "cursor": max_seq,
     }
+
+
+def _summary_marker(text: str, marker: str) -> str:
+    wanted = marker.strip().lower()
+    for line in (text or "").splitlines():
+        key, sep, value = line.partition(":")
+        if sep and key.strip().lower() == wanted:
+            return value.strip()
+    return ""
+
+
+def _roadmap_policy_from_config(config: RepoRoadmapConfig, *, apply: bool) -> RoadmapPromotionPolicy:
+    return RoadmapPromotionPolicy(
+        auto_continue=True,
+        allowlisted_transitions=config.allowed_transitions,
+        max_chain_depth=config.max_chain_depth,
+        max_promotions_per_roadmap=config.max_promotions_per_roadmap,
+        promote_cooldown_seconds=config.promote_cooldown_seconds,
+        require_review_edge=config.require_review_edge,
+        require_ack_edge=config.require_ack_edge,
+        require_trusted_assignee=config.require_trusted_assignee,
+        trusted_assignees=config.trusted_assignees,
+        require_origin_match=config.require_origin_match,
+        expected_origin=config.expected_origin,
+        expected_return_to=config.expected_return_to,
+        require_policy_resolution=config.require_policy_resolution,
+        apply_enabled=bool(apply and config.apply_mode),
+        impl_assignee=config.impl_assignee,
+        review_assignee=config.review_assignee,
+        ack_trigger_agent=config.ack_trigger_agent,
+    )
+
+
+def load_roadmap_apply_ledger(path: str) -> InMemoryRoadmapApplyLedger:
+    ledger = InMemoryRoadmapApplyLedger()
+    if not path:
+        return ledger
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ledger
+    if isinstance(data, dict):
+        for key, receipt in data.items():
+            if isinstance(receipt, dict):
+                ledger.applied[str(key)] = receipt
+    return ledger
+
+
+def _persist_roadmap_apply_ledger(ledger: InMemoryRoadmapApplyLedger, path: str) -> None:
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(ledger.applied, ensure_ascii=False), encoding="utf-8")
 
 
 def live_source_factory(board: str, entry: BoardRegistryEntry) -> LiveBoardEventSource:

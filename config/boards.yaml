@@ -24,11 +24,17 @@ boards:
     db_identity: agentflow-hermes
     enabled: true
     default_endpoint: discord:1497895797579190357
+    roadmap_config_path: /home/duckran/dev/agentflow-hermes/agentflow-roadmap.yaml
+    roadmap_receipts_file: /home/duckran/dev/agentflow-hermes/.agentflow-roadmap-receipts.json
   warroom-os:
     db_identity: warroom-os
     enabled: true
     default_endpoint: discord:1499390151393284106
+    roadmap_config_path: /home/duckran/.hermes/agentflow/roadmaps/research-roadmap.yaml
+    roadmap_receipts_file: /home/duckran/.hermes/agentflow/roadmaps/research-receipts.json
   oracle-lab:
     db_identity: oracle-lab
     enabled: true
     default_endpoint: discord:1500539609413849200
+    roadmap_config_path: /home/duckran/.hermes/agentflow/roadmaps/shaman-roadmap.yaml
+    roadmap_receipts_file: /home/duckran/.hermes/agentflow/roadmaps/shaman-receipts.json

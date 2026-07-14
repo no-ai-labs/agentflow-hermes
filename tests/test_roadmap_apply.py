@@ -177,6 +177,8 @@ class _RecordingCliRunner:
 
     def __call__(self, argv: list[str]) -> tuple[int, str, str]:
         self.calls.append(list(argv))
+        if "notify-subscribe" in argv:
+            return 0, "", ""
         task_id = f"t_real_{len(self.calls)}"
         return 0, json.dumps({"success": True, "task_id": task_id}), ""
 
@@ -189,38 +191,41 @@ def test_real_kanban_adapter_calls_cli_runner_with_exact_argv_shape():
 
     assert result["success"] is True
     assert result["applied"] is True
-    assert result["created_task_ids"] == ["t_real_1", "t_real_2", "t_real_3"]
+    assert result["created_task_ids"] == ["t_real_1", "t_real_3", "t_real_5"]
     assert len(adapter.create_calls) == 3
-    assert len(runner.calls) == 3
+    assert len(runner.calls) == 6
 
-    impl_argv, review_argv, fanin_argv = runner.calls
+    impl_argv, impl_subscribe_argv, review_argv, review_subscribe_argv, fanin_argv, fanin_subscribe_argv = runner.calls
 
     assert impl_argv == [
-        "hermes", "kanban", "--board", "main", "create", "m15 impl [m14->m15.impl_review_fanin]",
+        adapter.hermes_bin, "kanban", "--board", "main", "create", "m15 impl [m14->m15.impl_review_fanin]",
         "--body", impl_argv[impl_argv.index("--body") + 1],
         "--assignee", "impl-agent",
         "--idempotency-key", impl_argv[impl_argv.index("--idempotency-key") + 1],
         "--created-by", "loop-agent",
-        "--origin-platform", "discord", "--origin-chat-id", "hermes-main",
         "--json",
     ]
     assert "--parent" not in impl_argv
     assert "--initial-status" not in impl_argv
     assert "ready" not in impl_argv
     assert "Acceptance criteria:" in impl_argv[impl_argv.index("--body") + 1]
+    assert impl_subscribe_argv[:5] == ["hermes", "kanban", "--board", "main", "notify-subscribe"]
+    assert impl_subscribe_argv[impl_subscribe_argv.index("--chat-id") + 1] == "hermes-main"
 
     assert "--parent" in review_argv
     assert review_argv[review_argv.index("--parent") + 1] == "t_real_1"
     assert "--assignee" in review_argv and review_argv[review_argv.index("--assignee") + 1] == "ccreviewer"
     assert "--ack-trigger-agent" not in review_argv
+    assert review_subscribe_argv[:5] == ["hermes", "kanban", "--board", "main", "notify-subscribe"]
 
     assert "--parent" in fanin_argv
-    assert fanin_argv[fanin_argv.index("--parent") + 1] == "t_real_2"
+    assert fanin_argv[fanin_argv.index("--parent") + 1] == "t_real_3"
     assert fanin_argv[fanin_argv.index("--assignee") + 1] == "ack-agent"
-    assert "--ack-trigger-agent" in fanin_argv
+    assert "--ack-trigger-agent" not in fanin_argv
+    assert fanin_subscribe_argv[:5] == ["hermes", "kanban", "--board", "main", "notify-subscribe"]
 
 
-def test_real_kanban_adapter_maps_return_to_origin_thread_and_user_flags():
+def test_real_kanban_adapter_omits_unsupported_origin_flags_on_current_cli():
     runner = _RecordingCliRunner()
     adapter = RealKanbanGraphAdapter(runner, board="main")
     intent = GraphIntentCandidate(
@@ -241,12 +246,29 @@ def test_real_kanban_adapter_maps_return_to_origin_thread_and_user_flags():
 
     assert result["success"] is True
     argv = runner.calls[0]
-    assert argv[argv.index("--origin-platform") + 1] == "discord"
-    assert argv[argv.index("--origin-chat-id") + 1] == "hermes-main"
-    assert argv[argv.index("--origin-thread-id") + 1] == "thread-7"
-    assert argv[argv.index("--origin-user-id") + 1] == "user-9"
+    subscribe_argv = runner.calls[1]
+    assert "--origin-platform" not in argv
+    assert "--origin-chat-id" not in argv
+    assert "--origin-thread-id" not in argv
+    assert "--origin-user-id" not in argv
     assert "Acceptance criteria:\nprove argv" in argv[argv.index("--body") + 1]
     assert "--initial-status" not in argv
+    assert subscribe_argv[subscribe_argv.index("--thread-id") + 1] == "thread-7"
+    assert subscribe_argv[subscribe_argv.index("--user-id") + 1] == "user-9"
+
+
+def test_real_kanban_adapter_resolves_user_hermes_bin_when_service_path_is_minimal(monkeypatch, tmp_path):
+    fake_home = tmp_path / "home"
+    hermes_bin = fake_home / ".local" / "bin" / "hermes"
+    hermes_bin.parent.mkdir(parents=True)
+    hermes_bin.write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    monkeypatch.delenv("HERMES_BIN", raising=False)
+
+    adapter = RealKanbanGraphAdapter(board="main")
+
+    assert adapter.hermes_bin == str(hermes_bin)
 
 
 def test_real_kanban_adapter_duplicate_go_uses_apply_ledger_no_extra_create():
@@ -258,7 +280,7 @@ def test_real_kanban_adapter_duplicate_go_uses_apply_ledger_no_extra_create():
     assert first["applied"] is True
     assert second["duplicate"] is True
     assert second["created_task_ids"] == first["created_task_ids"]
-    assert len(runner.calls) == 3
+    assert len([c for c in runner.calls if "create" in c]) == 3
 
 
 def test_duplicate_event_returns_existing_ids_no_duplicate_creates():

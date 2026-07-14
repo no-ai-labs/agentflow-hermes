@@ -76,10 +76,14 @@ class _RecordingCliRunner:
 
     def __init__(self) -> None:
         self.calls = []
+        self._create_seq = 0
 
     def __call__(self, argv):
         self.calls.append(list(argv))
-        task_id = f"t_cli_real_{len(self.calls)}"
+        if "notify-subscribe" in argv:
+            return 0, "", ""
+        self._create_seq += 1
+        task_id = f"t_cli_real_{self._create_seq}"
         return 0, json.dumps({"success": True, "task_id": task_id}), ""
 
 
@@ -389,7 +393,10 @@ def test_cli_loop_evaluate_real_adapter_mode_calls_board_client(monkeypatch, tmp
     roadmap = data["receipt"]["decision_payload"]["roadmap_autopromote"]
     assert roadmap["applied"] is True
     assert roadmap["created_task_ids"] == ["t_cli_real_1", "t_cli_real_2", "t_cli_real_3"]
-    assert len(runner.calls) == 3
+    create_calls = [c for c in runner.calls if "create" in c]
+    subscribe_calls = [c for c in runner.calls if "notify-subscribe" in c]
+    assert len(create_calls) == 3
+    assert len(subscribe_calls) == 3
     assert all(argv[:4] == ["hermes", "kanban", "--board", "main"] for argv in runner.calls)
 
 

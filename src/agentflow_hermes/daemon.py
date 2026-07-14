@@ -37,14 +37,16 @@ from .continuation_config import ContractRegistry, load_contract_registry
 from .continuation_engine import (
     ExternalWaitChecker,
     ingest_board_once,
+    load_roadmap_apply_ledger,
     live_source_factory,
     poll_external_wait_conditions,
     real_adapter_factory,
     reconcile_outbox,
 )
 from .continuation_store import ContinuationStore
-from .graph_creator import propose_next_slice_graph, propose_remediation_graph
+from .graph_creator import RealKanbanGraphAdapter, propose_next_slice_graph, propose_remediation_graph
 from .interaction import InteractionInbox
+from .roadmap_config import load_repo_roadmap_config
 
 DEFAULT_POLL_INTERVAL_SECONDS = 0.5
 DEFAULT_RECONCILE_INTERVAL_SECONDS = 300.0
@@ -96,6 +98,8 @@ def discover_boards(
                 enabled=True,
                 default_endpoint=(override.default_endpoint if override else ""),
                 db_path=(override.db_path if override and override.db_path else "") or str(db_path),
+                roadmap_config_path=(override.roadmap_config_path if override else ""),
+                roadmap_receipts_file=(override.roadmap_receipts_file if override else ""),
             )
     return registry
 
@@ -110,10 +114,15 @@ def route_board_events(
     store: ContinuationStore,
     contract_registry: ContractRegistry,
     adapter: Any,
-    roadmap_router: Callable[..., dict[str, Any]] = propose_next_slice_graph,
+    roadmap_router: Callable[..., dict[str, Any]] | None = None,
     code_fix_router: Callable[..., dict[str, Any]] = propose_remediation_graph,
     interaction_inbox: InteractionInbox | None = None,
     source_factory: Callable[[str, BoardRegistryEntry], Any] = live_source_factory,
+    roadmap_config: Any = None,
+    roadmap_apply_ledger: Any = None,
+    roadmap_receipts_file: str = "",
+    roadmap_graph_adapter: Any = None,
+    apply: bool = False,
 ) -> dict[str, Any]:
     """One board's worth of the unified handler router. Seeds a
     never-before-seen board's cursor to its current max event id (no
@@ -138,6 +147,11 @@ def route_board_events(
         code_fix_router=code_fix_router,
         default_endpoint=entry.default_endpoint,
         interaction_inbox=interaction_inbox,
+        roadmap_config=roadmap_config,
+        roadmap_apply_ledger=roadmap_apply_ledger,
+        roadmap_receipts_file=roadmap_receipts_file,
+        roadmap_graph_adapter=roadmap_graph_adapter,
+        apply=apply,
     )
 
 
@@ -250,6 +264,19 @@ class AgentflowDaemon:
         board_reports = []
         for board, entry in registry.items():
             adapter = adapter_factory(board, entry)
+            roadmap_config = None
+            roadmap_apply_ledger = None
+            roadmap_graph_adapter = None
+            if entry.roadmap_config_path:
+                with contextlib.suppress(OSError, ValueError):
+                    roadmap_config = load_repo_roadmap_config(entry.roadmap_config_path)
+                roadmap_apply_ledger = load_roadmap_apply_ledger(entry.roadmap_receipts_file)
+                if self.config.apply and roadmap_config is not None:
+                    roadmap_graph_adapter = RealKanbanGraphAdapter(
+                        board=board,
+                        source_task_id="agentflowd",
+                        subscription_endpoint=entry.default_endpoint,
+                    )
             board_reports.append(
                 route_board_events(
                     board=board,
@@ -259,6 +286,11 @@ class AgentflowDaemon:
                     adapter=adapter,
                     interaction_inbox=interaction_inbox,
                     source_factory=self.config.source_factory,
+                    roadmap_config=roadmap_config,
+                    roadmap_apply_ledger=roadmap_apply_ledger,
+                    roadmap_receipts_file=entry.roadmap_receipts_file,
+                    roadmap_graph_adapter=roadmap_graph_adapter,
+                    apply=self.config.apply,
                 )
             )
         wait_report = poll_external_wait_conditions(store, checker=self.config.external_wait_checker)

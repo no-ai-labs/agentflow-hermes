@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 
 from agentflow_hermes.board_adapter import FakeBoardAdapter
 from agentflow_hermes.board_events import BoardEvent, FakeBoardEventSource
 from agentflow_hermes.continuation_config import load_contract_registry
 from agentflow_hermes.continuation_store import ContinuationStore
+from agentflow_hermes.graph_creator import FakeKanbanGraphAdapter
+from agentflow_hermes.roadmap_config import load_repo_roadmap_config
 from agentflow_hermes.daemon import (
     AgentflowDaemon,
     DaemonConfig,
@@ -35,7 +38,7 @@ def _fake_source_factory(events):
     return factory
 
 
-def _route_primed(*, board, entry, store, contract_registry, adapter, events):
+def _route_primed(*, board, entry, store, contract_registry, adapter, events, **kwargs):
     """route_board_events seeds a never-before-seen board's cursor to its
     current max event id on first call (no historical replay, plan 2.6/9.1).
     Tests that want to observe a fresh event being *processed* must prime the
@@ -43,7 +46,7 @@ def _route_primed(*, board, entry, store, contract_registry, adapter, events):
     store.advance_cursor(board, f"{board}-db", 0)
     return route_board_events(
         board=board, entry=entry, store=store, contract_registry=contract_registry, adapter=adapter,
-        source_factory=_fake_source_factory(events),
+        source_factory=_fake_source_factory(events), **kwargs,
     )
 
 
@@ -55,6 +58,73 @@ def _go_event() -> BoardEvent:
         source_graph_id="g_1",
         summary="Verdict: GO",
     )
+
+
+def _roadmap_go_event() -> BoardEvent:
+    return BoardEvent(
+        event_id="ev_go",
+        event_seq=1,
+        source_task_id="t_go",
+        source_graph_id="g_1",
+        assignee="ccreviewer",
+        summary="""Verdict: GO
+Roadmap-Transition: b1.default.impl_review
+Next-Slice: next
+Review-Edge: verified
+Ack-Edge: verified
+Parent-GO: verified
+Auto-Continue: true
+Origin/return_to: Discord Devhub / #b1
+Return-To: Discord Devhub / #b1
+Subscription-Status: verified
+Policy-Resolution-Ref: policy:test
+""",
+    )
+
+
+def _roadmap_config_file(tmp_path) -> str:
+    path = tmp_path / "roadmap.yaml"
+    path.write_text(
+        """enabled: true
+kill_switch: false
+board: b1
+same_board_only: true
+apply_mode: true
+expected_origin: "Discord Devhub / #b1"
+expected_return_to: "Discord Devhub / #b1"
+impl_assignee: ccsupervisor
+review_assignee: ccreviewer
+ack_trigger_agent: true
+trusted_assignees:
+  - ccreviewer
+allowed_transitions:
+  - b1.default.impl_review
+max_chain_depth: 3
+max_promotions_per_roadmap: 6
+promote_cooldown_seconds: 0
+require_review_edge: true
+require_ack_edge: true
+require_trusted_assignee: true
+require_origin_match: true
+require_policy_resolution: true
+transitions:
+  b1.default.impl_review:
+    roadmap_id: b1.roadmap
+    from_slice: current
+    to_slice: next
+    slice_template:
+      - impl
+      - review
+      - fanin
+    policy_refs:
+      - design_opus
+      - implementation_default
+    max_chain_depth: 3
+    version: template-v1
+""",
+        encoding="utf-8",
+    )
+    return str(path)
 
 
 def _code_fix_event() -> BoardEvent:
@@ -131,6 +201,21 @@ def test_discover_boards_applies_endpoint_override(tmp_path):
     assert registry["alpha"].default_endpoint == "discord:555"
 
 
+def test_discover_boards_preserves_roadmap_transition_config_override(tmp_path):
+    root = tmp_path / "boards"
+    (root / "alpha").mkdir(parents=True)
+    sqlite3.connect(root / "alpha" / "kanban.db").close()
+    overrides = tmp_path / "boards.yaml"
+    overrides.write_text(
+        "boards:\n  alpha:\n    roadmap_config_path: /tmp/alpha-roadmap.yaml\n    roadmap_receipts_file: /tmp/alpha-receipts.json\n"
+    )
+
+    registry = discover_boards(boards_root=root, overrides_path=overrides)
+
+    assert registry["alpha"].roadmap_config_path == "/tmp/alpha-roadmap.yaml"
+    assert registry["alpha"].roadmap_receipts_file == "/tmp/alpha-receipts.json"
+
+
 def test_discover_boards_missing_root_returns_empty(tmp_path):
     assert discover_boards(boards_root=tmp_path / "does-not-exist") == {}
 
@@ -150,6 +235,56 @@ def test_router_routes_go_and_code_fix_and_needs_input(tmp_path):
     store2 = ContinuationStore(tmp_path / "agentflow2.sqlite")
     fix_result = _route_primed(board="b1", entry=entry, store=store2, contract_registry=contracts, adapter=adapter, events=[_code_fix_event()])
     assert fix_result["results"][0]["action"] == "code_fix_routed"
+
+
+def test_router_go_without_transition_config_is_deterministic_noop(tmp_path):
+    store = ContinuationStore(tmp_path / "agentflow.sqlite")
+    adapter = FakeBoardAdapter()
+    contracts = _contracts_with_generic()
+    entry = BoardRegistryEntry(board="b1", db_identity="b1", default_endpoint="discord:1")
+
+    result = _route_primed(board="b1", entry=entry, store=store, contract_registry=contracts, adapter=adapter, events=[_go_event()])
+
+    item = result["results"][0]
+    assert item["action"] == "roadmap_routed"
+    assert item["roadmap"]["reason"] == "no_transition_config"
+    assert item["roadmap"]["created_task_ids"] == []
+
+
+def test_router_configured_go_applies_graph_and_replay_is_deduped(tmp_path):
+    receipts = tmp_path / "receipts.json"
+    roadmap_config = load_repo_roadmap_config(_roadmap_config_file(tmp_path))
+    contracts = _contracts_with_generic()
+    adapter = FakeKanbanGraphAdapter()
+    entry = BoardRegistryEntry(board="b1", db_identity="b1", default_endpoint="discord:1")
+
+    store = ContinuationStore(tmp_path / "agentflow.sqlite")
+    result = _route_primed(
+        board="b1", entry=entry, store=store, contract_registry=contracts, adapter=FakeBoardAdapter(),
+        events=[_roadmap_go_event()], roadmap_config=roadmap_config, roadmap_receipts_file=str(receipts),
+        roadmap_graph_adapter=adapter, apply=True,
+    )
+
+    roadmap = result["results"][0]["roadmap"]
+    assert roadmap["action"] == "apply"
+    assert roadmap["applied"] is True
+    assert len(roadmap["created_task_ids"]) == 3
+    assert len(adapter.create_calls) == 3
+    saved = json.loads(receipts.read_text(encoding="utf-8"))
+    assert roadmap["idempotency_key"] in saved
+
+    replay_store = ContinuationStore(tmp_path / "agentflow-replay.sqlite")
+    replay_adapter = FakeKanbanGraphAdapter()
+    replay = _route_primed(
+        board="b1", entry=entry, store=replay_store, contract_registry=contracts, adapter=FakeBoardAdapter(),
+        events=[_roadmap_go_event()], roadmap_config=roadmap_config, roadmap_receipts_file=str(receipts),
+        roadmap_graph_adapter=replay_adapter, apply=True,
+    )
+
+    replay_roadmap = replay["results"][0]["roadmap"]
+    assert replay_roadmap["reason"] == "duplicate_graph"
+    assert replay_roadmap["created_task_ids"] == roadmap["created_task_ids"]
+    assert replay_adapter.create_calls == []
 
 
 def test_router_needs_input_h1_creates_owner_anchor_when_unresolved(tmp_path):
