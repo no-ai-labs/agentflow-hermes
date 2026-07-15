@@ -311,6 +311,13 @@ class RealBoardAdapter:
         assignee = short_text(str(intent.get("assignee") or ""))
         if assignee:
             argv += ["--assignee", assignee]
+        parent_task_id = short_text(str(intent.get("parent_task_id") or ""))
+        if parent_task_id:
+            # Link a generated review card to its fix card so the code-fix
+            # graph is a real parent/child graph on the board, not two
+            # unrelated cards. The Hermes ``create`` surface accepts --parent
+            # (same flag RealKanbanGraphAdapter uses for roadmap graphs).
+            argv += ["--parent", parent_task_id]
         if key:
             argv += ["--idempotency-key", key]
         if is_blocked:

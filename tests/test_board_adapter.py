@@ -100,6 +100,25 @@ def test_real_adapter_create_task_uses_initial_status_blocked_and_body_checklist
     assert "approval_receipt_id" in body
 
 
+def test_real_adapter_create_task_links_parent_when_present():
+    calls = []
+
+    def runner(argv):
+        calls.append(argv)
+        return 0, json.dumps({"id": "t_review"}), ""
+
+    adapter = RealBoardAdapter(runner=runner, board="warroom-os", hermes_bin="hermes")
+    result = adapter.create_task(
+        _intent(kind="review", status="running", idempotency_key="code_fix_review:abc", parent_task_id="t_fix")
+    )
+
+    assert result == {"success": True, "task_id": "t_review"}
+    argv = calls[0]
+    assert "--parent" in argv and "t_fix" in argv
+    # A non-blocked review card is created running, not blocked.
+    assert "--initial-status" not in argv
+
+
 def test_real_adapter_create_task_is_cached_locally_and_skips_second_cli_call():
     calls = []
 

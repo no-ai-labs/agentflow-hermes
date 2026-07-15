@@ -522,6 +522,36 @@ def test_daemon_tick_processes_discovered_board(tmp_path):
     assert report["boards"][0]["results"][0]["action"] == "roadmap_routed"
 
 
+def test_daemon_runtime_report_distinguishes_global_daemon_from_legacy_canary(tmp_path):
+    """M30A item 5: the status surface must report the global continuation
+    daemon's coverage (discovered boards, semantic handlers, notify+wake
+    transport) and must NOT call a board unprotected merely because legacy
+    direct-dispatch live-send remains canary-only."""
+    boards_root = tmp_path / "boards"
+    for board in ("alpha", "beta"):
+        (boards_root / board).mkdir(parents=True)
+        _seed_live_kanban_db(boards_root / board / "kanban.db")
+    store = ContinuationStore(tmp_path / "agentflow.sqlite")
+    config = DaemonConfig(store=store, boards_root=boards_root, contracts_dir=None, apply=True)
+    daemon = AgentflowDaemon(config)
+
+    report = daemon.runtime_report()
+
+    assert report["runtime"] == "global_continuation_daemon"
+    assert report["apply"] is True
+    assert report["discovered_boards"] == 2
+    assert set(report["enrolled_boards"]) == {"alpha", "beta"}
+    assert report["callback_transport"] == "kanban_notify_wake"
+    # Semantic handlers include both needs_input and the new code_fix handler.
+    assert "code_fix" in report["semantic_handlers"]
+    assert "needs_input" in report["semantic_handlers"]
+    # Every discovered board is continuation-protected regardless of any legacy
+    # direct-dispatch canary scope.
+    assert all(b["continuation_protected"] for b in report["boards"])
+    assert "canary_only" in report["legacy_direct_dispatch"]
+    assert report["canonical_db"] == str(store.path)
+
+
 def test_daemon_reconcile_replays_outbox(tmp_path):
     boards_root = tmp_path / "boards"
     (boards_root / "alpha").mkdir(parents=True)

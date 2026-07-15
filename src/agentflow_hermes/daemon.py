@@ -104,6 +104,71 @@ def discover_boards(
     return registry
 
 
+# -- runtime doctor/status surface (plan/M30A item 5) -----------------------
+
+
+# The return-trip transport every semantic handler uses: a durable Kanban
+# notify + active-wake subscription on the generated graph, never a direct
+# AgentFlow/Discord send.
+CALLBACK_TRANSPORT = "kanban_notify_wake"
+
+
+def runtime_report(
+    *,
+    boards_root: Path,
+    overrides_path: Path | None = None,
+    store: ContinuationStore | None = None,
+    apply: bool = False,
+) -> dict[str, Any]:
+    """Describe the global continuation daemon's live surface so an operator
+    can tell it apart from the legacy direct-dispatch canary.
+
+    Reports discovered/enrolled boards, ``--apply`` status, the registered
+    semantic continuation handlers, the canonical store path and per-board
+    cursors, and the callback transport (Kanban notify+wake). Crucially it
+    reports continuation coverage per board independently of whether any
+    legacy *direct AgentFlow live-send* remains canary-only: a board covered
+    by the global daemon is protected even if direct live-send is not enabled
+    for it, so this surface never claims such a board is "unprotected"."""
+    from .continuation import _HANDLERS
+
+    registry = discover_boards(boards_root=boards_root, overrides_path=overrides_path)
+    handlers = sorted(kind.value for kind in _HANDLERS)
+
+    boards: list[dict[str, Any]] = []
+    for board, entry in registry.items():
+        db_identity = entry.db_identity or board
+        board_row: dict[str, Any] = {
+            "board": board,
+            "enrolled": True,
+            "db_identity": db_identity,
+            "default_endpoint": entry.default_endpoint,
+            # Global-by-discovery: coverage comes from the daemon observing the
+            # board, not from any per-channel allowlist or direct-send canary.
+            "continuation_protected": True,
+            "protection": "global_continuation_daemon",
+        }
+        if store is not None:
+            board_row["cursor"] = store.get_cursor(board, db_identity)
+            board_row["cursor_seeded"] = store.cursor_exists(board, db_identity)
+        boards.append(board_row)
+
+    return {
+        "runtime": "global_continuation_daemon",
+        "apply": apply,
+        "discovered_boards": len(boards),
+        "enrolled_boards": [b["board"] for b in boards],
+        "boards": boards,
+        "semantic_handlers": handlers,
+        "callback_transport": CALLBACK_TRANSPORT,
+        "canonical_db": str(store.path) if store is not None else "",
+        # Legacy direct-dispatch AgentFlow live-send is a *separate*, canary-only
+        # policy. Its scope never implies a board observed by this daemon is
+        # unprotected — continuation coverage is global-by-discovery.
+        "legacy_direct_dispatch": "canary_only_independent_of_continuation_coverage",
+    }
+
+
 # -- per-board wrapper over continuation_engine's router ---------------------
 
 
@@ -295,6 +360,15 @@ class AgentflowDaemon:
             )
         wait_report = poll_external_wait_conditions(store, checker=self.config.external_wait_checker)
         return {"success": True, "boards": board_reports, "external_wait": wait_report, "ts": time.time()}
+
+    def runtime_report(self) -> dict[str, Any]:
+        """Operator-facing status surface for this daemon (plan/M30A item 5)."""
+        return runtime_report(
+            boards_root=self.config.boards_root,
+            overrides_path=self.config.overrides_path,
+            store=self._store(),
+            apply=self.config.apply,
+        )
 
     def reconcile(self) -> dict[str, Any]:
         """Reconciliation pass (plan 2.6/9.5): identical event routing plus

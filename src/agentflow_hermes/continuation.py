@@ -9,11 +9,13 @@ per-kind branching.
 
 from __future__ import annotations
 
+from .continuations.code_fix import CodeFixHandler
 from .continuations.owner_input import OwnerInputHandler
 from .outcome import ContinuationKind
 
 _HANDLERS = {
     ContinuationKind.NEEDS_INPUT: OwnerInputHandler(),
+    ContinuationKind.CODE_FIX: CodeFixHandler(),
 }
 
 

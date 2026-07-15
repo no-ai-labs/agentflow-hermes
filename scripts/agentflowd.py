@@ -110,6 +110,11 @@ def main(argv: list[str] | None = None) -> int:
     reconcile_p = sub.add_parser("reconcile", help="Run one reconciliation pass and exit.")
     _add_common_args(reconcile_p)
 
+    doctor_p = sub.add_parser(
+        "doctor", help="Print the global continuation daemon's runtime surface (boards, handlers, transport)."
+    )
+    _add_common_args(doctor_p)
+
     _default_unit_dir = str(Path.home() / ".config" / "systemd" / "user")
     service_p = sub.add_parser("service", help="Install/enable the one user-level agentflowd systemd units.")
     service_sub = service_p.add_subparsers(dest="service_cmd", required=True)
@@ -152,6 +157,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "reconcile":
         with effective_store(args) as store:
             report = build_daemon(args, store).reconcile()
+        print(report)
+        return 0
+
+    if args.cmd == "doctor":
+        # Read-only status surface: report against the configured/canonical
+        # store directly (never a throwaway preview copy) so the cursors shown
+        # are the real ones, but never mutate anything.
+        report = build_daemon(args, _configured_store(args)).runtime_report()
         print(report)
         return 0
 

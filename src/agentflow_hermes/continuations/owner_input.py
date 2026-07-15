@@ -17,7 +17,7 @@ from ..input_contract import InputContract
 from ..interaction import InteractionCase, InteractionInbox
 from ..outcome import ContinuationKind, OutcomeEnvelope
 from ..requirements import Requirement
-from .base import ContinuationPlan, StepResult
+from .base import ContinuationPlan, StepResult, apply_board_operation
 
 
 def _stable_digest(instance: dict[str, Any]) -> str:
@@ -70,47 +70,9 @@ def _owner_anchor_intent(
     return payload
 
 
-def _apply_board_operation(
-    store: ContinuationStore,
-    instance_id: int,
-    *,
-    step_id: int | str,
-    operation: str,
-    payload: dict[str, Any],
-    idempotency_key: str,
-    adapter: Any,
-) -> dict[str, Any]:
-    """Durable outbox intent/attempt/applied cycle for a board mutation.
-
-    Enqueues (idempotent by key) before ever calling the adapter, so a crash
-    or adapter failure between enqueue and apply leaves a durable ``pending``
-    row that ``continuation retry`` can see/reconcile instead of an external
-    mutation that only ever existed as a direct, unrecorded adapter call.
-    """
-    enqueued = store.outbox_enqueue(
-        instance_id, step_id=str(step_id), operation=operation, payload=payload, idempotency_key=idempotency_key
-    )
-    row = enqueued["outbox"]
-    if row["state"] == "applied" and row.get("board_task_id"):
-        return {"success": True, "task_id": row["board_task_id"]}
-    if adapter is None:
-        return {"success": False, "error": "no_adapter"}
-    if operation == "create_task":
-        result = adapter.create_task(payload)
-    elif operation == "subscribe":
-        result = adapter.subscribe(str(payload.get("task_id") or ""), str(payload.get("endpoint") or ""))
-    elif operation == "complete_owner_anchor":
-        result = adapter.complete_owner_anchor(
-            str(payload.get("task_id") or ""), receipt_ref=str(payload.get("receipt_ref") or "")
-        )
-    else:
-        result = {"success": False, "error": "unknown_outbox_operation"}
-    if result.get("success"):
-        task_id = result.get("task_id", "")
-        store.outbox_mark(row["id"], state="applied", board_task_id=task_id)
-        return {"success": True, "task_id": task_id}
-    store.outbox_mark(row["id"], state="pending")
-    return {"success": False, "error": result.get("error", "adapter_error")}
+# Backward-compatible module-local alias: the durable outbox cycle now lives
+# in continuations.base so every handler shares one implementation.
+_apply_board_operation = apply_board_operation
 
 
 def _materialization_intent(

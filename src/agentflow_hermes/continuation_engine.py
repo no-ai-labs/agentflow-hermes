@@ -474,19 +474,43 @@ def ingest_board_once(
                 break
             max_seq = max(max_seq, event.event_seq)
         elif envelope.continuation_kind == ContinuationKind.CODE_FIX:
-            result = code_fix_router(
-                event.summary,
-                source_ref=event.source_task_id,
-                origin=origin_ref,
-                return_to=return_to_ref,
-                adapter=None,
-            )
-            results.append({
-                "event_id": event.event_id,
-                "action": "code_fix_routed",
-                "router_success": bool(result.get("success")),
-            })
-            max_seq = max(max_seq, event.event_seq)
+            if apply and adapter is not None:
+                # Live apply: materialize an idempotent runnable-fix ->
+                # independent-review graph on the real board via the durable
+                # outbox/receipts, and subscribe review back to the trusted
+                # origin (Kanban notify + active-wake). Never proposal-only
+                # (adapter=None) while advancing the cursor. Fail closed: a
+                # failed materialization leaves the cursor unadvanced so the
+                # whole event replays on the next tick (plan/M30A items 2/3).
+                handler = get_handler(ContinuationKind.CODE_FIX)
+                step = handler.materialize(
+                    envelope, store=store, adapter=adapter, blockers=compiled.blockers
+                )
+                results.append({
+                    "event_id": event.event_id,
+                    "action": "code_fix_applied",
+                    "router_success": step.success,
+                    "state": step.state,
+                    "code_fix": step.metadata,
+                })
+                if not step.success:
+                    break
+                max_seq = max(max_seq, event.event_seq)
+            else:
+                # Dry-run / no-adapter: request-only proposal, no board write.
+                result = code_fix_router(
+                    event.summary,
+                    source_ref=event.source_task_id,
+                    origin=origin_ref,
+                    return_to=return_to_ref,
+                    adapter=None,
+                )
+                results.append({
+                    "event_id": event.event_id,
+                    "action": "code_fix_routed",
+                    "router_success": bool(result.get("success")),
+                })
+                max_seq = max(max_seq, event.event_seq)
         elif envelope.continuation_kind == ContinuationKind.EXTERNAL_WAIT:
             outcome = _handle_external_wait(envelope=envelope, event_run_metadata=event.run_metadata, store=store)
             results.append({"event_id": event.event_id, **outcome})
@@ -507,6 +531,111 @@ def ingest_board_once(
         "processed": len(results),
         "results": results,
         "cursor": max_seq,
+    }
+
+
+def backfill_code_fix_event(
+    *,
+    board: str,
+    source: BoardEventSource,
+    store: ContinuationStore,
+    event_id: str = "",
+    event_seq: int | None = None,
+    adapter: Any = None,
+    existing_remediation_ids: Iterable[str] = (),
+    apply: bool = True,
+) -> dict[str, Any]:
+    """Bounded explicit backfill of a single missed CODE_FIX event by id/seq.
+
+    Unlike ``ingest_board_once`` this never touches the board cursor, so replaying
+    one historical event id (e.g. the t_89e3c71f incident's event 7305) does not
+    reset or skip unrelated history. It is idempotent: the continuation instance
+    is deduped on its source tuple, so a duplicate replay/restart creates zero
+    duplicate tasks/wakes.
+
+    If ``existing_remediation_ids`` names remediation tasks that were already
+    created manually (e.g. t_566a2b1b/t_706d3754), the backfill records a durable
+    manual-remediation satisfaction and resolves the continuation *without*
+    materializing a second graph — the missed event is accounted for, not
+    duplicated (plan/M30A item 4)."""
+    manual_ids = [str(x) for x in existing_remediation_ids if str(x)]
+    events = list(source.fetch_events_since(0))
+    match = None
+    for event in events:
+        if (event_id and event.event_id == event_id) or (event_seq is not None and event.event_seq == event_seq):
+            match = event
+            break
+    if match is None:
+        return {"success": False, "error": "event_not_found", "event_id": event_id, "event_seq": event_seq}
+
+    compiled = compile_outcome(
+        run_metadata=match.run_metadata,
+        summary=match.summary,
+        event_id=match.event_id,
+        board=board,
+        source_task_id=match.source_task_id,
+        source_graph_id=match.source_graph_id,
+        origin_ref=match.origin_ref,
+        return_to_ref=match.return_to_ref,
+        workspace_ref=match.workspace_ref,
+        assignee=match.assignee,
+        occurred_at=match.occurred_at,
+        title=match.title,
+        event_kind=match.event_kind,
+    )
+    envelope = compiled.envelope
+    if envelope.continuation_kind != ContinuationKind.CODE_FIX:
+        return {
+            "success": False,
+            "error": "not_code_fix",
+            "event_id": match.event_id,
+            "continuation_kind": envelope.continuation_kind.value,
+        }
+
+    if manual_ids:
+        creation = store.create_instance(
+            board=envelope.board,
+            source_task_id=envelope.source_task_id,
+            source_event_id=envelope.event_id,
+            source_graph_id=envelope.source_graph_id,
+            contract_ref=envelope.contract_ref,
+            verdict=envelope.verdict.value,
+            continuation_kind=envelope.continuation_kind.value,
+            origin_ref=envelope.origin_ref,
+            return_to_ref=envelope.return_to_ref,
+            workspace_ref=envelope.workspace_ref,
+        )
+        instance = creation["instance"]
+        instance_id = instance["id"]
+        # Idempotent: record (upsert) the manual-remediation satisfaction and
+        # walk to a resolved terminal state only the first time.
+        store.record_requirement_satisfaction(
+            instance_id,
+            field_name="manual_remediation",
+            value=manual_ids,
+            source_kind="manual_remediation",
+            source_ref=",".join(manual_ids),
+        )
+        if instance["state"] == ContinuationState.DETECTED.value:
+            store.transition(instance_id, ContinuationState.MATERIALIZING, reason="backfill_manual_remediation")
+            store.transition(instance_id, ContinuationState.RESUMABLE, reason="manual_remediation_linked")
+            store.transition(instance_id, ContinuationState.RESUMED, reason="manual_remediation_satisfied")
+        return {
+            "success": True,
+            "action": "linked_manual_remediation",
+            "instance_id": instance_id,
+            "created": creation["created"],
+            "manual_remediation_ids": manual_ids,
+            "state": store.get_instance(instance_id)["state"],
+        }
+
+    handler = get_handler(ContinuationKind.CODE_FIX)
+    step = handler.materialize(envelope, store=store, adapter=adapter if apply else None, blockers=compiled.blockers)
+    return {
+        "success": step.success,
+        "action": "code_fix_backfilled" if step.success else "code_fix_backfill_failed",
+        "state": step.state,
+        "code_fix": step.metadata,
     }
 
 

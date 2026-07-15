@@ -47,15 +47,18 @@ from .outcome import (
     _from_text_fallback,
     _unknown_envelope,
 )
+from .remediation import parse_verdict_summary
 from .requirements import Requirement, RequirementKind
 
 COMPILE_STAGE_STRUCTURED = "structured_metadata"
+COMPILE_STAGE_FLAT = "flat_reviewer_metadata"
 COMPILE_STAGE_DETERMINISTIC = "deterministic_grammar"
 COMPILE_STAGE_MODEL = "model_compiled"
 COMPILE_STAGE_UNRESOLVED = "unresolved"
 
 _STAGE_CONFIDENCE = {
     COMPILE_STAGE_STRUCTURED: 1.0,
+    COMPILE_STAGE_FLAT: 0.95,
     COMPILE_STAGE_DETERMINISTIC: 0.9,
     COMPILE_STAGE_MODEL: 0.5,
     COMPILE_STAGE_UNRESOLVED: 0.0,
@@ -71,6 +74,11 @@ class CompiledOutcome:
     stage: str
     confidence: float
     requirements: tuple[Requirement, ...] = ()
+    # Concrete blocker labels carried through for CODE_FIX materialization
+    # (plan/M30A item 2). Populated from authoritative flat reviewer metadata
+    # ``blockers`` or from the summary's named blockers; empty for every other
+    # continuation kind.
+    blockers: tuple[str, ...] = ()
 
 
 class ModelCompiler(Protocol):
@@ -114,6 +122,17 @@ _PENDING_OWNER_RE = re.compile(
     r"pending\s+(?:the\s+)?owner'?s?\s+([a-zA-Z][a-zA-Z0-9 _-]*?)(?=[.,;\n]|$)",
     re.IGNORECASE,
 )
+
+_BLOCKER_FIELD_RE = re.compile(
+    r"^\s*(?:Blockers?|Blocking findings?|Failure|Issue|Reason)\s*:\s*(.+?)\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+_BULLET_RE = re.compile(r"^\s*[-*]\s+(.+?)\s*$", re.MULTILINE)
+_OWNER_EXTERNAL_RE = re.compile(
+    r"\b(owner|operator|human|approval|approve|confirm|input|credentials?|external[_ -]?wait|waiting\s+for|pending\s+owner)\b",
+    re.IGNORECASE,
+)
+_NO_BLOCKER_RE = re.compile(r"\b(none|no blockers?|n/?a|not applicable)\b", re.IGNORECASE)
 
 
 def _slugify_field_name(phrase: str) -> str:
@@ -167,14 +186,36 @@ def compile_outcome(
             envelope=unknown, stage=COMPILE_STAGE_UNRESOLVED, confidence=_STAGE_CONFIDENCE[COMPILE_STAGE_UNRESOLVED]
         )
 
+    # Authoritative flat reviewer metadata (``{verdict, blockers}`` with no
+    # ``agentflow_outcome`` envelope). This is the M30A t_89 incident shape:
+    # a done event whose run metadata is flat and whose summary says
+    # ``Verdict: BLOCK``. A concrete blocker deterministically becomes a
+    # CODE_FIX; owner-only/approval verdicts with no blocker stay typed and
+    # fall through (fail closed) rather than being coerced into a code fix.
+    flat = _compile_flat_reviewer(run_metadata, summary, **common)
+    if flat is not None:
+        envelope, blockers = flat
+        return CompiledOutcome(
+            envelope=envelope,
+            stage=COMPILE_STAGE_FLAT,
+            confidence=_STAGE_CONFIDENCE[COMPILE_STAGE_FLAT],
+            blockers=blockers,
+        )
+
     deterministic = _compile_deterministic(summary, **common)
     if deterministic is not None:
         envelope, requirements = deterministic
+        blockers: tuple[str, ...] = ()
+        if envelope.continuation_kind == ContinuationKind.CODE_FIX:
+            blockers = tuple(parse_verdict_summary(summary or "").blockers)
+            if not blockers:
+                blockers = _generic_blockers_from_text(summary or "")
         return CompiledOutcome(
             envelope=envelope,
             stage=COMPILE_STAGE_DETERMINISTIC,
             confidence=_STAGE_CONFIDENCE[COMPILE_STAGE_DETERMINISTIC],
             requirements=requirements,
+            blockers=blockers,
         )
 
     model_candidate = model_compiler(
@@ -227,6 +268,74 @@ def _requirements_from_envelope(
     )
 
 
+def _extract_flat_blockers(run_metadata: dict[str, Any] | None) -> tuple[str, ...] | None:
+    """Return the top-level ``blockers`` list from flat reviewer metadata, or
+    ``None`` when the metadata is not flat reviewer metadata (missing a
+    top-level ``verdict``, or carrying a real ``agentflow_outcome`` envelope
+    which is handled by the authoritative structured stage instead)."""
+    if not isinstance(run_metadata, dict):
+        return None
+    if "verdict" not in run_metadata or isinstance(run_metadata.get("agentflow_outcome"), dict):
+        return None
+    raw = run_metadata.get("blockers")
+    if isinstance(raw, (list, tuple)):
+        return tuple(str(b).strip() for b in raw if str(b).strip())
+    if isinstance(raw, str) and raw.strip():
+        return (raw.strip(),)
+    return ()
+
+
+def _compile_flat_reviewer(
+    run_metadata: dict[str, Any] | None, summary: str, **common: Any
+) -> tuple[OutcomeEnvelope, tuple[str, ...]] | None:
+    """Normalize authoritative flat reviewer metadata into the typed envelope.
+
+    A flat ``{verdict: 'BLOCK'|'NEED_MORE', blockers: [...]}`` with at least one
+    concrete blocker becomes a CODE_FIX; a flat ``{verdict: 'GO'}`` becomes a
+    complete/continue outcome. Every other flat shape (a BLOCK/NEED_MORE with no
+    concrete blocker — i.e. owner-only/approval/external-wait territory) returns
+    ``None`` so it stays typed and falls through to the deterministic summary
+    grammar or unresolved fail-closed path. Uses no fixed four-class blocker
+    vocabulary and no magic sentinel text — the metadata's own ``verdict`` and
+    ``blockers`` are authoritative."""
+    blockers = _extract_flat_blockers(run_metadata)
+    if blockers is None:
+        return None
+    assert isinstance(run_metadata, dict)
+    try:
+        verdict = Verdict(str(run_metadata.get("verdict") or "").upper())
+    except ValueError:
+        return None
+
+    if verdict in (Verdict.BLOCK, Verdict.NEED_MORE) and blockers:
+        try:
+            envelope = OutcomeEnvelope(
+                schema_version=1,
+                verdict=verdict,
+                continuation_kind=ContinuationKind.CODE_FIX,
+                confidence="flat_metadata",
+                **common,
+            )
+        except OutcomeEnvelopeError:
+            return None
+        return envelope, blockers
+
+    if verdict == Verdict.GO:
+        try:
+            envelope = OutcomeEnvelope(
+                schema_version=1,
+                verdict=verdict,
+                continuation_kind=ContinuationKind.COMPLETE,
+                confidence="flat_metadata",
+                **common,
+            )
+        except OutcomeEnvelopeError:
+            return None
+        return envelope, ()
+
+    return None
+
+
 def _compile_deterministic(
     summary: str, **common: Any
 ) -> tuple[OutcomeEnvelope, tuple[Requirement, ...]] | None:
@@ -239,7 +348,69 @@ def _compile_deterministic(
     if fallback.continuation_kind != ContinuationKind.UNKNOWN:
         return fallback, _requirements_from_envelope(fallback)
 
+    generic_code_fix = _compile_generic_blocker_prose(text, **common)
+    if generic_code_fix is not None:
+        return generic_code_fix
+
     return _compile_natural_prose(text, **common)
+
+
+def _compile_generic_blocker_prose(
+    text: str, **common: Any
+) -> tuple[OutcomeEnvelope, tuple[Requirement, ...]] | None:
+    """Compile explicit natural BLOCK/NEED_MORE prose with concrete blocker
+    evidence to CODE_FIX without a fixed blocker vocabulary or magic sentinel.
+
+    The grammar intentionally requires an explicit blocker/issue/failure field
+    or bullets, and rejects owner/approval/external-wait-like phrases so those
+    cases stay in their typed paths or fail closed instead of becoming code fix.
+    """
+    parsed = parse_verdict_summary(text)
+    try:
+        verdict = Verdict(parsed.verdict)
+    except ValueError:
+        return None
+    if verdict not in (Verdict.BLOCK, Verdict.NEED_MORE):
+        return None
+    blockers = _generic_blockers_from_text(text)
+    if not blockers:
+        return None
+    try:
+        envelope = OutcomeEnvelope(
+            schema_version=1,
+            verdict=verdict,
+            continuation_kind=ContinuationKind.CODE_FIX,
+            confidence="deterministic_grammar",
+            **common,
+        )
+    except OutcomeEnvelopeError:
+        return None
+    return envelope, ()
+
+
+def _generic_blockers_from_text(text: str) -> tuple[str, ...]:
+    blockers: list[str] = []
+    for match in _BLOCKER_FIELD_RE.finditer(text or ""):
+        candidate = match.group(1).strip()
+        if _is_concrete_code_blocker(candidate):
+            blockers.append(candidate)
+    if not blockers and re.search(r"^\s*Blockers?\s*:\s*$", text or "", re.IGNORECASE | re.MULTILINE):
+        for match in _BULLET_RE.finditer(text or ""):
+            candidate = match.group(1).strip()
+            if _is_concrete_code_blocker(candidate):
+                blockers.append(candidate)
+    return tuple(dict.fromkeys(blockers))
+
+
+def _is_concrete_code_blocker(candidate: str) -> bool:
+    candidate = candidate.strip().strip(".;")
+    if len(candidate) < 8:
+        return False
+    if _NO_BLOCKER_RE.fullmatch(candidate) or _NO_BLOCKER_RE.search(candidate):
+        return False
+    if _OWNER_EXTERNAL_RE.search(candidate):
+        return False
+    return True
 
 
 def _compile_natural_prose(text: str, **common: Any) -> tuple[OutcomeEnvelope, tuple[Requirement, ...]] | None:

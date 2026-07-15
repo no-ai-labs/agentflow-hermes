@@ -3,6 +3,7 @@ from __future__ import annotations
 from agentflow_hermes.outcome import ContinuationKind, Verdict
 from agentflow_hermes.outcome_compiler import (
     COMPILE_STAGE_DETERMINISTIC,
+    COMPILE_STAGE_FLAT,
     COMPILE_STAGE_MODEL,
     COMPILE_STAGE_STRUCTURED,
     COMPILE_STAGE_UNRESOLVED,
@@ -47,6 +48,114 @@ def test_malformed_structured_metadata_is_unresolved_no_fallback():
     compiled = compile_outcome(run_metadata=run_metadata, summary="Verdict: GO", **_common())
     assert compiled.stage == COMPILE_STAGE_UNRESOLVED
     assert compiled.envelope.continuation_kind == ContinuationKind.UNKNOWN
+
+
+def test_flat_reviewer_metadata_block_with_blockers_compiles_to_code_fix():
+    """M30A item 1 / the t_89e3c71f incident: a done event whose run metadata
+    is flat ``{verdict:'BLOCK', blockers:[...]}`` with no ``agentflow_outcome``
+    envelope and whose summary only says ``Verdict: BLOCK`` must deterministically
+    become CODE_FIX carrying the concrete blockers — not silently advance."""
+    compiled = compile_outcome(
+        run_metadata={"verdict": "BLOCK", "blockers": ["packet rerun url missing", "stale review edge"]},
+        summary="Verdict: BLOCK",
+        **_common(),
+    )
+    assert compiled.stage == COMPILE_STAGE_FLAT
+    assert compiled.confidence == 0.95
+    assert compiled.envelope.verdict == Verdict.BLOCK
+    assert compiled.envelope.continuation_kind == ContinuationKind.CODE_FIX
+    assert compiled.envelope.confidence == "flat_metadata"
+    assert compiled.blockers == ("packet rerun url missing", "stale review edge")
+
+
+def test_flat_reviewer_metadata_need_more_variant_also_code_fix():
+    compiled = compile_outcome(
+        run_metadata={"verdict": "NEED_MORE", "blockers": "single blocker string"},
+        summary="",
+        **_common(),
+    )
+    assert compiled.stage == COMPILE_STAGE_FLAT
+    assert compiled.envelope.continuation_kind == ContinuationKind.CODE_FIX
+    assert compiled.blockers == ("single blocker string",)
+
+
+def test_flat_reviewer_metadata_block_without_blocker_stays_typed_fail_closed():
+    """Owner-only/approval/external-wait territory: a flat BLOCK with no concrete
+    blocker must NOT be coerced into a code fix. With a bare ``Verdict: BLOCK``
+    summary and no named blocker it stays unresolved (fail closed)."""
+    compiled = compile_outcome(
+        run_metadata={"verdict": "BLOCK", "blockers": []},
+        summary="Verdict: BLOCK",
+        **_common(),
+    )
+    assert compiled.stage == COMPILE_STAGE_UNRESOLVED
+    assert compiled.envelope.continuation_kind == ContinuationKind.UNKNOWN
+    assert compiled.blockers == ()
+
+
+def test_flat_reviewer_metadata_go_compiles_to_complete():
+    compiled = compile_outcome(
+        run_metadata={"verdict": "GO"},
+        summary="",
+        **_common(),
+    )
+    assert compiled.stage == COMPILE_STAGE_FLAT
+    assert compiled.envelope.continuation_kind == ContinuationKind.COMPLETE
+
+
+def test_natural_block_with_generic_concrete_blocker_compiles_to_code_fix_without_vocab():
+    compiled = compile_outcome(
+        run_metadata=None,
+        summary="Verdict: BLOCK\nBlockers: packet rerun URL missing from final acknowledgement",
+        **_common(),
+    )
+    assert compiled.stage == COMPILE_STAGE_DETERMINISTIC
+    assert compiled.envelope.verdict == Verdict.BLOCK
+    assert compiled.envelope.continuation_kind == ContinuationKind.CODE_FIX
+    assert compiled.blockers == ("packet rerun URL missing from final acknowledgement",)
+
+
+def test_owner_approval_blocker_heading_stays_fail_closed_not_code_fix():
+    compiled = compile_outcome(
+        run_metadata=None,
+        summary="Verdict: BLOCK\nBlockers: owner approval is required before continuing",
+        **_common(),
+    )
+    assert compiled.stage == COMPILE_STAGE_UNRESOLVED
+    assert compiled.envelope.continuation_kind == ContinuationKind.UNKNOWN
+
+
+def test_agentflow_outcome_envelope_still_wins_over_flat_sibling_keys():
+    """A real ``agentflow_outcome`` block is authoritative even if flat sibling
+    ``verdict``/``blockers`` keys also happen to be present."""
+    compiled = compile_outcome(
+        run_metadata={
+            "verdict": "BLOCK",
+            "blockers": ["ignore me"],
+            "agentflow_outcome": {
+                "schema_version": 1,
+                "verdict": "BLOCK",
+                "continuation_kind": "needs_input",
+                "contract_ref": "warroom.g421.exposure-resolution.v1",
+                "required_inputs": [{"name": "approval_receipt_id", "authority": "owner"}],
+            },
+        },
+        summary="",
+        **_common(),
+    )
+    assert compiled.stage == COMPILE_STAGE_STRUCTURED
+    assert compiled.envelope.continuation_kind == ContinuationKind.NEEDS_INPUT
+    assert compiled.blockers == ()
+
+
+def test_summary_named_blocker_code_fix_carries_blockers():
+    compiled = compile_outcome(
+        run_metadata=None,
+        summary="Verdict: BLOCK — stale_inline_route detected",
+        **_common(),
+    )
+    assert compiled.envelope.continuation_kind == ContinuationKind.CODE_FIX
+    assert "stale_inline_route" in compiled.blockers
 
 
 def test_natural_prose_without_marker_compiles_to_needs_input_fact_requirement():

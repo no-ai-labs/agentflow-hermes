@@ -19,7 +19,12 @@ from .remediation import parse_verdict_summary
 # "deterministic_grammar" and "model_compiled" are additive confidence levels
 # used by outcome_compiler.py's stage 2/3 (see that module's docstring); they
 # never claim "structured" since only real agentflow_outcome metadata may.
-_CONFIDENCE_LEVELS = {"structured", "text_explicit", "deterministic_grammar", "model_compiled", "none"}
+# "flat_metadata" is authoritative flat reviewer metadata (top-level
+# ``verdict``/``blockers`` with no ``agentflow_outcome`` envelope) normalized
+# into the typed envelope — nearly as trustworthy as "structured" but kept a
+# distinct level so "structured" stays reserved for a real agentflow_outcome
+# block (plan/M30A item 1).
+_CONFIDENCE_LEVELS = {"structured", "flat_metadata", "text_explicit", "deterministic_grammar", "model_compiled", "none"}
 
 # Versioned default contract for an explicit needs_input outcome that carries
 # no domain-specific contract_ref. A domain contract (e.g.
