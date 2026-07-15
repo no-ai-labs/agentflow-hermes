@@ -76,9 +76,14 @@ class CompiledOutcome:
     requirements: tuple[Requirement, ...] = ()
     # Concrete blocker labels carried through for CODE_FIX materialization
     # (plan/M30A item 2). Populated from authoritative flat reviewer metadata
-    # ``blockers`` or from the summary's named blockers; empty for every other
-    # continuation kind.
+    # ``blockers`` or from the summary's named blockers; for a SEMANTIC_REFUSAL
+    # this carries the offending unsafe blocker(s) so the durable refusal ACK
+    # can record exactly what was refused. Empty for every other kind.
     blockers: tuple[str, ...] = ()
+    # Unsafe categories that forced a SEMANTIC_REFUSAL (plan/M30A remediation).
+    # Empty for every safe/auto-appliable outcome; non-empty iff
+    # ``continuation_kind == SEMANTIC_REFUSAL``.
+    refusal_categories: tuple[str, ...] = ()
 
 
 class ModelCompiler(Protocol):
@@ -133,6 +138,70 @@ _OWNER_EXTERNAL_RE = re.compile(
     re.IGNORECASE,
 )
 _NO_BLOCKER_RE = re.compile(r"\b(none|no blockers?|n/?a|not applicable)\b", re.IGNORECASE)
+
+# Unsafe blocker categories (plan/M30A remediation). These describe *categories*
+# a reviewer BLOCK/NEED_MORE must never be auto-remediated into a CODE_FIX for —
+# they are not a fixed "safe-blocker vocabulary" allowlist and carry no magic
+# sentinel: a blocker matching any of these fails closed to a SEMANTIC_REFUSAL,
+# preserving typed authoritative metadata (which is classified before this ever
+# runs). Anything matching none of them stays eligible for the normal
+# concrete-code-blocker CODE_FIX path.
+_UNSAFE_CATEGORY_RES: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "credentials_secrets",
+        re.compile(
+            r"\b(credentials?|secret|secrets|api[_ -]?key|access[_ -]?key|"
+            r"private[_ -]?key|ssh[_ -]?key|password|passphrase|token|oauth|"
+            r"\.env\b|env\s+var(?:iable)?s?)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "destructive_data_loss",
+        re.compile(
+            r"\b(destructive|data[_ -]?loss|irreversible|unrecoverable|"
+            r"delete|deletion|drop|truncate|wipe|purge|destroy|"
+            r"rm\s+-rf|drop\s+table)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "owner_user_proof",
+        re.compile(
+            # owner/user/human/operator *together with* an approval/proof/input
+            # ask, or the standalone owner-only / sign-off / attestation asks.
+            # Requires the pairing so a bare "user cannot log in" code bug does
+            # not get refused — only genuine human-proof/input gates do.
+            r"\b(?:owner|operator|human|user)\b[^\n]*?"
+            r"\b(?:approv\w*|sign[- ]?off|proof|attest\w*|input|confirm\w*|"
+            r"decision|authoriz\w*|permission)\b"
+            r"|\bowner[- ]?only\b"
+            r"|\b(?:sign[- ]?off|attestation)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "live_money_financial",
+        re.compile(
+            r"\b(money|monetary|financial|finance|funds?|payment|payout|pay[- ]?out|"
+            r"invoice|billing|charge|refund|wire[- ]?transfer|live[- ]?money|"
+            r"purchase|transaction)\b|\$\d",
+            re.IGNORECASE,
+        ),
+    ),
+)
+
+
+def _unsafe_blocker_categories(candidates: Any) -> tuple[str, ...]:
+    """Return the sorted, de-duplicated unsafe categories present across every
+    candidate blocker phrase. Empty when none are unsafe."""
+    found: list[str] = []
+    for candidate in candidates:
+        text = str(candidate)
+        for name, pattern in _UNSAFE_CATEGORY_RES:
+            if name not in found and pattern.search(text):
+                found.append(name)
+    return tuple(sorted(found))
 
 
 def _slugify_field_name(phrase: str) -> str:
@@ -195,27 +264,38 @@ def compile_outcome(
     flat = _compile_flat_reviewer(run_metadata, summary, **common)
     if flat is not None:
         envelope, blockers = flat
+        refusal_categories: tuple[str, ...] = ()
+        if envelope.continuation_kind == ContinuationKind.SEMANTIC_REFUSAL:
+            refusal_categories = _unsafe_blocker_categories(blockers)
         return CompiledOutcome(
             envelope=envelope,
             stage=COMPILE_STAGE_FLAT,
             confidence=_STAGE_CONFIDENCE[COMPILE_STAGE_FLAT],
             blockers=blockers,
+            refusal_categories=refusal_categories,
         )
 
     deterministic = _compile_deterministic(summary, **common)
     if deterministic is not None:
         envelope, requirements = deterministic
         blockers: tuple[str, ...] = ()
+        refusal_categories = ()
         if envelope.continuation_kind == ContinuationKind.CODE_FIX:
             blockers = tuple(parse_verdict_summary(summary or "").blockers)
             if not blockers:
                 blockers = _generic_blockers_from_text(summary or "")
+        elif envelope.continuation_kind == ContinuationKind.SEMANTIC_REFUSAL:
+            candidates = _blocker_candidates_from_text(summary or "")
+            refusal_categories = _unsafe_blocker_categories(candidates)
+            # Carry the offending unsafe blockers through for the durable ACK.
+            blockers = tuple(c for c in candidates if _unsafe_blocker_categories((c,)))
         return CompiledOutcome(
             envelope=envelope,
             stage=COMPILE_STAGE_DETERMINISTIC,
             confidence=_STAGE_CONFIDENCE[COMPILE_STAGE_DETERMINISTIC],
             requirements=requirements,
             blockers=blockers,
+            refusal_categories=refusal_categories,
         )
 
     model_candidate = model_compiler(
@@ -308,11 +388,20 @@ def _compile_flat_reviewer(
         return None
 
     if verdict in (Verdict.BLOCK, Verdict.NEED_MORE) and blockers:
+        # Fail closed: an unsafe blocker category (credentials, destructive,
+        # owner/user proof, live-money) is never auto-remediated — it compiles
+        # to an explicit SEMANTIC_REFUSAL instead of a CODE_FIX, carrying the
+        # offending blockers through for the durable refusal ACK.
+        kind = (
+            ContinuationKind.SEMANTIC_REFUSAL
+            if _unsafe_blocker_categories(blockers)
+            else ContinuationKind.CODE_FIX
+        )
         try:
             envelope = OutcomeEnvelope(
                 schema_version=1,
                 verdict=verdict,
-                continuation_kind=ContinuationKind.CODE_FIX,
+                continuation_kind=kind,
                 confidence="flat_metadata",
                 **common,
             )
@@ -358,12 +447,14 @@ def _compile_deterministic(
 def _compile_generic_blocker_prose(
     text: str, **common: Any
 ) -> tuple[OutcomeEnvelope, tuple[Requirement, ...]] | None:
-    """Compile explicit natural BLOCK/NEED_MORE prose with concrete blocker
-    evidence to CODE_FIX without a fixed blocker vocabulary or magic sentinel.
+    """Compile explicit natural BLOCK/NEED_MORE prose with blocker evidence
+    without a fixed blocker vocabulary or magic sentinel.
 
-    The grammar intentionally requires an explicit blocker/issue/failure field
-    or bullets, and rejects owner/approval/external-wait-like phrases so those
-    cases stay in their typed paths or fail closed instead of becoming code fix.
+    The grammar requires an explicit blocker/issue/failure field or bullets.
+    An unsafe blocker category (credentials, destructive, owner/user proof,
+    live-money) fails closed to an explicit SEMANTIC_REFUSAL; otherwise a
+    concrete code blocker becomes a CODE_FIX. Prose with neither stays out of
+    this stage so it can fall through to the owner-input grammar.
     """
     parsed = parse_verdict_summary(text)
     try:
@@ -372,7 +463,22 @@ def _compile_generic_blocker_prose(
         return None
     if verdict not in (Verdict.BLOCK, Verdict.NEED_MORE):
         return None
-    blockers = _generic_blockers_from_text(text)
+
+    candidates = _blocker_candidates_from_text(text)
+    if _unsafe_blocker_categories(candidates):
+        try:
+            envelope = OutcomeEnvelope(
+                schema_version=1,
+                verdict=verdict,
+                continuation_kind=ContinuationKind.SEMANTIC_REFUSAL,
+                confidence="deterministic_grammar",
+                **common,
+            )
+        except OutcomeEnvelopeError:
+            return None
+        return envelope, ()
+
+    blockers = tuple(c for c in candidates if _is_concrete_code_blocker(c))
     if not blockers:
         return None
     try:
@@ -388,18 +494,26 @@ def _compile_generic_blocker_prose(
     return envelope, ()
 
 
-def _generic_blockers_from_text(text: str) -> tuple[str, ...]:
-    blockers: list[str] = []
+def _blocker_candidates_from_text(text: str) -> tuple[str, ...]:
+    """Every candidate blocker phrase from explicit blocker/issue/failure
+    fields or bullets under a bare ``Blockers:`` heading — unfiltered, so the
+    unsafe-category gate can inspect owner/credential/destructive phrases that
+    ``_is_concrete_code_blocker`` would otherwise silently drop."""
+    candidates: list[str] = []
     for match in _BLOCKER_FIELD_RE.finditer(text or ""):
         candidate = match.group(1).strip()
-        if _is_concrete_code_blocker(candidate):
-            blockers.append(candidate)
-    if not blockers and re.search(r"^\s*Blockers?\s*:\s*$", text or "", re.IGNORECASE | re.MULTILINE):
+        if candidate and not (_NO_BLOCKER_RE.fullmatch(candidate) or _NO_BLOCKER_RE.search(candidate)):
+            candidates.append(candidate)
+    if not candidates and re.search(r"^\s*Blockers?\s*:\s*$", text or "", re.IGNORECASE | re.MULTILINE):
         for match in _BULLET_RE.finditer(text or ""):
             candidate = match.group(1).strip()
-            if _is_concrete_code_blocker(candidate):
-                blockers.append(candidate)
-    return tuple(dict.fromkeys(blockers))
+            if candidate and not (_NO_BLOCKER_RE.fullmatch(candidate) or _NO_BLOCKER_RE.search(candidate)):
+                candidates.append(candidate)
+    return tuple(dict.fromkeys(candidates))
+
+
+def _generic_blockers_from_text(text: str) -> tuple[str, ...]:
+    return tuple(c for c in _blocker_candidates_from_text(text) if _is_concrete_code_blocker(c))
 
 
 def _is_concrete_code_blocker(candidate: str) -> bool:

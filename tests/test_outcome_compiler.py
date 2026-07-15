@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from agentflow_hermes.outcome import ContinuationKind, Verdict
 from agentflow_hermes.outcome_compiler import (
     COMPILE_STAGE_DETERMINISTIC,
@@ -115,14 +117,115 @@ def test_natural_block_with_generic_concrete_blocker_compiles_to_code_fix_withou
     assert compiled.blockers == ("packet rerun URL missing from final acknowledgement",)
 
 
-def test_owner_approval_blocker_heading_stays_fail_closed_not_code_fix():
+def test_owner_approval_blocker_heading_is_semantic_refusal_not_code_fix():
+    """M30A remediation: an owner-approval blocker is unsafe (owner-only/
+    financial-approval category) — it must NOT auto-apply as CODE_FIX, and now
+    fails closed as an *explicit* SEMANTIC_REFUSAL rather than a passive
+    UNKNOWN, so the engine can durably quarantine + notify instead of silently
+    advancing."""
     compiled = compile_outcome(
         run_metadata=None,
         summary="Verdict: BLOCK\nBlockers: owner approval is required before continuing",
         **_common(),
     )
-    assert compiled.stage == COMPILE_STAGE_UNRESOLVED
-    assert compiled.envelope.continuation_kind == ContinuationKind.UNKNOWN
+    assert compiled.stage == COMPILE_STAGE_DETERMINISTIC
+    assert compiled.envelope.continuation_kind == ContinuationKind.SEMANTIC_REFUSAL
+    assert compiled.refusal_categories  # non-empty; classified unsafe
+
+
+# --- M30A remediation: unsafe BLOCK/NEED_MORE categories fail closed --------
+#
+# Table-driven across the four unsafe classes (credentials/secrets,
+# destructive/data-loss, owner/user proof-input, live-money/financial approval)
+# proven for BOTH authoritative flat reviewer metadata and the natural-prose
+# fallback grammar. None may become an auto-applied CODE_FIX; every one must
+# compile to an explicit SEMANTIC_REFUSAL carrying its unsafe categories.
+
+_UNSAFE_BLOCKERS = [
+    ("credentials", "rotate the leaked database credentials before continuing"),
+    ("secret_token", "the API token was hardcoded and committed to the repo"),
+    ("destructive_data_loss", "drop the production users table to reset state"),
+    ("owner_user_proof", "needs the owner to provide sign-off proof before merge"),
+    ("live_money", "requires financial approval to release the customer payment"),
+]
+
+
+@pytest.mark.parametrize("label,blocker", _UNSAFE_BLOCKERS, ids=[b[0] for b in _UNSAFE_BLOCKERS])
+def test_unsafe_flat_reviewer_blocker_fails_closed_as_semantic_refusal(label, blocker):
+    compiled = compile_outcome(
+        run_metadata={"verdict": "BLOCK", "blockers": [blocker]},
+        summary="Verdict: BLOCK",
+        **_common(),
+    )
+    assert compiled.stage == COMPILE_STAGE_FLAT
+    assert compiled.envelope.verdict == Verdict.BLOCK
+    assert compiled.envelope.continuation_kind == ContinuationKind.SEMANTIC_REFUSAL
+    assert compiled.envelope.continuation_kind != ContinuationKind.CODE_FIX
+    assert compiled.refusal_categories  # non-empty
+    # Authoritative blockers preserved for the durable refusal ACK.
+    assert compiled.blockers == (blocker,)
+
+
+@pytest.mark.parametrize("label,blocker", _UNSAFE_BLOCKERS, ids=[b[0] for b in _UNSAFE_BLOCKERS])
+def test_unsafe_flat_reviewer_need_more_also_fails_closed(label, blocker):
+    compiled = compile_outcome(
+        run_metadata={"verdict": "NEED_MORE", "blockers": [blocker]},
+        summary="",
+        **_common(),
+    )
+    assert compiled.stage == COMPILE_STAGE_FLAT
+    assert compiled.envelope.continuation_kind == ContinuationKind.SEMANTIC_REFUSAL
+    assert compiled.refusal_categories
+
+
+@pytest.mark.parametrize("label,blocker", _UNSAFE_BLOCKERS, ids=[b[0] for b in _UNSAFE_BLOCKERS])
+def test_unsafe_natural_fallback_blocker_fails_closed_as_semantic_refusal(label, blocker):
+    compiled = compile_outcome(
+        run_metadata=None,
+        summary=f"Verdict: BLOCK\nBlockers: {blocker}",
+        **_common(),
+    )
+    assert compiled.stage == COMPILE_STAGE_DETERMINISTIC
+    assert compiled.envelope.continuation_kind == ContinuationKind.SEMANTIC_REFUSAL
+    assert compiled.envelope.continuation_kind != ContinuationKind.CODE_FIX
+    assert compiled.refusal_categories
+
+
+def test_structured_metadata_authority_preserved_even_when_blocker_text_unsafe():
+    """Typed authoritative agentflow_outcome metadata is never reclassified by
+    the unsafe heuristic — a real needs_input envelope stays needs_input even if
+    its prose mentions credentials."""
+    run_metadata = {
+        "agentflow_outcome": {
+            "schema_version": 1,
+            "verdict": "BLOCK",
+            "continuation_kind": "needs_input",
+            "contract_ref": "warroom.g421.exposure-resolution.v1",
+            "required_inputs": [{"name": "approval_receipt_id", "authority": "owner"}],
+        },
+    }
+    compiled = compile_outcome(
+        run_metadata=run_metadata,
+        summary="Verdict: BLOCK\nBlockers: rotate the leaked credentials",
+        **_common(),
+    )
+    assert compiled.stage == COMPILE_STAGE_STRUCTURED
+    assert compiled.envelope.continuation_kind == ContinuationKind.NEEDS_INPUT
+    assert compiled.refusal_categories == ()
+
+
+def test_safe_concrete_flat_blocker_still_compiles_to_code_fix():
+    """Regression guard: a safe concrete code blocker is unchanged by the
+    unsafe-category gate — it still becomes CODE_FIX with zero refusal."""
+    compiled = compile_outcome(
+        run_metadata={"verdict": "BLOCK", "blockers": ["packet rerun url missing", "stale review edge"]},
+        summary="Verdict: BLOCK",
+        **_common(),
+    )
+    assert compiled.stage == COMPILE_STAGE_FLAT
+    assert compiled.envelope.continuation_kind == ContinuationKind.CODE_FIX
+    assert compiled.refusal_categories == ()
+    assert compiled.blockers == ("packet rerun url missing", "stale review edge")
 
 
 def test_agentflow_outcome_envelope_still_wins_over_flat_sibling_keys():

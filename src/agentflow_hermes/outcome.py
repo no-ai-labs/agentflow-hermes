@@ -53,6 +53,12 @@ class ContinuationKind(str, Enum):
     NEEDS_INPUT = "needs_input"
     APPROVAL_REQUIRED = "approval_required"
     EXTERNAL_WAIT = "external_wait"
+    # Explicit fail-closed outcome for an unsafe reviewer BLOCK/NEED_MORE whose
+    # blocker names a category (credentials/secrets, destructive/data-loss,
+    # owner-only proof/user input, live-money/financial approval) that must
+    # never be auto-remediated by a CODE_FIX graph. Durably quarantined and
+    # returned to the trusted origin via notify+wake instead (plan/M30A).
+    SEMANTIC_REFUSAL = "semantic_refusal"
     UNKNOWN = "unknown"
 
 

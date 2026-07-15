@@ -511,6 +511,42 @@ def ingest_board_once(
                     "router_success": bool(result.get("success")),
                 })
                 max_seq = max(max_seq, event.event_seq)
+        elif envelope.continuation_kind == ContinuationKind.SEMANTIC_REFUSAL:
+            if apply and adapter is not None:
+                # Fail closed: an unsafe BLOCK (credentials/secrets, destructive/
+                # data-loss, owner-only proof/user input, live-money approval) is
+                # never auto-remediated. Durably quarantine it (zero fix/review/
+                # activation tasks), record an explicit refusal ACK, and wake the
+                # trusted origin via the board's own notify+wake path. A failed
+                # materialization leaves the cursor unadvanced so the whole event
+                # replays on the next tick (plan/M30A remediation items 2/3).
+                handler = get_handler(ContinuationKind.SEMANTIC_REFUSAL)
+                step = handler.materialize(
+                    envelope,
+                    store=store,
+                    adapter=adapter,
+                    blockers=compiled.blockers,
+                    refusal_categories=compiled.refusal_categories,
+                )
+                results.append({
+                    "event_id": event.event_id,
+                    "action": "semantic_refusal_applied",
+                    "router_success": step.success,
+                    "state": step.state,
+                    "refusal": step.metadata,
+                })
+                if not step.success:
+                    break
+                max_seq = max(max_seq, event.event_seq)
+            else:
+                # Dry-run / no-adapter: detection only, no board write, no
+                # durable instance — mirrors the code-fix proposal-only path.
+                results.append({
+                    "event_id": event.event_id,
+                    "action": "semantic_refusal_detected",
+                    "refusal_categories": list(compiled.refusal_categories),
+                })
+                max_seq = max(max_seq, event.event_seq)
         elif envelope.continuation_kind == ContinuationKind.EXTERNAL_WAIT:
             outcome = _handle_external_wait(envelope=envelope, event_run_metadata=event.run_metadata, store=store)
             results.append({"event_id": event.event_id, **outcome})
