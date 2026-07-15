@@ -20,6 +20,14 @@ CONFLICTING between the 2026-07-09 and 2026-07-15 snapshots with no new commits 
 (`headRefOid` unchanged at `7114febfe07d1bb20a05822ba5bc4659c951ac1f`) — base-branch drift, not a
 PR-side regression. Re-check before posting.
 
+**2026-07-15T09:39Z re-check confirmation:** a second live pass (mergeable/mergeStateStatus,
+changed files, diff contents, comment counts, URL reachability) reconfirmed every fact in this
+refresh with no drift since the 09:14–09:15Z snapshot above. Added granularity from that pass:
+`mergeStateStatus` is `BLOCKED` for #59775/#58548/#58549 (no reviews/required checks yet, consistent
+with "no comments/reviews" above) and `DIRTY` for #58541 (needs a rebase against base, consistent
+with its `CONFLICTING` mergeable state). This does not change any draft comment content or the
+`safe_to_post` conclusions below — it is additional point-in-time metadata, not a blocker.
+
 ### 2026-07-15 refresh: what changed since the 2026-07-09 draft
 
 - **#58541** — two review comments landed (2026-07-06, 2026-07-08). The reviewer's testing-checklist
@@ -277,7 +285,8 @@ Body:
 ## 9. Posting packet (2026-07-15 refresh)
 
 Link check: all four target PR URLs and all three cited AgentFlow-Hermes doc/repo URLs returned
-HTTP 200 via `urllib.request.urlopen` at 2026-07-15T09:15Z; no non-200 responses observed. The
+HTTP 200 via `urllib.request.urlopen` at both 2026-07-15T09:15Z and the 09:39Z re-check; no
+non-200 responses observed. The
 checked URLs were:
 
 - https://github.com/NousResearch/hermes-agent/pull/59775
