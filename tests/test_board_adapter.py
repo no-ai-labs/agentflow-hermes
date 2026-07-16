@@ -255,6 +255,10 @@ def test_real_adapter_subscribe_numeric_research_creates_durable_ack_rows(tmp_pa
     con.close()
     calls = []
 
+    # Generic plain-text runner: the capability probe's `--help` call also
+    # returns this text, which has no "--delivery-mode" in it, so the
+    # adapter correctly detects the CLI as pre-canonical and falls back to
+    # the legacy _ensure_durable_ack_rows path exercised by this test.
     def runner(argv):
         calls.append(argv)
         return 0, "Subscribed", ""
@@ -264,7 +268,8 @@ def test_real_adapter_subscribe_numeric_research_creates_durable_ack_rows(tmp_pa
 
     assert result["success"] is True
     assert result["ack"] == {"success": True}
-    assert calls[0][calls[0].index("--chat-id") + 1] == "1499390151393284106"
+    sub_call = next(c for c in calls if "notify-subscribe" in c and "--help" not in c)
+    assert sub_call[sub_call.index("--chat-id") + 1] == "1499390151393284106"
     con = sqlite3.connect(db)
     try:
         notify = con.execute("select platform, chat_id, trigger_agent from kanban_notify_subs where task_id='t_owner'").fetchone()
@@ -373,6 +378,146 @@ def test_real_adapter_subscribe_fails_closed_when_ack_ensure_raises(tmp_path):
 
     assert result["success"] is False
     assert result["error"] == "ack_ensure_failed"
+
+
+def _create_canonical_notify_subs_table(db):
+    con = sqlite3.connect(db)
+    con.executescript(
+        """
+        create table kanban_notify_subs (
+            task_id text not null,
+            platform text not null,
+            chat_id text not null,
+            thread_id text not null default '',
+            user_id text,
+            chat_type text not null default 'dm',
+            notifier_profile text,
+            delivery_mode text not null default 'notify',
+            created_at integer not null,
+            last_event_id integer not null default 0,
+            primary key(task_id, platform, chat_id, thread_id)
+        );
+        """
+    )
+    con.close()
+
+
+def test_real_adapter_subscribe_uses_canonical_delivery_mode_argv_when_supported(tmp_path):
+    """M30D: when the installed `hermes` CLI's own --help advertises
+    `--delivery-mode`, subscribe must call notify-subscribe with
+    `--delivery-mode notify+wake --chat-type ...` and treat a verified
+    canonical `kanban_notify_subs` row as ACK/wake success even though the
+    legacy ack_subscription/ack_active_wake tables don't exist at all."""
+    db = tmp_path / "kanban.db"
+    _create_canonical_notify_subs_table(db)
+    con = sqlite3.connect(db)
+    con.execute(
+        """
+        insert into kanban_notify_subs
+            (task_id, platform, chat_id, thread_id, user_id, chat_type, delivery_mode, created_at)
+        values (?, ?, ?, '', NULL, ?, ?, ?)
+        """,
+        ("t_owner", "discord", "1499390151393284106", "channel", "notify+wake", 0),
+    )
+    con.commit()
+    con.close()
+
+    calls = []
+
+    def runner(argv):
+        calls.append(argv)
+        if "--help" in argv:
+            return 0, "usage: hermes kanban notify-subscribe ... --delivery-mode {notify,notify+wake,wake}", ""
+        return 0, "Subscribed", ""
+
+    adapter = RealBoardAdapter(runner=runner, board="warroom-os", board_db_path=db)
+    result = adapter.subscribe("t_owner", "discord:#research")
+
+    assert result["success"] is True
+    assert result["ack"] == {"success": True}
+    sub_call = next(c for c in calls if "notify-subscribe" in c and "--help" not in c)
+    assert sub_call[sub_call.index("--chat-id") + 1] == "1499390151393284106"
+    assert "--delivery-mode" in sub_call and "notify+wake" in sub_call
+    assert "--chat-type" in sub_call and "channel" in sub_call
+    # No legacy ack tables exist in this DB at all -- canonical verification
+    # must not require them.
+    con = sqlite3.connect(db)
+    try:
+        assert not any(
+            row[0] in ("ack_subscription", "ack_active_wake")
+            for row in con.execute("select name from sqlite_master where type='table'")
+        )
+    finally:
+        con.close()
+
+
+def test_real_adapter_subscribe_canonical_verification_failure_fails_closed(tmp_path):
+    """Even when the CLI call itself exits 0, if the authoritative
+    kanban_notify_subs row can't be verified with delivery_mode='notify+wake'
+    afterward, subscribe must fail closed rather than report success."""
+    db = tmp_path / "kanban.db"
+    _create_canonical_notify_subs_table(db)
+    # No row inserted -- the canonical row is missing/never landed.
+
+    def runner(argv):
+        if "--help" in argv:
+            return 0, "usage: hermes kanban notify-subscribe ... --delivery-mode {notify,notify+wake,wake}", ""
+        return 0, "Subscribed", ""
+
+    adapter = RealBoardAdapter(runner=runner, board="warroom-os", board_db_path=db)
+    result = adapter.subscribe("t_owner", "discord:#research")
+
+    assert result["success"] is False
+    assert result["error"] != "ack_schema_missing"
+
+
+def test_real_adapter_subscribe_legacy_fallback_used_when_delivery_mode_unsupported(tmp_path):
+    """When the installed CLI's --help does not advertise --delivery-mode,
+    subscribe must not pass it and must fall back to the legacy
+    _ensure_durable_ack_rows repair path."""
+    db = tmp_path / "kanban.db"
+    con = sqlite3.connect(db)
+    con.executescript(
+        """
+        create table kanban_notify_subs (
+            task_id text not null, platform text not null, chat_id text not null,
+            thread_id text not null default '', notifier_profile text, created_at integer not null,
+            trigger_agent integer not null default 0,
+            primary key(task_id, platform, chat_id, thread_id)
+        );
+        create table ack_subscription (
+            id integer primary key autoincrement, task_id text not null, platform text, chat_id text,
+            thread_id text, notifier_profile text, desired_delivery_mode text,
+            active_wake_required integer not null default 0, operator_receipt_required integer not null default 0,
+            created_at integer not null
+        );
+        create table ack_active_wake (
+            id integer primary key autoincrement, task_id text not null, subscription_id integer,
+            triggered_agent integer not null default 0, correlation_id text, created_at integer not null, status text
+        );
+        """
+    )
+    con.close()
+    calls = []
+
+    def runner(argv):
+        calls.append(argv)
+        if "--help" in argv:
+            return 0, "usage: hermes kanban notify-subscribe --platform P --chat-id C", ""
+        return 0, "Subscribed", ""
+
+    adapter = RealBoardAdapter(runner=runner, board="warroom-os", board_db_path=db)
+    result = adapter.subscribe("t_owner", "discord:#research")
+
+    assert result["success"] is True
+    sub_call = next(c for c in calls if "notify-subscribe" in c and "--help" not in c)
+    assert "--delivery-mode" not in sub_call
+    con = sqlite3.connect(db)
+    try:
+        sub = con.execute("select active_wake_required from ack_subscription where task_id='t_owner'").fetchone()
+    finally:
+        con.close()
+    assert sub == (1,)
 
 
 def test_real_adapter_plain_text_commands_do_not_require_json_output():

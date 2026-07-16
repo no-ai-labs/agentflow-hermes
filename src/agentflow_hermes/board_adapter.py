@@ -35,13 +35,25 @@ warroom-os`` is not sufficient by itself to guarantee a mutation lands on
 ``warroom-os``.
 
 After a successful real ``notify-subscribe`` to a numeric Discord channel id
-(not a ``#name`` placeholder), ``RealBoardAdapter.subscribe`` also
-idempotently repairs the durable ``kanban_notify_subs`` /
-``ack_subscription`` / ``ack_active_wake`` rows in that board's own Kanban
-DB, mirroring ``kanban_auto_remediation_adapter.py``'s
-``_ensure_durable_ack_rows`` for the M24B oracle canary. ``notify-subscribe``
-alone only writes ``kanban_notify_subs``; the gateway's active-wake path also
-needs the ``ack_subscription``/``ack_active_wake`` rows to fire.
+(not a ``#name`` placeholder), ``RealBoardAdapter.subscribe`` ensures the
+board's own Kanban DB actually reflects a wake-capable subscription (M30D):
+
+- If the installed ``hermes`` CLI's own ``notify-subscribe --help`` output
+  advertises ``--delivery-mode`` (probed once per adapter instance, never
+  invented), ``subscribe`` calls ``notify-subscribe`` with ``--delivery-mode
+  notify+wake --chat-type ...`` and then verifies the authoritative
+  ``kanban_notify_subs`` row landed with ``delivery_mode='notify+wake'``.
+  That verified canonical row is ACK/wake success on its own -- new/global
+  boards need not have the legacy ``ack_subscription``/``ack_active_wake``
+  tables at all.
+- Otherwise it falls back to idempotently repairing the legacy
+  ``kanban_notify_subs``/``ack_subscription``/``ack_active_wake`` rows,
+  mirroring ``kanban_auto_remediation_adapter.py``'s
+  ``_ensure_durable_ack_rows`` for the M24B oracle canary.
+
+Either way, a nested ACK/verification failure is fatal to the whole
+``subscribe`` call: a bare ``kanban_notify_subs`` row alone is not enough for
+the gateway's active-wake path to fire.
 """
 
 from __future__ import annotations
@@ -173,6 +185,69 @@ class RealBoardAdapter:
         self.board_db_path = Path(board_db_path) if board_db_path else default_board_kanban_db_path(self.board)
         self._repair_ack_rows = runner is None or board_db_path is not None
         self._key_to_task_id: dict[str, str] = {}
+        self._delivery_mode_supported: bool | None = None
+
+    def _supports_delivery_mode(self) -> bool:
+        """Detect whether the installed `hermes` CLI's notify-subscribe
+        supports canonical `--delivery-mode` by checking its own --help
+        output (never invents CLI capability). Cached per adapter instance
+        so repeat subscribe() calls don't re-probe."""
+        if self._delivery_mode_supported is not None:
+            return self._delivery_mode_supported
+        argv = [self.hermes_bin, "kanban", "notify-subscribe", "--help"]
+        try:
+            returncode, stdout, _stderr = self.runner(argv)
+        except Exception:
+            self._delivery_mode_supported = False
+            return False
+        self._delivery_mode_supported = returncode == 0 and "--delivery-mode" in (stdout or "")
+        return self._delivery_mode_supported
+
+    def _verify_canonical_notify_sub(
+        self,
+        task_id: str,
+        *,
+        platform: str,
+        chat_id: str,
+        thread_id: str = "",
+        chat_type: str = "",
+        user_id: str = "",
+    ) -> dict[str, Any]:
+        """Verify the authoritative canonical `kanban_notify_subs` row for
+        this subscription has `delivery_mode='notify+wake'` in the target
+        board's own Kanban DB. This is ACK/wake success on its own -- unlike
+        the legacy path, it does not require the legacy
+        ack_subscription/ack_active_wake tables to exist (M30D: new/global
+        boards may not have them)."""
+        try:
+            conn = sqlite3.connect(str(self.board_db_path))
+        except Exception:
+            return {"success": False, "error": "canonical_db_connect_failed"}
+        try:
+            if not _table_exists(conn, "kanban_notify_subs"):
+                return {"success": False, "error": "canonical_schema_missing"}
+            cols = _table_columns(conn, "kanban_notify_subs")
+            if "delivery_mode" not in cols:
+                return {"success": False, "error": "canonical_schema_missing"}
+            row = conn.execute(
+                "SELECT delivery_mode, chat_type, user_id FROM kanban_notify_subs "
+                "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
+                (task_id, platform, chat_id, thread_id),
+            ).fetchone()
+            if row is None:
+                return {"success": False, "error": "canonical_row_missing"}
+            row_mode, row_chat_type, row_user_id = row
+            if row_mode != "notify+wake":
+                return {"success": False, "error": "canonical_delivery_mode_mismatch"}
+            if chat_type and "chat_type" in cols and row_chat_type and row_chat_type != chat_type:
+                return {"success": False, "error": "canonical_chat_type_mismatch"}
+            if user_id and "user_id" in cols and row_user_id and row_user_id != user_id:
+                return {"success": False, "error": "canonical_user_id_mismatch"}
+            return {"success": True}
+        except Exception:
+            return {"success": False, "error": "canonical_verify_failed"}
+        finally:
+            conn.close()
 
     def _ensure_durable_ack_rows(
         self, task_id: str, *, platform: str, chat_id: str, thread_id: str = ""
@@ -355,6 +430,14 @@ class RealBoardAdapter:
             origin_flags["chat_id"] = _DISCORD_CHANNEL_ALIASES.get(chat_key, origin_flags["chat_id"])
             if not origin_flags["chat_id"].isdigit():
                 return {"success": False, "error": "discord_chat_id_not_numeric"}
+
+        # Only probe/use the canonical delivery-mode CLI shape when ACK
+        # repair is actually wired (real adapter with a real board DB); pure
+        # argv-shape unit tests (fake runner, no board_db_path) keep their
+        # existing plain notify-subscribe behavior untouched.
+        use_canonical = self._repair_ack_rows and self._supports_delivery_mode()
+        chat_type = "thread" if origin_flags.get("thread_id") else "channel"
+
         argv = [
             self.hermes_bin, "kanban", "--board", self.board, "notify-subscribe", task_id,
             "--platform", origin_flags["platform"], "--chat-id", origin_flags["chat_id"],
@@ -363,21 +446,41 @@ class RealBoardAdapter:
             argv += ["--thread-id", origin_flags["thread_id"]]
         if origin_flags.get("user_id"):
             argv += ["--user-id", origin_flags["user_id"]]
+        if use_canonical:
+            argv += ["--chat-type", chat_type, "--delivery-mode", "notify+wake"]
+
         result = self._run(argv)
         chat_id = origin_flags["chat_id"]
-        if result.get("success") and self._repair_ack_rows and origin_flags["platform"] == "discord" and chat_id.isdigit():
-            ack = self._ensure_durable_ack_rows(
-                task_id, platform="discord", chat_id=chat_id, thread_id=origin_flags.get("thread_id", "")
+        if not (result.get("success") and self._repair_ack_rows and origin_flags["platform"] == "discord" and chat_id.isdigit()):
+            return result
+
+        if use_canonical:
+            ack = self._verify_canonical_notify_sub(
+                task_id,
+                platform="discord",
+                chat_id=chat_id,
+                thread_id=origin_flags.get("thread_id", ""),
+                chat_type=chat_type,
+                user_id=origin_flags.get("user_id", ""),
             )
             if not ack.get("success"):
-                # notify-subscribe plus ACK repair is one semantic operation:
-                # a bare kanban_notify_subs row with no durable
-                # ack_subscription/ack_active_wake repair leaves the
-                # gateway's active-wake path with nothing to act on, so this
-                # must never surface as a top-level success (M30C).
-                return {"success": False, "error": ack.get("error", "ack_ensure_failed"), "ack": ack}
-            result = {**result, "ack": ack}
-        return result
+                # A CLI exit-0 alone isn't proof the canonical row landed as
+                # notify+wake -- verify against the authoritative board DB
+                # and fail closed if it didn't (M30D).
+                return {"success": False, "error": ack.get("error", "canonical_verification_failed"), "ack": ack}
+            return {**result, "ack": ack}
+
+        ack = self._ensure_durable_ack_rows(
+            task_id, platform="discord", chat_id=chat_id, thread_id=origin_flags.get("thread_id", "")
+        )
+        if not ack.get("success"):
+            # notify-subscribe plus ACK repair is one semantic operation:
+            # a bare kanban_notify_subs row with no durable
+            # ack_subscription/ack_active_wake repair leaves the
+            # gateway's active-wake path with nothing to act on, so this
+            # must never surface as a top-level success (M30C).
+            return {"success": False, "error": ack.get("error", "ack_ensure_failed"), "ack": ack}
+        return {**result, "ack": ack}
 
     def comment(self, task_id: str, body: str) -> dict[str, Any]:
         argv = [self.hermes_bin, "kanban", "--board", self.board, "comment", task_id, body]
