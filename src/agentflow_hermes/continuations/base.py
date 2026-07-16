@@ -72,12 +72,30 @@ def apply_board_operation(
         )
     else:
         result = {"success": False, "error": "unknown_outbox_operation"}
-    if result.get("success"):
+    if result.get("success") and not _has_failed_nested_ack(result):
         task_id = result.get("task_id", "")
         store.outbox_mark(row["id"], state="applied", board_task_id=task_id)
         return {"success": True, "task_id": task_id}
     store.outbox_mark(row["id"], state="pending")
-    return {"success": False, "error": result.get("error", "adapter_error")}
+    error = result.get("error")
+    if not error and _has_failed_nested_ack(result):
+        ack = result.get("ack")
+        error = ack.get("error", "ack_ensure_failed") if isinstance(ack, dict) else "ack_malformed"
+    return {"success": False, "error": error or "adapter_error"}
+
+
+def _has_failed_nested_ack(result: dict[str, Any]) -> bool:
+    """Structurally fail closed on a required durable ACK/active-wake repair
+    that a subscribe-shaped adapter result nests under ``ack``: notify+wake
+    plus ACK repair is one semantic operation, so a top-level ``success: True``
+    alongside a missing/malformed/failed nested ``ack`` must never be treated
+    as an applied board mutation."""
+    if "ack" not in result:
+        return False
+    ack = result.get("ack")
+    if not isinstance(ack, dict):
+        return True
+    return not ack.get("success")
 
 
 class ContinuationHandler(Protocol):

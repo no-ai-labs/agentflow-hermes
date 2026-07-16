@@ -145,9 +145,51 @@ def test_semantic_refusal_notify_failure_leaves_cursor_retryable_then_retry(tmp_
     assert failing.tasks == {}
     instance = store.list_instances()[0]
     assert instance["state"] == "failed_retryable"
+    assert store.list_requirement_satisfactions(instance["id"]) == []
 
     # Retry with a working adapter: refusal completes, cursor advances, one ACK,
     # one subscription, no duplicate instance.
+    working = FakeBoardAdapter()
+    second = _ingest(store, working, [_unsafe_event(run_metadata, summary)])
+    assert second["results"][0]["router_success"] is True
+    assert working.tasks == {}
+    assert len(working.subscriptions) == 1
+    assert store.get_cursor("warroom-os", "warroom-os-db") == 7305
+    assert len(store.list_instances()) == 1
+    assert store.list_instances()[0]["state"] == "blocked_invalid"
+
+
+class _NestedAckFailureSubscribeAdapter(FakeBoardAdapter):
+    """Mirrors RealBoardAdapter.subscribe returning top-level success=True
+    with a failed nested ACK/active-wake repair (ack_schema_missing/
+    ack_ensure_failed) -- the exact M30C incident shape."""
+
+    def subscribe(self, task_id: str, endpoint: str) -> dict[str, Any]:
+        pair = (task_id, endpoint)
+        if pair not in self.subscriptions:
+            self.subscriptions.append(pair)
+        return {"success": True, "ack": {"success": False, "error": "ack_schema_missing"}}
+
+
+def test_semantic_refusal_nested_ack_failure_fails_closed_then_retry_succeeds_once(tmp_path):
+    store = ContinuationStore(tmp_path / "agentflow.sqlite")
+    label, run_metadata, summary = _UNSAFE_CASES[0]
+
+    failing = _NestedAckFailureSubscribeAdapter()
+    first = _ingest(store, failing, [_unsafe_event(run_metadata, summary)])
+
+    item = first["results"][0]
+    assert item["action"] == "semantic_refusal_applied"
+    assert item["router_success"] is False
+    # Fail closed: cursor did not advance, and no false semantic success or
+    # quarantine transition happened despite the adapter's top-level success.
+    assert store.get_cursor("warroom-os", "warroom-os-db") == 0
+    instance = store.list_instances()[0]
+    assert instance["state"] == "failed_retryable"
+    assert store.list_requirement_satisfactions(instance["id"]) == []
+
+    # Retry with a working adapter: exactly one wake/refusal receipt, zero
+    # duplicate tasks/wakes, and the retry advances exactly once.
     working = FakeBoardAdapter()
     second = _ingest(store, working, [_unsafe_event(run_metadata, summary)])
     assert second["results"][0]["router_success"] is True

@@ -88,16 +88,11 @@ class SemanticRefusalHandler:
             instance = store.get_instance(instance_id)
         assert instance is not None
 
-        # 1) Durable semantic-refusal ACK (idempotent upsert on field_name).
-        store.record_requirement_satisfaction(
-            instance_id,
-            field_name="semantic_refusal",
-            value={"categories": list(refusal_categories), "blockers": list(blockers)},
-            source_kind="semantic_refusal_ack",
-            source_ref=",".join(refusal_categories),
-        )
-
-        # 2) Targeted trusted-origin notify+wake — never a direct send.
+        # 1) Targeted trusted-origin notify+wake — never a direct send. This
+        # must succeed before we record the refusal ACK/quarantine below: the
+        # durable notify+wake repair plus semantic-refusal ACK is one semantic
+        # operation, so an ACK/active-wake repair failure remains retryable
+        # without a false success receipt (M30C).
         digest = _stable_digest(instance)
         endpoint = outcome.return_to_ref or outcome.origin_ref
         subscribed = False
@@ -114,6 +109,17 @@ class SemanticRefusalHandler:
             if not sub.get("success"):
                 return self._fail(store, instance_id, "refusal_notify_failed")
             subscribed = True
+
+        # 2) Durable semantic-refusal ACK (idempotent upsert on field_name),
+        # recorded only after trusted-origin subscribe/active-wake repair is
+        # known to have succeeded.
+        store.record_requirement_satisfaction(
+            instance_id,
+            field_name="semantic_refusal",
+            value={"categories": list(refusal_categories), "blockers": list(blockers)},
+            source_kind="semantic_refusal_ack",
+            source_ref=",".join(refusal_categories),
+        )
 
         # 3) Durable quarantine — explicitly not a successful CODE_FIX advance.
         if instance["state"] != ContinuationState.BLOCKED_INVALID.value:

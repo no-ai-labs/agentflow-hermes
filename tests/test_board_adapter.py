@@ -179,6 +179,34 @@ def test_real_adapter_subscribe_uses_notify_subscribe_not_subscribe():
     assert "--origin-platform" not in argv
 
 
+def test_real_adapter_subscribe_maps_hermes_main_to_numeric_channel():
+    calls = []
+
+    def runner(argv):
+        calls.append(argv)
+        return 0, "Subscribed discord:hermes-main to t:1", ""
+
+    adapter = RealBoardAdapter(runner=runner, board="warroom-os")
+    result = adapter.subscribe("t:1", "discord:#hermes-main")
+
+    assert result["success"] is True
+    assert calls[0][calls[0].index("--chat-id") + 1] == "1497895797579190357"
+
+
+def test_real_adapter_subscribe_refuses_unknown_discord_channel_label_without_calling_cli():
+    calls = []
+
+    def runner(argv):
+        calls.append(argv)
+        return 0, "Subscribed", ""
+
+    adapter = RealBoardAdapter(runner=runner, board="warroom-os")
+    result = adapter.subscribe("t:1", "discord:#unknown-lane")
+
+    assert result == {"success": False, "error": "discord_chat_id_not_numeric"}
+    assert calls == []
+
+
 def test_real_adapter_subscribe_numeric_research_creates_durable_ack_rows(tmp_path):
     db = tmp_path / "kanban.db"
     con = sqlite3.connect(db)
@@ -295,6 +323,56 @@ def test_real_adapter_complete_uses_summary_and_metadata_not_receipt_ref():
     assert "--receipt-ref" not in argv
     metadata_index = argv.index("--metadata") + 1
     assert json.loads(argv[metadata_index]) == {"receipt_ref": "receipt:1"}
+
+
+def test_real_adapter_subscribe_fails_closed_when_ack_schema_missing(tmp_path):
+    """RealBoardAdapter.subscribe must not report top-level success when the
+    durable ACK/active-wake repair failed (M30C: schema missing from the
+    board's own Kanban DB) -- a bare notify-subscribe row with no ACK repair
+    is not enough for the gateway's active-wake path to fire."""
+    db = tmp_path / "kanban.db"
+    # No ack tables created at all -- _ensure_durable_ack_rows returns
+    # {"success": False, "error": "ack_schema_missing"}.
+    sqlite3.connect(db).close()
+    calls = []
+
+    def runner(argv):
+        calls.append(argv)
+        return 0, "Subscribed", ""
+
+    adapter = RealBoardAdapter(runner=runner, board="warroom-os", board_db_path=db)
+    result = adapter.subscribe("t_owner", "discord:#research")
+
+    assert result["success"] is False
+    assert result["error"] == "ack_schema_missing"
+
+
+def test_real_adapter_subscribe_fails_closed_when_ack_ensure_raises(tmp_path):
+    """A nested exception while repairing the durable ACK rows (malformed
+    schema) must also fail the whole subscribe closed, not just be silently
+    attached as a nested ``ack`` under a top-level success."""
+    db = tmp_path / "kanban.db"
+    con = sqlite3.connect(db)
+    # Tables exist (so the "ack_schema_missing" branch is skipped) but
+    # kanban_notify_subs is missing required columns, so the INSERT inside
+    # _ensure_durable_ack_rows raises and is caught as "ack_ensure_failed".
+    con.executescript(
+        """
+        create table kanban_notify_subs (task_id text not null);
+        create table ack_subscription (id integer primary key autoincrement);
+        create table ack_active_wake (id integer primary key autoincrement);
+        """
+    )
+    con.close()
+
+    def runner(argv):
+        return 0, "Subscribed", ""
+
+    adapter = RealBoardAdapter(runner=runner, board="warroom-os", board_db_path=db)
+    result = adapter.subscribe("t_owner", "discord:#research")
+
+    assert result["success"] is False
+    assert result["error"] == "ack_ensure_failed"
 
 
 def test_real_adapter_plain_text_commands_do_not_require_json_output():

@@ -134,6 +134,55 @@ def test_code_fix_apply_failure_leaves_cursor_retryable_then_retry_dedupes(tmp_p
     assert len(working.subscriptions) == 1
     assert store.get_cursor("warroom-os", "warroom-os-db") == 7305
     assert len(store.list_instances()) == 1
+    # A retry that replays from FAILED_RETRYABLE must still materialize the
+    # graph all the way to WAITING_REVIEW, not get stuck re-normalizing only
+    # from DETECTED (M30C item 4).
+    assert store.list_instances()[0]["state"] == "waiting_review"
+
+
+class _NestedAckFailureSubscribeAdapter(FakeBoardAdapter):
+    """Mirrors RealBoardAdapter.subscribe returning top-level success=True
+    with a failed nested ACK/active-wake repair -- the exact M30C incident
+    shape, applied to the code-fix review subscription."""
+
+    def subscribe(self, task_id: str, endpoint: str) -> dict[str, Any]:
+        pair = (task_id, endpoint)
+        if pair not in self.subscriptions:
+            self.subscriptions.append(pair)
+        return {"success": True, "ack": {"success": False, "error": "ack_ensure_failed"}}
+
+
+def test_code_fix_nested_ack_failure_on_review_subscribe_fails_closed_then_retry_succeeds_once(tmp_path):
+    store = ContinuationStore(tmp_path / "agentflow.sqlite")
+
+    failing = _NestedAckFailureSubscribeAdapter()
+    first = _ingest(store, failing, [_t89_event()])
+
+    item = first["results"][0]
+    assert item["action"] == "code_fix_applied"
+    assert item["router_success"] is False
+    # Fail closed: cursor did not advance despite the fix/review tasks having
+    # been created and the adapter reporting top-level subscribe success.
+    assert store.get_cursor("warroom-os", "warroom-os-db") == 0
+    instance = store.list_instances()[0]
+    assert instance["state"] == "failed_retryable"
+    # The fix/review tasks were already durably created and applied on the
+    # first attempt -- only the review subscribe/ACK repair failed closed.
+    assert len(failing.tasks) == 2
+    assert len(failing.subscriptions) == 1
+
+    # Retry with a working adapter: the already-applied create_task steps
+    # dedupe locally (zero duplicate tasks against the new adapter), exactly
+    # one new review subscription/wake succeeds, and the retry advances
+    # exactly once.
+    working = FakeBoardAdapter()
+    second = _ingest(store, working, [_t89_event()])
+    assert second["results"][0]["router_success"] is True
+    assert working.tasks == {}
+    assert len(working.subscriptions) == 1
+    assert store.get_cursor("warroom-os", "warroom-os-db") == 7305
+    assert len(store.list_instances()) == 1
+    assert store.list_instances()[0]["state"] == "waiting_review"
 
 
 def test_delivered_subscription_is_the_semantic_return_not_a_direct_send(tmp_path):

@@ -65,6 +65,10 @@ _DISCORD_CHANNEL_ALIASES = {
     # Devhub #research. Keep the real ACK path on the numeric channel id;
     # chat_id='research' is only a human label and does not wake Discord.
     "research": "1499390151393284106",
+    # Devhub #shaman / #hermes-main lanes used by the AgentFlow loops. These
+    # mirror scripts/kanban_auto_remediation_adapter.py's default notify set.
+    "shaman": "1500539609413849200",
+    "hermes-main": "1497895797579190357",
 }
 
 
@@ -349,6 +353,8 @@ class RealBoardAdapter:
         if origin_flags["platform"] == "discord":
             chat_key = origin_flags["chat_id"].lstrip("#")
             origin_flags["chat_id"] = _DISCORD_CHANNEL_ALIASES.get(chat_key, origin_flags["chat_id"])
+            if not origin_flags["chat_id"].isdigit():
+                return {"success": False, "error": "discord_chat_id_not_numeric"}
         argv = [
             self.hermes_bin, "kanban", "--board", self.board, "notify-subscribe", task_id,
             "--platform", origin_flags["platform"], "--chat-id", origin_flags["chat_id"],
@@ -363,6 +369,13 @@ class RealBoardAdapter:
             ack = self._ensure_durable_ack_rows(
                 task_id, platform="discord", chat_id=chat_id, thread_id=origin_flags.get("thread_id", "")
             )
+            if not ack.get("success"):
+                # notify-subscribe plus ACK repair is one semantic operation:
+                # a bare kanban_notify_subs row with no durable
+                # ack_subscription/ack_active_wake repair leaves the
+                # gateway's active-wake path with nothing to act on, so this
+                # must never surface as a top-level success (M30C).
+                return {"success": False, "error": ack.get("error", "ack_ensure_failed"), "ack": ack}
             result = {**result, "ack": ack}
         return result
 

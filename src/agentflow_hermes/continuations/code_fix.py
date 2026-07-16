@@ -80,7 +80,14 @@ class CodeFixHandler:
                 metadata={"instance_id": instance_id, "created": creation["created"]},
             )
 
-        if instance["state"] == ContinuationState.DETECTED.value:
+        # Normalize into MATERIALIZING from a fresh detection or a prior failed
+        # attempt so a retry re-derives the same terminal graph instead of
+        # getting stuck in FAILED_RETRYABLE forever despite every step below
+        # succeeding (M30C item 4).
+        if instance["state"] in (
+            ContinuationState.DETECTED.value,
+            ContinuationState.FAILED_RETRYABLE.value,
+        ):
             store.transition(instance_id, ContinuationState.MATERIALIZING, reason="code_fix_detected")
             instance = store.get_instance(instance_id)
         assert instance is not None
