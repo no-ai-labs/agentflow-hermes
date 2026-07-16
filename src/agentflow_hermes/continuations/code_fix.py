@@ -25,7 +25,7 @@ from typing import Any
 
 from ..continuation_store import ContinuationState, ContinuationStore
 from ..outcome import ContinuationKind, OutcomeEnvelope
-from .base import StepResult, apply_board_operation
+from .base import StepResult, apply_board_operation, pending_outbox_retry_not_due
 
 
 def _stable_digest(instance: dict[str, Any]) -> str:
@@ -84,6 +84,15 @@ class CodeFixHandler:
         # attempt so a retry re-derives the same terminal graph instead of
         # getting stuck in FAILED_RETRYABLE forever despite every step below
         # succeeding (M30C item 4).
+        if instance["state"] == ContinuationState.FAILED_RETRYABLE.value and pending_outbox_retry_not_due(
+            store, instance_id
+        ):
+            return StepResult(
+                success=False,
+                reason="outbox_retry_not_due",
+                state=instance["state"],
+                metadata={"instance_id": instance_id, "created": creation["created"], "retry_due": False},
+            )
         if instance["state"] in (
             ContinuationState.DETECTED.value,
             ContinuationState.FAILED_RETRYABLE.value,

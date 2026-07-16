@@ -117,6 +117,30 @@ def _table_columns(conn: sqlite3.Connection, name: str) -> set[str]:
     return {row[1] for row in conn.execute(f"PRAGMA table_info({name})")}
 
 
+def _sanitized_cli_error(
+    *, exc: BaseException | None = None, returncode: int | None = None, stderr: str = ""
+) -> str:
+    """Map CLI runner failures to bounded durable classes.
+
+    AgentFlow stores this string in its retry outbox. Keep it low-cardinality
+    and free of raw command lines, DB paths, exception reprs, or route text.
+    """
+    if isinstance(exc, subprocess.TimeoutExpired):
+        return "cli_runner_timeout"
+    if isinstance(exc, sqlite3.OperationalError):
+        msg = str(exc).lower()
+        if "locked" in msg or "busy" in msg:
+            return "cli_runner_db_locked"
+    msg = (stderr or "").lower()
+    if "database is locked" in msg or "database table is locked" in msg or "sqlite_busy" in msg:
+        return "cli_runner_db_locked"
+    if "timed out" in msg or "timeout" in msg:
+        return "cli_runner_timeout"
+    if returncode is not None:
+        return "cli_runner_failed"
+    return "cli_runner_error"
+
+
 class FakeBoardAdapter:
     """In-memory idempotent adapter for tests. Never mutates external state."""
 
@@ -607,21 +631,27 @@ class RealBoardAdapter:
         """Run a subcommand that prints plain text (block/comment/complete/
         notify-subscribe on this CLI version). Success is exit-code only."""
         try:
-            returncode, _stdout, _stderr = self.runner(argv)
-        except Exception:
-            return {"success": False, "error": "cli_runner_error"}
+            returncode, _stdout, stderr = self.runner(argv)
+        except Exception as exc:
+            return {"success": False, "error": _sanitized_cli_error(exc=exc)}
+        stderr_error = _sanitized_cli_error(stderr=stderr)
+        if stderr_error in {"cli_runner_db_locked", "cli_runner_timeout"}:
+            return {"success": False, "error": stderr_error}
         if returncode != 0:
-            return {"success": False, "error": "cli_runner_failed"}
+            return {"success": False, "error": _sanitized_cli_error(returncode=returncode, stderr=stderr)}
         return {"success": True}
 
     def _run_json(self, argv: list[str]) -> dict[str, Any]:
         """Run a subcommand that supports ``--json`` (only `create`/`show`/`list`)."""
         try:
-            returncode, stdout, _stderr = self.runner(argv)
-        except Exception:
-            return {"success": False, "error": "cli_runner_error"}
+            returncode, stdout, stderr = self.runner(argv)
+        except Exception as exc:
+            return {"success": False, "error": _sanitized_cli_error(exc=exc)}
+        stderr_error = _sanitized_cli_error(stderr=stderr)
+        if stderr_error in {"cli_runner_db_locked", "cli_runner_timeout"}:
+            return {"success": False, "error": stderr_error}
         if returncode != 0:
-            return {"success": False, "error": "cli_runner_failed"}
+            return {"success": False, "error": _sanitized_cli_error(returncode=returncode, stderr=stderr)}
         try:
             result = json.loads(stdout)
         except (json.JSONDecodeError, ValueError, TypeError):

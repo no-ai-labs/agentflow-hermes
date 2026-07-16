@@ -138,6 +138,19 @@ def test_outbox_enqueue_is_idempotent_and_reconciles(tmp_path):
     assert row["board_task_id"] == "task:abc"
 
 
+def test_outbox_mark_applied_clears_stale_retry_metadata(tmp_path):
+    store = _store(tmp_path)
+    instance_id = _make_instance(store)["instance"]["id"]
+    op = store.outbox_enqueue(instance_id, step_id="", operation="create_task", payload={"x": 1}, idempotency_key="op:retry")
+    store.outbox_mark(op["outbox"]["id"], state="pending", next_attempt_at=9999999999.0, last_error="cli_runner_error")
+
+    row = store.outbox_mark(op["outbox"]["id"], state="applied", board_task_id="task:abc")
+
+    assert row["state"] == "applied"
+    assert row["next_attempt_at"] == 0
+    assert row["last_error"] == ""
+
+
 def test_board_cursor_scoped_per_board_and_db_identity(tmp_path):
     store = _store(tmp_path)
     store.advance_cursor("warroom-os", "db-a", 100)

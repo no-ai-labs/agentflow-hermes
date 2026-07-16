@@ -700,6 +700,21 @@ def test_service_install_render_never_writes(tmp_path):
     assert not (tmp_path / service_install.SERVICE_NAME).exists()
 
 
+def test_service_install_units_pin_hermes_path_for_daemon_and_reconcile(tmp_path):
+    repo = tmp_path / "repo"
+    script = repo / "scripts" / "agentflowd.py"
+    script.parent.mkdir(parents=True)
+    script.write_text("# stub\n")
+
+    plan = service_install.render_install_plan(str(script))
+
+    expected_path = f"Environment=PATH={repo / '.venv' / 'bin'}:%h/.local/bin:/usr/local/bin:/usr/bin:/bin"
+    service_unit = plan["units"][service_install.SERVICE_NAME]
+    reconcile_unit = plan["units"][service_install.RECONCILE_SERVICE_NAME]
+    assert expected_path in service_unit
+    assert expected_path in reconcile_unit
+
+
 def test_service_install_write_files_requires_unit_dir(tmp_path):
     script = tmp_path / "agentflowd.py"
     script.write_text("# stub\n")

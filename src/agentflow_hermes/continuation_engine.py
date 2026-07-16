@@ -372,6 +372,28 @@ def reconcile_outbox(store: ContinuationStore, *, adapter_by_board: dict[str, An
                         result = {"success": False, "error": "origin_wake_not_yet_accepted", "scheduled": True}
         elif operation == "complete_owner_anchor":
             result = adapter.complete_owner_anchor(str(payload.get("task_id") or ""), receipt_ref=str(payload.get("receipt_ref") or ""))
+        elif operation == "record_consumer_ack":
+            task_id = str(payload.get("task_id") or "")
+            endpoint = str(payload.get("endpoint") or "")
+            status = str(payload.get("status") or "")
+            check = getattr(adapter, "consumer_ack_satisfied", None)
+            if check is not None:
+                verified = check(task_id, endpoint, status)
+                if verified and verified.get("success"):
+                    result = {"success": True, "source": "consumer_ack_receipt"}
+                else:
+                    record = getattr(adapter, "record_consumer_ack", None)
+                    if record is None:
+                        result = {"success": False, "error": "adapter_missing_record_consumer_ack"}
+                    else:
+                        result = record(task_id, endpoint, status)
+                        if result.get("success"):
+                            verified_after = check(task_id, endpoint, status)
+                            if not (verified_after and verified_after.get("success")):
+                                result = {"success": False, "error": "consumer_ack_not_verified", "ack": verified_after}
+            else:
+                record = getattr(adapter, "record_consumer_ack", None)
+                result = record(task_id, endpoint, status) if record is not None else {"success": False, "error": "adapter_missing_record_consumer_ack"}
         else:
             result = {"success": False, "error": "unknown_outbox_operation"}
         if result.get("success"):

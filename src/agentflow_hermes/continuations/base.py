@@ -14,6 +14,42 @@ from typing import Any, Protocol
 from ..outcome import ContinuationKind, OutcomeEnvelope
 
 
+def pending_outbox_retry_not_due(store: Any, instance_id: int, *, now: float | None = None) -> bool:
+    """Return True when an existing pending outbox row is still in backoff.
+
+    Handlers call this before re-entering MATERIALIZING from FAILED_RETRYABLE.
+    A non-due outbox is already the durable retry state; toggling the instance
+    FAILED_RETRYABLE -> MATERIALIZING -> FAILED_RETRYABLE on every daemon tick
+    creates an event storm without making any external mutation eligible.
+    """
+    # Prefer the store helper when present: it implements the precise contract
+    # that all pending rows are in the future. If one pending row is due, the
+    # handler must re-enter materialization so that due work can converge.
+    helper = getattr(store, "outbox_pending_retry_at", None)
+    if helper is not None:
+        return helper(instance_id, now=now) is not None
+
+    due_at = time.time() if now is None else now
+    with store.connect() as con:
+        row = con.execute(
+            """
+            select 1 from board_outbox
+             where continuation_id=?
+               and state='pending'
+               and coalesce(next_attempt_at, 0) > ?
+               and not exists (
+                   select 1 from board_outbox due
+                    where due.continuation_id=board_outbox.continuation_id
+                      and due.state='pending'
+                      and coalesce(due.next_attempt_at, 0) <= ?
+               )
+             limit 1
+            """,
+            (instance_id, due_at, due_at),
+        ).fetchone()
+    return row is not None
+
+
 @dataclass(frozen=True)
 class ContinuationPlan:
     instance_id: int

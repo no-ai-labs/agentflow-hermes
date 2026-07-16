@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import subprocess
 from pathlib import Path
 
 from agentflow_hermes.board_adapter import RealBoardAdapter
@@ -174,6 +175,132 @@ def _route(store: ContinuationStore, db: Path, calls: list[list[str]]):
         default_endpoint="discord:1497895797579190357",
         apply=True,
     )
+
+
+def test_semantic_refusal_cli_failure_backoff_bounds_events_and_clears_on_convergence(tmp_path):
+    """M30I: scans while outbox is in backoff must not append state
+    transitions per scan. Applied rows clear stale retry/error metadata."""
+    board_db = tmp_path / "kanban.db"
+    _create_current_hermes_notify_schema(board_db)
+    store = ContinuationStore(tmp_path / "agentflow.sqlite")
+    store.advance_cursor("agentflow-hermes", "agentflow-hermes", 0)
+    calls: list[list[str]] = []
+    mode = {"value": "fail"}
+
+    def runner(argv):
+        calls.append(argv)
+        if "--help" in argv:
+            return 0, "usage: hermes kanban notify-subscribe --delivery-mode notify+wake --chat-type channel", ""
+        if "wake-origin" in argv:
+            if mode["value"] == "fail":
+                return 1, "", "hermes missing from systemd PATH"
+            con = sqlite3.connect(board_db)
+            con.execute(
+                """
+                insert into kanban_task_origin(
+                    task_id, platform, chat_id, thread_id, notifier_profile, chat_type, created_at, updated_at
+                ) values ('t_source', 'discord', '1497895797579190357', '', 'default', 'group', 1, 1)
+                on conflict(task_id) do update set updated_at=excluded.updated_at
+                """
+            )
+            con.execute(
+                """
+                insert into kanban_notify_receipts(
+                    task_id, platform, chat_id, thread_id, active_wake_status, active_wake_at, consumer_ack_status, updated_at
+                ) values ('t_source', 'discord', '1497895797579190357', '', 'accepted', 2, NULL, 2)
+                on conflict(task_id, platform, chat_id, thread_id) do update set
+                    active_wake_status='accepted', active_wake_at=2, updated_at=2
+                """
+            )
+            con.commit()
+            con.close()
+            return 0, json.dumps({"task_id": "t_source", "active_wake_status": "accepted"}), ""
+        if "consumer-ack-origin" in argv:
+            con = sqlite3.connect(board_db)
+            con.execute(
+                """
+                update kanban_notify_receipts
+                set consumer_ack_status='semantic_refusal_ack', consumer_ack_at=4, updated_at=4
+                where task_id='t_source' and platform='discord' and chat_id='1497895797579190357' and thread_id=''
+                """
+            )
+            con.commit()
+            con.close()
+            return 0, json.dumps({"task_id": "t_source", "consumer_ack_status": "semantic_refusal_ack"}), ""
+        return 0, "", ""
+
+    def route():
+        source = FakeBoardEventSource(db_identity="agentflow-hermes", events=[_semantic_refusal_event()])
+        return ingest_board_once(
+            board="agentflow-hermes",
+            source=source,
+            store=store,
+            contract_registry=_contracts(),
+            adapter=RealBoardAdapter(runner=runner, board="agentflow-hermes", board_db_path=board_db),
+            default_endpoint="discord:1497895797579190357",
+            apply=True,
+        )
+
+    first = route()
+    assert first["cursor"] == 0
+    assert first["results"][0]["router_success"] is False
+    instance = store.list_instances()[0]
+    event_count_after_attempt = len(store.list_events(instance["id"]))
+    row_after_attempt = store.list_outbox()[0]
+    assert row_after_attempt["attempts"] == 1
+    assert row_after_attempt["last_error"] == "cli_runner_failed"
+    assert row_after_attempt["next_attempt_at"] > row_after_attempt["updated_at"]
+
+    for _ in range(5):
+        replay = route()
+        assert replay["cursor"] == 0
+        assert replay["results"][0]["router_success"] is False
+
+    assert len(store.list_events(instance["id"])) == event_count_after_attempt
+    assert store.list_outbox()[0]["attempts"] == 1
+    assert len([c for c in calls if "wake-origin" in c]) == 1
+
+    mode["value"] = "recover"
+    with store.connect() as con:
+        con.execute("update board_outbox set next_attempt_at=0")
+
+    recovered = route()
+    assert recovered["cursor"] == 3968
+    assert recovered["results"][0]["router_success"] is True
+    rows = {row["operation"]: row for row in store.list_outbox()}
+    assert rows["schedule_origin_wake"]["state"] == "applied"
+    assert rows["schedule_origin_wake"]["last_error"] == ""
+    assert rows["schedule_origin_wake"]["next_attempt_at"] == 0
+    assert rows["record_consumer_ack"]["state"] == "applied"
+    assert rows["record_consumer_ack"]["last_error"] == ""
+    assert rows["record_consumer_ack"]["next_attempt_at"] == 0
+    assert len([c for c in calls if "wake-origin" in c]) == 2
+    assert len([c for c in calls if "consumer-ack-origin" in c]) == 1
+
+    terminal_event_count = len(store.list_events(instance["id"]))
+    outcome = OutcomeEnvelope(
+        schema_version=1,
+        event_id="kanban-event-3968",
+        board="agentflow-hermes",
+        source_task_id="t_source",
+        source_graph_id="graph:t_source",
+        verdict=Verdict.BLOCK,
+        continuation_kind=ContinuationKind.SEMANTIC_REFUSAL,
+        origin_ref="discord:1497895797579190357",
+        return_to_ref="discord:1497895797579190357",
+    )
+    adapter = RealBoardAdapter(runner=runner, board="agentflow-hermes", board_db_path=board_db)
+    for _ in range(3):
+        result = SemanticRefusalHandler().materialize(
+            outcome,
+            store=store,
+            adapter=adapter,
+            blockers=("credentials required from user",),
+            refusal_categories=("credentials",),
+        )
+        assert result.success is True
+        assert result.state == "blocked_invalid"
+    assert len(store.list_events(instance["id"])) == terminal_event_count
 
 
 def test_semantic_refusal_accepts_existing_one_shot_receipt_and_backs_off_retry(tmp_path):
@@ -393,3 +520,87 @@ def test_recovery_of_terminal_instance_missing_consumer_ack_enqueues_only_that(t
     con.close()
     assert tuple(receipt) == ("accepted", "semantic_refusal_ack")
     assert origin_count == 1
+
+
+def test_consumer_ack_cli_timeout_persists_bounded_error_and_non_due_retry_is_quiet(tmp_path):
+    board_db = tmp_path / "kanban.db"
+    _create_current_hermes_notify_schema(board_db)
+    _insert_delivered_one_shot_receipt(board_db, task_id="t_source")
+    store = ContinuationStore(tmp_path / "agentflow.sqlite")
+    store.advance_cursor("agentflow-hermes", "agentflow-hermes", 0)
+    calls: list[list[str]] = []
+
+    def runner(argv):
+        calls.append(argv)
+        if "consumer-ack-origin" in argv:
+            raise subprocess.TimeoutExpired(argv, timeout=30)
+        return 0, "{}", ""
+
+    adapter = RealBoardAdapter(runner=runner, board="agentflow-hermes", board_db_path=board_db)
+    source = FakeBoardEventSource(db_identity="agentflow-hermes", events=[_semantic_refusal_event()])
+
+    first = ingest_board_once(
+        board="agentflow-hermes",
+        source=source,
+        store=store,
+        contract_registry=_contracts(),
+        adapter=adapter,
+        default_endpoint="discord:1497895797579190357",
+        apply=True,
+    )
+
+    assert first["cursor"] == 0
+    assert first["results"][0]["router_success"] is False
+    rows = {row["operation"]: row for row in store.list_outbox()}
+    assert rows["record_consumer_ack"]["state"] == "pending"
+    assert rows["record_consumer_ack"]["last_error"] == "cli_runner_timeout"
+    instance = store.list_instances()[0]
+    transition_count = len([e for e in store.list_events(instance["id"]) if e["kind"] == "state_transition"])
+
+    # Immediate replay sees the pending outbox backoff and must not append the
+    # failed_retryable -> materializing -> failed_retryable storm observed live.
+    second = ingest_board_once(
+        board="agentflow-hermes",
+        source=source,
+        store=store,
+        contract_registry=_contracts(),
+        adapter=adapter,
+        default_endpoint="discord:1497895797579190357",
+        apply=True,
+    )
+
+    assert second["cursor"] == 0
+    assert second["results"][0]["router_success"] is False
+    assert len([c for c in calls if "consumer-ack-origin" in c]) == 1
+    assert len([e for e in store.list_events(instance["id"]) if e["kind"] == "state_transition"]) == transition_count
+
+
+def test_consumer_ack_cli_lock_error_is_sanitized(tmp_path):
+    board_db = tmp_path / "kanban.db"
+    _create_current_hermes_notify_schema(board_db)
+    _insert_delivered_one_shot_receipt(board_db, task_id="t_source")
+    store = ContinuationStore(tmp_path / "agentflow.sqlite")
+    store.advance_cursor("agentflow-hermes", "agentflow-hermes", 0)
+
+    def runner(argv):
+        if "consumer-ack-origin" in argv:
+            # Some Hermes CLI initialization-lock failures have historically
+            # printed a lock error on stderr without propagating a non-zero rc.
+            # The adapter still must persist the bounded class, not raw stderr
+            # and not a misleading cli_invalid_json.
+            return 0, "", "sqlite3.OperationalError: database is locked: /private/path/kanban.db"
+        return 0, "{}", ""
+
+    result = ingest_board_once(
+        board="agentflow-hermes",
+        source=FakeBoardEventSource(db_identity="agentflow-hermes", events=[_semantic_refusal_event()]),
+        store=store,
+        contract_registry=_contracts(),
+        adapter=RealBoardAdapter(runner=runner, board="agentflow-hermes", board_db_path=board_db),
+        default_endpoint="discord:1497895797579190357",
+        apply=True,
+    )
+
+    assert result["cursor"] == 0
+    rows = {row["operation"]: row for row in store.list_outbox()}
+    assert rows["record_consumer_ack"]["last_error"] == "cli_runner_db_locked"

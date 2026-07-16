@@ -46,6 +46,26 @@ def _validate_exec_name(exec_name: str) -> str:
     return exec_name
 
 
+def _unit_path_environment(script_path: Path) -> str:
+    """PATH for systemd units that run AgentFlow.
+
+    The daemon invokes the Hermes CLI from subprocesses during live board
+    mutations. User systemd's default PATH can omit the repo venv and
+    ``~/.local/bin`` even when an interactive shell works, producing durable
+    ``cli_runner_error`` outbox rows. Render an explicit PATH into both units
+    so reinstall/update preserves the live deployment fix.
+    """
+    repo_root = script_path.parent.parent
+    entries = [
+        str(repo_root / ".venv" / "bin"),
+        "%h/.local/bin",
+        "/usr/local/bin",
+        "/usr/bin",
+        "/bin",
+    ]
+    return ":".join(entries)
+
+
 def render_agentflowd_service_unit(
     script_path: Path | str,
     *,
@@ -69,6 +89,7 @@ def render_agentflowd_service_unit(
         "\n"
         "[Service]\n"
         "Type=simple\n"
+        f"Environment=PATH={_unit_path_environment(validated_script)}\n"
         f"ExecStart={exec_start}\n"
         "Restart=on-failure\n"
         "RestartSec=5\n"
@@ -95,6 +116,7 @@ def render_reconcile_service_unit(script_path: Path | str, *, python_exec: str =
         "\n"
         "[Service]\n"
         "Type=oneshot\n"
+        f"Environment=PATH={_unit_path_environment(validated_script)}\n"
         f"ExecStart={exec_start}\n"
     )
 

@@ -568,8 +568,13 @@ class ContinuationStore:
         next_attempt_at: float | None = None,
         last_error: str | None = None,
     ) -> dict[str, Any]:
+        """Record one durable attempt outcome. Marking a row ``applied``
+        atomically clears the retry schedule (``next_attempt_at=0``) and the
+        stale ``last_error`` from the attempts that preceded convergence, so a
+        converged row never reads back as a still-failing one (M30I)."""
         self.init()
         now = time.time()
+        applied = state == "applied"
         with self.connect() as con:
             con.execute(
                 """
@@ -577,12 +582,12 @@ class ContinuationStore:
                     state=?,
                     board_task_id=coalesce(nullif(?,''), board_task_id),
                     attempts=attempts+1,
-                    next_attempt_at=coalesce(?, next_attempt_at),
-                    last_error=coalesce(?, last_error),
+                    next_attempt_at=case when ? then 0 else coalesce(?, next_attempt_at) end,
+                    last_error=case when ? then '' else coalesce(?, last_error) end,
                     updated_at=?
                 where id=?
                 """,
-                (state, board_task_id, next_attempt_at, last_error, now, outbox_id),
+                (state, board_task_id, applied, next_attempt_at, applied, last_error, now, outbox_id),
             )
             row = con.execute("select * from board_outbox where id=?", (outbox_id,)).fetchone()
         return dict(row)
@@ -625,6 +630,31 @@ class ContinuationStore:
             )
             updated = con.execute("select * from board_outbox where id=?", (row["id"],)).fetchone()
             return dict(updated)
+
+    def outbox_pending_retry_at(self, instance_id: int, *, now: float | None = None) -> float | None:
+        """Earliest ``next_attempt_at`` when this instance has pending outbox
+        rows and *none* of them are due yet; ``None`` when nothing is pending or
+        at least one row is due.
+
+        Callers use this to skip an entire materialize attempt while the durable
+        backoff is still running, so repeated event-loop scans cost zero state
+        transitions and durable growth stays O(due attempts) rather than
+        O(scans) (M30I).
+        """
+        self.init()
+        at = time.time() if now is None else now
+        with self.connect() as con:
+            row = con.execute(
+                """
+                select min(coalesce(next_attempt_at, 0)) as earliest
+                from board_outbox where continuation_id=? and state='pending'
+                """,
+                (instance_id,),
+            ).fetchone()
+        earliest = None if row is None else row["earliest"]
+        if earliest is None or float(earliest) <= at:
+            return None
+        return float(earliest)
 
     def list_outbox(self, *, state: str | None = None) -> list[dict[str, Any]]:
         self.init()
