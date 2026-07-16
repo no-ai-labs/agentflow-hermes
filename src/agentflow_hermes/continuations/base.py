@@ -59,6 +59,8 @@ def apply_board_operation(
         instance_id, step_id=str(step_id), operation=operation, payload=payload, idempotency_key=idempotency_key
     )
     row = enqueued["outbox"]
+    if operation == "schedule_origin_wake":
+        return _apply_schedule_origin_wake(store, row, payload, adapter)
     if row["state"] == "applied":
         return {"success": True, "task_id": row.get("board_task_id", "")}
     if row["state"] == "pending" and float(row.get("next_attempt_at") or 0) > time.time():
@@ -69,8 +71,6 @@ def apply_board_operation(
         result = adapter.create_task(payload)
     elif operation == "subscribe":
         result = adapter.subscribe(str(payload.get("task_id") or ""), str(payload.get("endpoint") or ""))
-    elif operation == "schedule_origin_wake":
-        result = adapter.schedule_origin_wake(str(payload.get("task_id") or ""), str(payload.get("endpoint") or ""))
     elif operation == "complete_owner_anchor":
         result = adapter.complete_owner_anchor(
             str(payload.get("task_id") or ""), receipt_ref=str(payload.get("receipt_ref") or "")
@@ -93,6 +93,50 @@ def apply_board_operation(
     delay = min(300.0, max(5.0, 5.0 * (2 ** min(attempts_after - 1, 6))))
     store.outbox_mark(row["id"], state="pending", next_attempt_at=time.time() + delay, last_error=safe_error)
     return {"success": False, "error": safe_error}
+
+
+def _apply_schedule_origin_wake(store: Any, row: dict[str, Any], payload: dict[str, Any], adapter: Any) -> dict[str, Any]:
+    task_id = str(payload.get("task_id") or "")
+    endpoint = str(payload.get("endpoint") or "")
+    if row["state"] == "applied":
+        if _origin_wake_satisfied(adapter, task_id, endpoint):
+            return {"success": True, "task_id": row.get("board_task_id", "")}
+        _mark_outbox_pending(store, row, "origin_wake_not_yet_accepted")
+        return {"success": False, "error": "origin_wake_not_yet_accepted"}
+    if row["state"] == "pending" and float(row.get("next_attempt_at") or 0) > time.time():
+        return {"success": False, "error": "outbox_retry_not_due"}
+    if adapter is None:
+        return {"success": False, "error": "no_adapter"}
+    if _origin_wake_satisfied(adapter, task_id, endpoint):
+        store.outbox_mark(row["id"], state="applied")
+        return {"success": True, "task_id": row.get("board_task_id", "")}
+    if str(row.get("last_error") or "") == "origin_wake_not_yet_accepted":
+        _mark_outbox_pending(store, row, "origin_wake_not_yet_accepted")
+        return {"success": False, "error": "origin_wake_not_yet_accepted"}
+    schedule = getattr(adapter, "schedule_origin_wake", None)
+    if schedule is None:
+        return {"success": False, "error": "adapter_missing_schedule_origin_wake"}
+    result = schedule(task_id, endpoint)
+    if result.get("success") and _origin_wake_satisfied(adapter, task_id, endpoint):
+        store.outbox_mark(row["id"], state="applied")
+        return {"success": True, "task_id": row.get("board_task_id", "")}
+    error = str(result.get("error") or "origin_wake_not_yet_accepted")[:200]
+    _mark_outbox_pending(store, row, error)
+    return {"success": False, "error": error}
+
+
+def _origin_wake_satisfied(adapter: Any, task_id: str, endpoint: str) -> bool:
+    check = getattr(adapter, "origin_wake_satisfied", None)
+    if check is None:
+        return False
+    result = check(task_id, endpoint)
+    return bool(result and result.get("success"))
+
+
+def _mark_outbox_pending(store: Any, row: dict[str, Any], error: str) -> None:
+    attempts_after = int(row.get("attempts") or 0) + 1
+    delay = min(300.0, max(5.0, 5.0 * (2 ** min(attempts_after - 1, 6))))
+    store.outbox_mark(row["id"], state="pending", next_attempt_at=time.time() + delay, last_error=error)
 
 
 def _has_failed_nested_ack(result: dict[str, Any]) -> bool:

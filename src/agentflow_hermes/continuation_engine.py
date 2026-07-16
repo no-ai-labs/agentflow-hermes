@@ -321,6 +321,18 @@ def reconcile_outbox(store: ContinuationStore, *, adapter_by_board: dict[str, An
     retried: list[str] = []
     failed: list[str] = []
     now = time.time()
+
+    def _mark_pending(row: dict[str, Any], error: str) -> None:
+        attempts_after = int(row.get("attempts") or 0) + 1
+        delay = min(300.0, max(5.0, 5.0 * (2 ** min(attempts_after - 1, 6))))
+        store.outbox_mark(row["id"], state="pending", next_attempt_at=time.time() + delay, last_error=error[:200])
+
+    def _origin_wake_satisfied(adapter: Any, task_id: str, endpoint: str) -> bool:
+        check = getattr(adapter, "origin_wake_satisfied", None)
+        if check is None:
+            return False
+        result = check(task_id, endpoint)
+        return bool(result and result.get("success"))
     with store.connect() as con:
         rows = [dict(r) for r in con.execute(
             """
@@ -341,7 +353,23 @@ def reconcile_outbox(store: ContinuationStore, *, adapter_by_board: dict[str, An
         elif operation == "subscribe":
             result = adapter.subscribe(str(payload.get("task_id") or ""), str(payload.get("endpoint") or ""))
         elif operation == "schedule_origin_wake":
-            result = adapter.schedule_origin_wake(str(payload.get("task_id") or ""), str(payload.get("endpoint") or ""))
+            task_id = str(payload.get("task_id") or "")
+            endpoint = str(payload.get("endpoint") or "")
+            # wake-origin scheduling is fire-and-forget: CLI success means a
+            # durable row was scheduled, not that the gateway accepted/started
+            # the active wake. Only origin_wake_satisfied is terminal.
+            if _origin_wake_satisfied(adapter, task_id, endpoint):
+                result = {"success": True, "source": "origin_wake_receipt"}
+            else:
+                # Once a schedule has been attempted, do not storm duplicate
+                # wake-origin calls while waiting for the durable receipt to
+                # move from scheduled to accepted/started/completed.
+                if str(row.get("last_error") or "") == "origin_wake_not_yet_accepted":
+                    result = {"success": False, "error": "origin_wake_not_yet_accepted"}
+                else:
+                    result = adapter.schedule_origin_wake(task_id, endpoint)
+                    if result.get("success") and not _origin_wake_satisfied(adapter, task_id, endpoint):
+                        result = {"success": False, "error": "origin_wake_not_yet_accepted", "scheduled": True}
         elif operation == "complete_owner_anchor":
             result = adapter.complete_owner_anchor(str(payload.get("task_id") or ""), receipt_ref=str(payload.get("receipt_ref") or ""))
         else:
@@ -356,9 +384,7 @@ def reconcile_outbox(store: ContinuationStore, *, adapter_by_board: dict[str, An
             retried.append(row["idempotency_key"])
         else:
             error = str(result.get("error") or "adapter_error")[:200]
-            attempts_after = int(row.get("attempts") or 0) + 1
-            delay = min(300.0, max(5.0, 5.0 * (2 ** min(attempts_after - 1, 6))))
-            store.outbox_mark(row["id"], state="pending", next_attempt_at=time.time() + delay, last_error=error)
+            _mark_pending(row, error)
             failed.append(row["idempotency_key"])
     return {"retried": retried, "failed": failed, "pending_before": len(rows)}
 

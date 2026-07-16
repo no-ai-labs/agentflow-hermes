@@ -191,6 +191,44 @@ def test_semantic_refusal_scheduled_not_yet_accepted_leaves_cursor_retryable_the
     assert len(store.list_requirement_satisfactions(instance["id"])) == 1
 
 
+def test_semantic_refusal_poisoned_applied_wake_row_rechecks_receipt_before_ack(tmp_path):
+    """Defense in depth: a legacy reconcile bug may have marked a scheduled-only
+    wake outbox row applied. The handler must still recheck the durable wake
+    receipt before recording semantic_refusal ACK or advancing the cursor."""
+    store = ContinuationStore(tmp_path / "agentflow.sqlite")
+    label, run_metadata, summary = _UNSAFE_CASES[0]
+    adapter = _PendingWakeAdapter()
+
+    first = _ingest(store, adapter, [_unsafe_event(run_metadata, summary)])
+    assert first["results"][0]["router_success"] is False
+    assert store.get_cursor("warroom-os", "warroom-os-db") == 0
+    instance = store.list_instances()[0]
+    assert store.list_requirement_satisfactions(instance["id"]) == []
+
+    # Simulate the poisoned pre-fix reconcile state: applied outbox without an
+    # accepted/started/completed durable origin wake receipt.
+    with store.connect() as con:
+        con.execute("update board_outbox set state='applied', next_attempt_at=0, last_error=''")
+
+    poisoned_retry = _ingest(store, adapter, [_unsafe_event(run_metadata, summary)])
+    assert poisoned_retry["results"][0]["router_success"] is False
+    assert store.get_cursor("warroom-os", "warroom-os-db") == 0
+    assert store.list_requirement_satisfactions(instance["id"]) == []
+    rows = store.list_outbox()
+    assert rows[0]["state"] == "pending"
+    assert rows[0]["last_error"] == "origin_wake_not_yet_accepted"
+
+    adapter.satisfied_origin_wakes.add(("t_89e3c71f", "discord:#research"))
+    with store.connect() as con:
+        con.execute("update board_outbox set next_attempt_at=0")
+    accepted_retry = _ingest(store, adapter, [_unsafe_event(run_metadata, summary)])
+    assert accepted_retry["results"][0]["router_success"] is True
+    assert store.get_cursor("warroom-os", "warroom-os-db") == 7305
+    assert store.list_instances()[0]["state"] == "blocked_invalid"
+    assert len(store.list_requirement_satisfactions(instance["id"])) == 1
+    assert adapter.scheduled_origin_wakes == [("t_89e3c71f", "discord:#research")]
+
+
 def test_semantic_refusal_prior_wake_receipt_skips_schedule_entirely(tmp_path):
     """A durable prior wake receipt short-circuits straight to the ACK --
     zero notify-subscribe and zero wake-origin calls."""

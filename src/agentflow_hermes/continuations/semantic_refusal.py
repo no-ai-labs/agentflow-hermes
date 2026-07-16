@@ -187,7 +187,13 @@ class SemanticRefusalHandler:
         )
         row = enqueued["outbox"]
         if row["state"] == "applied":
-            return {"success": True, "source": "outbox_applied"}
+            # Defense in depth for stale poisoned rows written by older
+            # reconcile code: an applied outbox state is only trusted when the
+            # authoritative durable wake receipt is now satisfied.
+            if self._origin_wake_satisfied(adapter, task_id, endpoint):
+                return {"success": True, "source": "outbox_applied_receipt_verified"}
+            self._mark_wake_pending(store, row)
+            return {"success": False, "error": "origin_wake_not_yet_accepted"}
 
         if self._origin_wake_satisfied(adapter, task_id, endpoint):
             store.outbox_mark(row["id"], state="applied")

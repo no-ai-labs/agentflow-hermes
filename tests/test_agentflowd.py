@@ -473,6 +473,74 @@ def test_reconcile_outbox_is_idempotent_on_restart(tmp_path):
     assert len(adapter.tasks) == 1
 
 
+class _ScheduledOnlyWakeAdapter(FakeBoardAdapter):
+    def schedule_origin_wake(self, task_id: str, endpoint: str) -> dict[str, Any]:
+        pair = (task_id, endpoint)
+        if pair not in self.scheduled_origin_wakes:
+            self.scheduled_origin_wakes.append(pair)
+        return {"success": True, "scheduled": True}
+
+
+def test_reconcile_outbox_schedule_origin_wake_scheduled_only_stays_pending_bounded(tmp_path):
+    store = ContinuationStore(tmp_path / "agentflow.sqlite")
+    created = store.create_instance(board="b1", source_task_id="t_1", source_event_id="ev_1", source_graph_id="g_1")
+    instance_id = created["instance"]["id"]
+    store.outbox_enqueue(
+        instance_id,
+        step_id="0",
+        operation="schedule_origin_wake",
+        payload={"task_id": "t_1", "endpoint": "discord:#research"},
+        idempotency_key="wake:k1",
+    )
+    adapter = _ScheduledOnlyWakeAdapter()
+
+    report = reconcile_outbox(store, adapter_by_board={"b1": adapter})
+
+    assert report["pending_before"] == 1
+    assert report["retried"] == []
+    assert report["failed"] == ["wake:k1"]
+    rows = store.list_outbox()
+    assert rows[0]["state"] == "pending"
+    assert rows[0]["last_error"] == "origin_wake_not_yet_accepted"
+    assert rows[0]["next_attempt_at"] > 0
+    assert rows[0]["attempts"] == 1
+    assert adapter.scheduled_origin_wakes == [("t_1", "discord:#research")]
+
+    # Immediate reconcile is not due and must not issue a duplicate wake storm.
+    second = reconcile_outbox(store, adapter_by_board={"b1": adapter})
+    assert second["pending_before"] == 0
+    assert adapter.scheduled_origin_wakes == [("t_1", "discord:#research")]
+
+
+def test_reconcile_outbox_schedule_origin_wake_applies_after_durable_receipt_once(tmp_path):
+    store = ContinuationStore(tmp_path / "agentflow.sqlite")
+    created = store.create_instance(board="b1", source_task_id="t_1", source_event_id="ev_1", source_graph_id="g_1")
+    instance_id = created["instance"]["id"]
+    store.outbox_enqueue(
+        instance_id,
+        step_id="0",
+        operation="schedule_origin_wake",
+        payload={"task_id": "t_1", "endpoint": "discord:#research"},
+        idempotency_key="wake:k1",
+    )
+    adapter = _ScheduledOnlyWakeAdapter()
+
+    reconcile_outbox(store, adapter_by_board={"b1": adapter})
+    adapter.satisfied_origin_wakes.add(("t_1", "discord:#research"))
+    with store.connect() as con:
+        con.execute("update board_outbox set next_attempt_at=0")
+
+    report = reconcile_outbox(store, adapter_by_board={"b1": adapter})
+    assert report["retried"] == ["wake:k1"]
+    rows = store.list_outbox()
+    assert rows[0]["state"] == "applied"
+    assert adapter.scheduled_origin_wakes == [("t_1", "discord:#research")]
+
+    restart = reconcile_outbox(store, adapter_by_board={"b1": adapter})
+    assert restart["pending_before"] == 0
+    assert adapter.scheduled_origin_wakes == [("t_1", "discord:#research")]
+
+
 # -- single instance lock ----------------------------------------------------
 
 
