@@ -35,7 +35,7 @@ from typing import Any
 
 from ..continuation_store import ContinuationState, ContinuationStore
 from ..outcome import ContinuationKind, OutcomeEnvelope
-from .base import StepResult
+from .base import StepResult, apply_board_operation
 
 
 def _stable_digest(instance: dict[str, Any]) -> str:
@@ -114,10 +114,29 @@ class SemanticRefusalHandler:
             if not wake.get("success"):
                 return self._fail(store, instance_id, str(wake.get("error") or "refusal_wake_not_yet_accepted"))
             wake_satisfied = True
+        else:
+            return self._fail(store, instance_id, "semantic_refusal_origin_missing")
 
-        # 2) Durable semantic-refusal ACK (idempotent upsert on field_name),
-        # recorded only after the trusted-origin wake is known to be durably
-        # accepted/started/completed.
+        consumer_ack = apply_board_operation(
+            store,
+            instance_id,
+            step_id="0",
+            operation="record_consumer_ack",
+            payload={
+                "task_id": outcome.source_task_id,
+                "endpoint": endpoint,
+                "status": "semantic_refusal_ack",
+            },
+            idempotency_key=f"semantic_refusal_consumer_ack:{digest}:{endpoint}",
+            adapter=adapter,
+        )
+        if not consumer_ack.get("success"):
+            return self._fail(store, instance_id, str(consumer_ack.get("error") or "consumer_ack_failed"))
+
+        # 2) Internal requirement ACK (idempotent upsert on field_name),
+        # recorded only after the trusted-origin wake and durable Hermes
+        # consumer ACK are both verified. The internal row is not a substitute
+        # for the public Hermes consumer-ack boundary.
         store.record_requirement_satisfaction(
             instance_id,
             field_name="semantic_refusal",
@@ -137,6 +156,7 @@ class SemanticRefusalHandler:
                 "instance_id": instance_id,
                 "created": creation["created"],
                 "refusal_ack": True,
+                "consumer_ack_status": "semantic_refusal_ack",
                 "refusal_categories": list(refusal_categories),
                 "subscribed": wake_satisfied,
                 "endpoint": endpoint,

@@ -165,6 +165,21 @@ class CodeFixHandler:
             )
             if not sub.get("success"):
                 return self._fail(store, instance_id, "review_subscribe_failed", instance_id_meta=instance_id)
+            consumer_ack = apply_board_operation(
+                store,
+                instance_id,
+                step_id="0",
+                operation="record_consumer_ack",
+                payload={
+                    "task_id": outcome.source_task_id,
+                    "endpoint": endpoint,
+                    "status": "semantic_block_remediation_created",
+                },
+                idempotency_key=f"code_fix_consumer_ack:{review_key}:{endpoint}",
+                adapter=adapter,
+            )
+            if not consumer_ack.get("success"):
+                return self._fail(store, instance_id, "consumer_ack_failed", instance_id_meta=instance_id)
             subscribed = True
 
         if instance["state"] == ContinuationState.MATERIALIZING.value:
@@ -179,6 +194,7 @@ class CodeFixHandler:
                 "fix_task_id": fix_task_id,
                 "review_task_id": review_task_id,
                 "subscribed": subscribed,
+                "consumer_ack_status": "semantic_block_remediation_created" if subscribed else "",
                 "endpoint": endpoint,
             },
         )

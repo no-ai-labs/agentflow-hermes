@@ -70,6 +70,10 @@ def test_flat_block_becomes_code_fix_graph_with_notify_wake(tmp_path):
     assert adapter.subscriptions == [(review["task_id"], "discord:#research")]
     # Review is independent and linked to the fix, not the fix itself.
     assert review["parent_task_id"] == fix["task_id"]
+    # Typed Hermes consumer ACK recorded only after the fix+review graph and
+    # return-edge subscription are durable.
+    assert adapter.consumer_acks == [("t_89e3c71f", "discord:#research", "semantic_block_remediation_created")]
+    assert item["code_fix"]["consumer_ack_status"] == "semantic_block_remediation_created"
 
     # Durable instance/steps reflect the materialized graph.
     instances = store.list_instances()
@@ -185,6 +189,49 @@ def test_code_fix_nested_ack_failure_on_review_subscribe_fails_closed_then_retry
     assert second["results"][0]["router_success"] is True
     assert working.tasks == {}
     assert len(working.subscriptions) == 1
+    assert store.get_cursor("warroom-os", "warroom-os-db") == 7305
+    assert len(store.list_instances()) == 1
+    assert store.list_instances()[0]["state"] == "waiting_review"
+
+
+class _FailingConsumerAckAdapter(FakeBoardAdapter):
+    """The review subscribe succeeds and is durable, but the typed Hermes
+    consumer ACK fails -- mirrors a CLI consumer-ack-origin call erroring out
+    after the graph/return-edge are already applied."""
+
+    def record_consumer_ack(self, task_id: str, endpoint: str, status: str) -> dict[str, Any]:
+        return {"success": False, "error": "consumer_ack_cli_failed"}
+
+
+def test_code_fix_consumer_ack_failure_fails_closed_then_retry_succeeds_once(tmp_path):
+    store = ContinuationStore(tmp_path / "agentflow.sqlite")
+
+    failing = _FailingConsumerAckAdapter()
+    first = _ingest(store, failing, [_t89_event()])
+
+    item = first["results"][0]
+    assert item["action"] == "code_fix_applied"
+    assert item["router_success"] is False
+    # Fail closed: cursor did not advance despite the fix/review graph and
+    # return-edge subscription already being durable.
+    assert store.get_cursor("warroom-os", "warroom-os-db") == 0
+    instance = store.list_instances()[0]
+    assert instance["state"] == "failed_retryable"
+    assert len(failing.tasks) == 2
+    assert len(failing.subscriptions) == 1
+    assert failing.consumer_acks == []
+
+    # Retry with a working adapter after the durable backoff is due: the
+    # already-applied fix/review/subscribe steps dedupe locally, exactly one
+    # consumer ACK is recorded, and the cursor advances exactly once.
+    with store.connect() as con:
+        con.execute("update board_outbox set next_attempt_at=0")
+    working = FakeBoardAdapter()
+    second = _ingest(store, working, [_t89_event()])
+    assert second["results"][0]["router_success"] is True
+    assert working.tasks == {}
+    assert working.subscriptions == []
+    assert working.consumer_acks == [("t_89e3c71f", "discord:#research", "semantic_block_remediation_created")]
     assert store.get_cursor("warroom-os", "warroom-os-db") == 7305
     assert len(store.list_instances()) == 1
     assert store.list_instances()[0]["state"] == "waiting_review"

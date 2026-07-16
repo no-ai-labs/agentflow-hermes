@@ -61,6 +61,8 @@ def apply_board_operation(
     row = enqueued["outbox"]
     if operation == "schedule_origin_wake":
         return _apply_schedule_origin_wake(store, row, payload, adapter)
+    if operation == "record_consumer_ack":
+        return _apply_record_consumer_ack(store, row, payload, adapter)
     if row["state"] == "applied":
         return {"success": True, "task_id": row.get("board_task_id", "")}
     if row["state"] == "pending" and float(row.get("next_attempt_at") or 0) > time.time():
@@ -131,6 +133,37 @@ def _origin_wake_satisfied(adapter: Any, task_id: str, endpoint: str) -> bool:
         return False
     result = check(task_id, endpoint)
     return bool(result and result.get("success"))
+
+
+def _apply_record_consumer_ack(store: Any, row: dict[str, Any], payload: dict[str, Any], adapter: Any) -> dict[str, Any]:
+    task_id = str(payload.get("task_id") or "")
+    endpoint = str(payload.get("endpoint") or "")
+    status = str(payload.get("status") or "")
+    if adapter is None:
+        return {"success": False, "error": "no_adapter"}
+    check = getattr(adapter, "consumer_ack_satisfied", None)
+    if row["state"] == "applied":
+        if check is not None:
+            verified = check(task_id, endpoint, status)
+            if verified and verified.get("success"):
+                return {"success": True, "task_id": row.get("board_task_id", "")}
+        _mark_outbox_pending(store, row, "consumer_ack_not_verified")
+        return {"success": False, "error": "consumer_ack_not_verified"}
+    if row["state"] == "pending" and float(row.get("next_attempt_at") or 0) > time.time():
+        return {"success": False, "error": "outbox_retry_not_due"}
+    record = getattr(adapter, "record_consumer_ack", None)
+    if record is None:
+        return {"success": False, "error": "adapter_missing_record_consumer_ack"}
+    result = record(task_id, endpoint, status)
+    if result.get("success"):
+        verified = check(task_id, endpoint, status) if check is not None else result
+        if verified and verified.get("success"):
+            store.outbox_mark(row["id"], state="applied")
+            return {"success": True, "task_id": row.get("board_task_id", "")}
+        result = {"success": False, "error": "consumer_ack_not_verified", "ack": verified}
+    error = str(result.get("error") or "consumer_ack_failed")[:200]
+    _mark_outbox_pending(store, row, error)
+    return {"success": False, "error": error}
 
 
 def _mark_outbox_pending(store: Any, row: dict[str, Any], error: str) -> None:

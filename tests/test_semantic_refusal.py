@@ -277,14 +277,15 @@ def test_semantic_refusal_reinterprets_legacy_subscribe_outbox_row(tmp_path):
     result = _ingest(store, adapter, [_unsafe_event(run_metadata, summary)])
 
     assert result["results"][0]["router_success"] is True
-    rows = store.list_outbox()
-    assert len(rows) == 1
-    assert rows[0]["id"] == legacy["id"]
-    assert rows[0]["operation"] == "schedule_origin_wake"
-    assert rows[0]["idempotency_key"].startswith("semantic_refusal_wake:")
-    assert rows[0]["state"] == "applied"
+    rows = {row["operation"]: row for row in store.list_outbox()}
+    assert len(rows) == 2
+    assert rows["schedule_origin_wake"]["id"] == legacy["id"]
+    assert rows["schedule_origin_wake"]["idempotency_key"].startswith("semantic_refusal_wake:")
+    assert rows["schedule_origin_wake"]["state"] == "applied"
+    assert rows["record_consumer_ack"]["state"] == "applied"
     assert adapter.subscriptions == []
     assert adapter.scheduled_origin_wakes == [("t_89e3c71f", "discord:#research")]
+    assert adapter.consumer_acks == [("t_89e3c71f", "discord:#research", "semantic_refusal_ack")]
 
 
 def test_dry_run_semantic_refusal_is_proposal_only_no_board_writes(tmp_path):

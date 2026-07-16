@@ -125,6 +125,7 @@ class FakeBoardAdapter:
         self.subscriptions: list[tuple[str, str]] = []
         self.scheduled_origin_wakes: list[tuple[str, str]] = []
         self.satisfied_origin_wakes: set[tuple[str, str]] = set()
+        self.consumer_acks: list[tuple[str, str, str]] = []
         self.blocked: list[tuple[str, str]] = []
         self.comments: list[tuple[str, str]] = []
         self.completed: list[tuple[str, str]] = []
@@ -161,6 +162,17 @@ class FakeBoardAdapter:
             self.scheduled_origin_wakes.append(pair)
         self.satisfied_origin_wakes.add(pair)
         return {"success": True, "scheduled": True}
+
+    def consumer_ack_satisfied(self, task_id: str, endpoint: str, status: str) -> dict[str, Any]:
+        if (task_id, endpoint, status) in self.consumer_acks:
+            return {"success": True, "consumer_ack_status": status}
+        return {"success": False, "error": "consumer_ack_missing"}
+
+    def record_consumer_ack(self, task_id: str, endpoint: str, status: str) -> dict[str, Any]:
+        pair = (task_id, endpoint, status)
+        if pair not in self.consumer_acks:
+            self.consumer_acks.append(pair)
+        return {"success": True, "consumer_ack_status": status}
 
     def comment(self, task_id: str, body: str) -> dict[str, Any]:
         pair = (task_id, body)
@@ -428,6 +440,45 @@ class RealBoardAdapter:
             "consumer_ack_status": consumer_ack_status or "",
         }
 
+    def consumer_ack_satisfied(self, task_id: str, endpoint: str, status: str) -> dict[str, Any]:
+        """Verify a durable Hermes consumer ACK receipt for the task origin."""
+        origin_flags = _map_origin_to_flags(endpoint)
+        if not origin_flags:
+            return {"success": False, "error": "unparseable_origin_endpoint"}
+        if origin_flags["platform"] == "discord":
+            chat_key = origin_flags["chat_id"].lstrip("#")
+            origin_flags["chat_id"] = _DISCORD_CHANNEL_ALIASES.get(chat_key, origin_flags["chat_id"])
+            if not origin_flags["chat_id"].isdigit():
+                return {"success": False, "error": "discord_chat_id_not_numeric"}
+        try:
+            conn = sqlite3.connect(str(self.board_db_path))
+        except Exception:
+            return {"success": False, "error": "canonical_db_connect_failed"}
+        try:
+            if not (_table_exists(conn, "kanban_task_origin") and _table_exists(conn, "kanban_notify_receipts")):
+                return {"success": False, "error": "receipt_schema_missing"}
+            row = conn.execute(
+                """
+                SELECT r.consumer_ack_status
+                  FROM kanban_task_origin o
+                  JOIN kanban_notify_receipts r
+                    ON r.task_id=o.task_id AND r.platform=o.platform
+                   AND r.chat_id=o.chat_id AND r.thread_id=o.thread_id
+                 WHERE o.task_id=? AND o.platform=? AND o.chat_id=? AND o.thread_id=?
+                """,
+                (task_id, origin_flags["platform"], origin_flags["chat_id"], origin_flags.get("thread_id", "")),
+            ).fetchone()
+            if row is None:
+                return {"success": False, "error": "consumer_ack_missing"}
+            actual = row[0] or ""
+            if actual != status:
+                return {"success": False, "error": "consumer_ack_status_mismatch", "consumer_ack_status": actual}
+            return {"success": True, "consumer_ack_status": actual}
+        except Exception:
+            return {"success": False, "error": "consumer_ack_verify_failed"}
+        finally:
+            conn.close()
+
     def schedule_origin_wake(self, task_id: str, endpoint: str) -> dict[str, Any]:
         """Schedule a durable origin wake through Hermes CLI, fail-closed.
 
@@ -444,6 +495,26 @@ class RealBoardAdapter:
                 argv += ["--thread-id", origin_flags["thread_id"]]
         argv += ["--json"]
         return self._run_json(argv)
+
+    def record_consumer_ack(self, task_id: str, endpoint: str, status: str) -> dict[str, Any]:
+        """Record a typed semantic ACK via Hermes' public CLI, never direct DB."""
+        origin_flags = _map_origin_to_flags(endpoint)
+        argv = [self.hermes_bin, "kanban", "--board", self.board, "consumer-ack-origin", task_id, "--status", status]
+        if origin_flags:
+            if origin_flags["platform"] == "discord":
+                chat_key = origin_flags["chat_id"].lstrip("#")
+                origin_flags["chat_id"] = _DISCORD_CHANNEL_ALIASES.get(chat_key, origin_flags["chat_id"])
+            argv += ["--platform", origin_flags["platform"], "--chat-id", origin_flags["chat_id"]]
+            if origin_flags.get("thread_id"):
+                argv += ["--thread-id", origin_flags["thread_id"]]
+        argv += ["--json"]
+        result = self._run_json(argv)
+        if not result.get("success"):
+            return result
+        verified = self.consumer_ack_satisfied(task_id, endpoint, status)
+        if not verified.get("success"):
+            return {"success": False, "error": verified.get("error", "consumer_ack_verify_failed"), "ack": verified}
+        return {**result, "ack": verified}
 
     def _ensure_durable_ack_rows(
         self, task_id: str, *, platform: str, chat_id: str, thread_id: str = ""
