@@ -319,9 +319,16 @@ def reconcile_outbox(store: ContinuationStore, *, adapter_by_board: dict[str, An
     import json as _json
 
     retried: list[str] = []
+    failed: list[str] = []
+    now = time.time()
     with store.connect() as con:
         rows = [dict(r) for r in con.execute(
-            "select o.*, c.board as board from board_outbox o join continuation_instances c on c.id=o.continuation_id where o.state='pending'"
+            """
+            select o.*, c.board as board
+            from board_outbox o join continuation_instances c on c.id=o.continuation_id
+            where o.state='pending' and coalesce(o.next_attempt_at, 0) <= ?
+            """,
+            (now,),
         ).fetchall()]
     for row in rows:
         adapter = adapter_by_board.get(row["board"])
@@ -333,6 +340,8 @@ def reconcile_outbox(store: ContinuationStore, *, adapter_by_board: dict[str, An
             result = adapter.create_task(payload)
         elif operation == "subscribe":
             result = adapter.subscribe(str(payload.get("task_id") or ""), str(payload.get("endpoint") or ""))
+        elif operation == "schedule_origin_wake":
+            result = adapter.schedule_origin_wake(str(payload.get("task_id") or ""), str(payload.get("endpoint") or ""))
         elif operation == "complete_owner_anchor":
             result = adapter.complete_owner_anchor(str(payload.get("task_id") or ""), receipt_ref=str(payload.get("receipt_ref") or ""))
         else:
@@ -345,7 +354,13 @@ def reconcile_outbox(store: ContinuationStore, *, adapter_by_board: dict[str, An
                 with contextlib.suppress(Exception):
                     store.mark_step(int(step_id), state="applied", board_task_id=task_id)
             retried.append(row["idempotency_key"])
-    return {"retried": retried, "pending_before": len(rows)}
+        else:
+            error = str(result.get("error") or "adapter_error")[:200]
+            attempts_after = int(row.get("attempts") or 0) + 1
+            delay = min(300.0, max(5.0, 5.0 * (2 ** min(attempts_after - 1, 6))))
+            store.outbox_mark(row["id"], state="pending", next_attempt_at=time.time() + delay, last_error=error)
+            failed.append(row["idempotency_key"])
+    return {"retried": retried, "failed": failed, "pending_before": len(rows)}
 
 
 def ingest_board_once(

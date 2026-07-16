@@ -125,8 +125,11 @@ def test_code_fix_apply_failure_leaves_cursor_retryable_then_retry_dedupes(tmp_p
     instance = store.list_instances()[0]
     assert instance["state"] == "failed_retryable"
 
-    # Retry the same event with a working adapter: exactly one fix/review graph,
-    # cursor advances, and no phantom duplicate from the failed attempt.
+    # Retry the same event with a working adapter after the durable backoff is
+    # due: exactly one fix/review graph, cursor advances, and no phantom
+    # duplicate from the failed attempt.
+    with store.connect() as con:
+        con.execute("update board_outbox set next_attempt_at=0")
     working = FakeBoardAdapter()
     second = _ingest(store, working, [_t89_event()])
     assert second["results"][0]["router_success"] is True
@@ -171,10 +174,12 @@ def test_code_fix_nested_ack_failure_on_review_subscribe_fails_closed_then_retry
     assert len(failing.tasks) == 2
     assert len(failing.subscriptions) == 1
 
-    # Retry with a working adapter: the already-applied create_task steps
-    # dedupe locally (zero duplicate tasks against the new adapter), exactly
-    # one new review subscription/wake succeeds, and the retry advances
-    # exactly once.
+    # Retry with a working adapter after the durable backoff is due: the
+    # already-applied create_task steps dedupe locally (zero duplicate tasks
+    # against the new adapter), exactly one new review subscription/wake
+    # succeeds, and the retry advances exactly once.
+    with store.connect() as con:
+        con.execute("update board_outbox set next_attempt_at=0")
     working = FakeBoardAdapter()
     second = _ingest(store, working, [_t89_event()])
     assert second["results"][0]["router_success"] is True

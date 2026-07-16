@@ -147,8 +147,10 @@ def test_semantic_refusal_notify_failure_leaves_cursor_retryable_then_retry(tmp_
     assert instance["state"] == "failed_retryable"
     assert store.list_requirement_satisfactions(instance["id"]) == []
 
-    # Retry with a working adapter: refusal completes, cursor advances, one ACK,
-    # one subscription, no duplicate instance.
+    # Retry with a working adapter after the durable backoff becomes due:
+    # refusal completes, cursor advances, one ACK, one subscription, no duplicate instance.
+    with store.connect() as con:
+        con.execute("update board_outbox set next_attempt_at=0")
     working = FakeBoardAdapter()
     second = _ingest(store, working, [_unsafe_event(run_metadata, summary)])
     assert second["results"][0]["router_success"] is True
@@ -188,8 +190,11 @@ def test_semantic_refusal_nested_ack_failure_fails_closed_then_retry_succeeds_on
     assert instance["state"] == "failed_retryable"
     assert store.list_requirement_satisfactions(instance["id"]) == []
 
-    # Retry with a working adapter: exactly one wake/refusal receipt, zero
-    # duplicate tasks/wakes, and the retry advances exactly once.
+    # Retry with a working adapter after the durable backoff becomes due:
+    # exactly one wake/refusal receipt, zero duplicate tasks/wakes, and the
+    # retry advances exactly once.
+    with store.connect() as con:
+        con.execute("update board_outbox set next_attempt_at=0")
     working = FakeBoardAdapter()
     second = _ingest(store, working, [_unsafe_event(run_metadata, summary)])
     assert second["results"][0]["router_success"] is True

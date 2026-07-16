@@ -147,26 +147,62 @@ def _board_has_notify_rows(db_path: str | Path) -> bool:
         conn.close()
 
 
-def _store_cursor_status(store: ContinuationStore, board: str, db_identity: str) -> tuple[int, bool]:
-    """Read cursor state without initializing or migrating the canonical store."""
+# Cursor columns this surface knows how to read, most canonical first. The
+# canonical schema is board_cursors(board, db_identity, last_event_id,
+# updated_at); anything else must fail closed rather than be guessed at.
+_KNOWN_CURSOR_COLUMNS = ("last_event_id",)
+
+
+def _store_cursor_status(store: ContinuationStore, board: str, db_identity: str) -> dict[str, Any]:
+    """Read cursor state without initializing or migrating the canonical store.
+
+    Returns the exact cursor when the known schema is present. A cursor that
+    cannot be read truthfully (unreadable DB, missing/unknown cursor schema) is
+    reported as an explicit error with ``cursor``/``cursor_seeded`` left unset:
+    doctor and live status must never report a malformed store as a healthy
+    ``cursor=0, cursor_seeded=false`` board.
+    """
     if not store.path.exists():
-        return 0, False
+        # The daemon has simply never run: no cursor exists yet, and saying so
+        # is truthful rather than a swallowed error.
+        return {"status": "uninitialized", "cursor": 0, "cursor_seeded": False, "error": "", "warning": ""}
     try:
         conn = sqlite3.connect(f"file:{store.path}?mode=ro", uri=True)
     except sqlite3.Error:
-        return 0, False
+        return _cursor_error("cursor_db_unavailable")
     try:
+        columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(board_cursors)")}
+        if not columns:
+            return _cursor_error("cursor_table_missing")
+        column = next((c for c in _KNOWN_CURSOR_COLUMNS if c in columns), "")
+        if not column:
+            return _cursor_error("cursor_column_unknown")
         row = conn.execute(
-            "select last_seq from board_cursors where board=? and db_identity=?",
+            f"select {column} from board_cursors where board=? and db_identity=?",
             (board, db_identity),
         ).fetchone()
     except sqlite3.Error:
-        return 0, False
+        return _cursor_error("cursor_read_failed")
     finally:
         conn.close()
     if row is None:
-        return 0, False
-    return int(row[0] or 0), True
+        # A board discovered before its first cursor write: genuinely unseeded.
+        return {"status": "ok", "cursor": 0, "cursor_seeded": False, "error": "", "warning": ""}
+    try:
+        cursor = int(row[0] or 0)
+    except (TypeError, ValueError):
+        return _cursor_error("cursor_value_malformed")
+    return {"status": "ok", "cursor": cursor, "cursor_seeded": True, "error": "", "warning": ""}
+
+
+def _cursor_error(error: str) -> dict[str, Any]:
+    return {
+        "status": "error",
+        "cursor": None,
+        "cursor_seeded": None,
+        "error": error,
+        "warning": "cursor_status_unavailable",
+    }
 
 
 def _board_protection_verdict(entry: BoardRegistryEntry, *, apply: bool) -> dict[str, Any]:
@@ -249,9 +285,10 @@ def runtime_report(
             "effective_semantic_protection"
         ]
         if store is not None:
-            cursor, cursor_seeded = _store_cursor_status(store, board, db_identity)
-            board_row["cursor"] = cursor
-            board_row["cursor_seeded"] = cursor_seeded
+            cursor_status = _store_cursor_status(store, board, db_identity)
+            board_row["cursor"] = cursor_status["cursor"]
+            board_row["cursor_seeded"] = cursor_status["cursor_seeded"]
+            board_row["cursor_status"] = cursor_status
         boards.append(board_row)
 
     warnings = [
@@ -259,6 +296,11 @@ def runtime_report(
         for b in boards
         if b["protection_verdict"]["warning"]
     ]
+    warnings.extend(
+        {"board": b["board"], "warning": b["cursor_status"]["warning"], "missing": [b["cursor_status"]["error"]]}
+        for b in boards
+        if b.get("cursor_status", {}).get("warning")
+    )
 
     continuation_runtime = {
         "runtime": "global_continuation_daemon",

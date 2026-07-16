@@ -7,6 +7,7 @@ fake/real adapter split in ``graph_creator.py``.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -58,14 +59,18 @@ def apply_board_operation(
         instance_id, step_id=str(step_id), operation=operation, payload=payload, idempotency_key=idempotency_key
     )
     row = enqueued["outbox"]
-    if row["state"] == "applied" and row.get("board_task_id"):
-        return {"success": True, "task_id": row["board_task_id"]}
+    if row["state"] == "applied":
+        return {"success": True, "task_id": row.get("board_task_id", "")}
+    if row["state"] == "pending" and float(row.get("next_attempt_at") or 0) > time.time():
+        return {"success": False, "error": "outbox_retry_not_due"}
     if adapter is None:
         return {"success": False, "error": "no_adapter"}
     if operation == "create_task":
         result = adapter.create_task(payload)
     elif operation == "subscribe":
         result = adapter.subscribe(str(payload.get("task_id") or ""), str(payload.get("endpoint") or ""))
+    elif operation == "schedule_origin_wake":
+        result = adapter.schedule_origin_wake(str(payload.get("task_id") or ""), str(payload.get("endpoint") or ""))
     elif operation == "complete_owner_anchor":
         result = adapter.complete_owner_anchor(
             str(payload.get("task_id") or ""), receipt_ref=str(payload.get("receipt_ref") or "")
@@ -76,12 +81,18 @@ def apply_board_operation(
         task_id = result.get("task_id", "")
         store.outbox_mark(row["id"], state="applied", board_task_id=task_id)
         return {"success": True, "task_id": task_id}
-    store.outbox_mark(row["id"], state="pending")
     error = result.get("error")
     if not error and _has_failed_nested_ack(result):
         ack = result.get("ack")
         error = ack.get("error", "ack_ensure_failed") if isinstance(ack, dict) else "ack_malformed"
-    return {"success": False, "error": error or "adapter_error"}
+    safe_error = str(error or "adapter_error")[:200]
+    attempts_after = int(row.get("attempts") or 0) + 1
+    # Durable exponential-ish backoff with a bounded floor/ceiling: enough to
+    # prevent the 100+ attempts/seconds hot loop while still allowing a daemon
+    # restart or reconcile pass to make a single due retry after recovery.
+    delay = min(300.0, max(5.0, 5.0 * (2 ** min(attempts_after - 1, 6))))
+    store.outbox_mark(row["id"], state="pending", next_attempt_at=time.time() + delay, last_error=safe_error)
+    return {"success": False, "error": safe_error}
 
 
 def _has_failed_nested_ack(result: dict[str, Any]) -> bool:

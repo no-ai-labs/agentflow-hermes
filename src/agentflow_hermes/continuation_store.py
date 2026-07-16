@@ -126,6 +126,24 @@ create table if not exists store_migration_receipts (
 create index if not exists idx_store_migration_receipts_path on store_migration_receipts(legacy_path, migrated_at);
 """
 
+_OUTBOX_RETRY_COLUMNS: dict[str, str] = {
+    "next_attempt_at": "REAL NOT NULL DEFAULT 0",
+    "last_error": "TEXT NOT NULL DEFAULT ''",
+}
+
+
+def _ensure_outbox_retry_columns(con: sqlite3.Connection) -> None:
+    """Add durable retry/backoff metadata to existing continuation stores.
+
+    The shared migration chain is intentionally conservative because it also
+    serves the older AgentFlow jobs DB. These columns are scoped to the
+    ContinuationStore init path and are additive/idempotent for live recovery.
+    """
+    existing = {str(row[1]) for row in con.execute("PRAGMA table_info(board_outbox)")}
+    for name, ddl in _OUTBOX_RETRY_COLUMNS.items():
+        if name not in existing:
+            con.execute(f"ALTER TABLE board_outbox ADD COLUMN {name} {ddl}")
+
 
 class ContinuationState(str, Enum):
     DETECTED = "detected"
@@ -252,6 +270,7 @@ class ContinuationStore:
             con.executescript(_REQUIREMENT_RESOLVER_DDL)
             con.executescript(_INTERACTION_INBOX_DDL)
             con.executescript(_STORE_MIGRATION_DDL)
+            _ensure_outbox_retry_columns(con)
 
     # -- instances -----------------------------------------------------
 
@@ -540,13 +559,30 @@ class ContinuationStore:
             row = con.execute("select * from board_outbox where id=?", (cur.lastrowid,)).fetchone()
             return {"created": True, "outbox": dict(row)}
 
-    def outbox_mark(self, outbox_id: int, *, state: str, board_task_id: str = "") -> dict[str, Any]:
+    def outbox_mark(
+        self,
+        outbox_id: int,
+        *,
+        state: str,
+        board_task_id: str = "",
+        next_attempt_at: float | None = None,
+        last_error: str | None = None,
+    ) -> dict[str, Any]:
         self.init()
         now = time.time()
         with self.connect() as con:
             con.execute(
-                "update board_outbox set state=?, board_task_id=coalesce(nullif(?,''), board_task_id), attempts=attempts+1, updated_at=? where id=?",
-                (state, board_task_id, now, outbox_id),
+                """
+                update board_outbox set
+                    state=?,
+                    board_task_id=coalesce(nullif(?,''), board_task_id),
+                    attempts=attempts+1,
+                    next_attempt_at=coalesce(?, next_attempt_at),
+                    last_error=coalesce(?, last_error),
+                    updated_at=?
+                where id=?
+                """,
+                (state, board_task_id, next_attempt_at, last_error, now, outbox_id),
             )
             row = con.execute("select * from board_outbox where id=?", (outbox_id,)).fetchone()
         return dict(row)
@@ -558,6 +594,20 @@ class ContinuationStore:
                 rows = con.execute("select * from board_outbox where state=? order by id", (state,)).fetchall()
             else:
                 rows = con.execute("select * from board_outbox order by id").fetchall()
+        return [dict(r) for r in rows]
+
+    def list_due_outbox(self, *, state: str = "pending", now: float | None = None) -> list[dict[str, Any]]:
+        self.init()
+        due_at = time.time() if now is None else now
+        with self.connect() as con:
+            rows = con.execute(
+                """
+                select * from board_outbox
+                where state=? and coalesce(next_attempt_at, 0) <= ?
+                order by id
+                """,
+                (state, due_at),
+            ).fetchall()
         return [dict(r) for r in rows]
 
     # -- requirement satisfactions (requirement_resolver.py) --------------

@@ -410,17 +410,6 @@ def test_real_adapter_subscribe_uses_canonical_delivery_mode_argv_when_supported
     legacy ack_subscription/ack_active_wake tables don't exist at all."""
     db = tmp_path / "kanban.db"
     _create_canonical_notify_subs_table(db)
-    con = sqlite3.connect(db)
-    con.execute(
-        """
-        insert into kanban_notify_subs
-            (task_id, platform, chat_id, thread_id, user_id, chat_type, delivery_mode, created_at)
-        values (?, ?, ?, '', NULL, ?, ?, ?)
-        """,
-        ("t_owner", "discord", "1499390151393284106", "channel", "notify+wake", 0),
-    )
-    con.commit()
-    con.close()
 
     calls = []
 
@@ -428,6 +417,17 @@ def test_real_adapter_subscribe_uses_canonical_delivery_mode_argv_when_supported
         calls.append(argv)
         if "--help" in argv:
             return 0, "usage: hermes kanban notify-subscribe ... --delivery-mode {notify,notify+wake,wake}", ""
+        con = sqlite3.connect(db)
+        con.execute(
+            """
+            insert into kanban_notify_subs
+                (task_id, platform, chat_id, thread_id, user_id, chat_type, delivery_mode, created_at)
+            values (?, ?, ?, '', NULL, ?, ?, ?)
+            """,
+            ("t_owner", "discord", "1499390151393284106", "channel", "notify+wake", 0),
+        )
+        con.commit()
+        con.close()
         return 0, "Subscribed", ""
 
     adapter = RealBoardAdapter(runner=runner, board="warroom-os", board_db_path=db)

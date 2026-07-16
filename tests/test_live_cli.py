@@ -153,6 +153,98 @@ def test_cli_live_status_warns_when_board_lacks_effective_semantic_protection(mo
     ]
 
 
+def _seed_canonical_cursor(db_path, *, board: str, db_identity: str, last_event_id: int):
+    con = sqlite3.connect(db_path)
+    con.executescript(
+        """
+        create table board_cursors (
+            board text not null,
+            db_identity text not null,
+            last_event_id integer not null default 0,
+            updated_at real not null,
+            primary key(board, db_identity)
+        );
+        """
+    )
+    con.execute(
+        "insert into board_cursors(board, db_identity, last_event_id, updated_at) values(?,?,?,0)",
+        (board, db_identity, last_event_id),
+    )
+    con.commit()
+    con.close()
+
+
+def test_status_surfaces_report_canonical_board_cursor(monkeypatch, tmp_path):
+    """M30E: doctor/live status must read the canonical ``last_event_id``
+    cursor for a discovered board, not collapse it to a plausible zero."""
+    boards_root = tmp_path / "boards"
+    _seed_board(boards_root / "alpha" / "kanban.db")
+    continuation_db = tmp_path / "agentflow-daemon.sqlite"
+    _seed_canonical_cursor(continuation_db, board="alpha", db_identity="alpha", last_event_id=42)
+    unit_dir = tmp_path / "units"
+    _write_agentflowd_units(unit_dir, boards_root=boards_root, continuation_db=continuation_db, apply=True)
+
+    for argv in (["doctor"], ["live", "status"]):
+        rc, data = _run(argv + ["--agentflowd-unit-dir", str(unit_dir)], monkeypatch, tmp_path)
+
+        assert rc == 0
+        board_row = data["boards"][0]
+        assert board_row["board"] == "alpha"
+        assert board_row["cursor"] == 42
+        assert board_row["cursor_seeded"] is True
+        assert board_row["cursor_status"]["status"] == "ok"
+        assert data["warnings"] == []
+        # Direct dispatch policy stays a separate, legacy canary-only surface.
+        assert data["direct_dispatch_policy"]["scope"] == "legacy_canary_only"
+
+
+def test_status_surfaces_report_missing_cursor_row_as_unseeded(monkeypatch, tmp_path):
+    boards_root = tmp_path / "boards"
+    _seed_board(boards_root / "alpha" / "kanban.db")
+    continuation_db = tmp_path / "agentflow-daemon.sqlite"
+    _seed_canonical_cursor(continuation_db, board="other", db_identity="other", last_event_id=7)
+    unit_dir = tmp_path / "units"
+    _write_agentflowd_units(unit_dir, boards_root=boards_root, continuation_db=continuation_db, apply=True)
+
+    rc, data = _run(["live", "status", "--agentflowd-unit-dir", str(unit_dir)], monkeypatch, tmp_path)
+
+    assert rc == 0
+    board_row = data["boards"][0]
+    assert board_row["cursor"] == 0
+    assert board_row["cursor_seeded"] is False
+    assert board_row["cursor_status"]["status"] == "ok"
+    assert data["warnings"] == []
+
+
+def test_status_surfaces_fail_closed_on_malformed_cursor_table(monkeypatch, tmp_path):
+    """A cursor table without any known cursor column must be surfaced as an
+    error, never reported as a healthy ``cursor=0, cursor_seeded=false``."""
+    boards_root = tmp_path / "boards"
+    _seed_board(boards_root / "alpha" / "kanban.db")
+    continuation_db = tmp_path / "agentflow-daemon.sqlite"
+    con = sqlite3.connect(continuation_db)
+    con.executescript("create table board_cursors (board text, db_identity text, updated_at real);")
+    con.commit()
+    con.close()
+    unit_dir = tmp_path / "units"
+    _write_agentflowd_units(unit_dir, boards_root=boards_root, continuation_db=continuation_db, apply=True)
+
+    for argv in (["doctor"], ["live", "status"]):
+        rc, data = _run(argv + ["--agentflowd-unit-dir", str(unit_dir)], monkeypatch, tmp_path)
+
+        assert rc == 0
+        board_row = data["boards"][0]
+        assert board_row["cursor_status"]["status"] == "error"
+        assert board_row["cursor_status"]["error"] == "cursor_column_unknown"
+        assert board_row["cursor"] is None
+        assert board_row["cursor_seeded"] is None
+        assert {
+            "board": "alpha",
+            "warning": "cursor_status_unavailable",
+            "missing": ["cursor_column_unknown"],
+        } in data["warnings"]
+
+
 def test_cli_dispatch_without_live_is_dry_run(monkeypatch, tmp_path):
     rc, data = _run(["enqueue", "--title", "t"], monkeypatch, tmp_path)
     assert rc == 0
