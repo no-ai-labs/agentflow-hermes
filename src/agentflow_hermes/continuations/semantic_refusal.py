@@ -10,9 +10,12 @@ fix/review/activation board task:
 1. It records a durable, idempotent semantic-refusal ACK (a requirement
    satisfaction carrying the unsafe categories + offending blockers) — an
    explicit acknowledgement distinct from any passive board delivery.
-2. It subscribes the *source* task back to its trusted origin using the board's
-   own Kanban notify + active-wake path, so the origin is woken about the
-   refusal. It never sends anything to AgentFlow/Discord directly.
+2. It checks for a durable prior wake receipt for the *source* task's trusted
+   origin, and otherwise schedules a typed origin wake via the board's own
+   Kanban ``wake-origin`` path, waiting for a durable accepted/started/
+   completed wake status before proceeding. It never sends anything to
+   AgentFlow/Discord directly, and never uses the generic notify-subscribe
+   path (that is a passive notify, not a typed origin wake).
 3. It parks the instance in the durable ``BLOCKED_INVALID`` quarantine state —
    explicitly NOT a successful CODE_FIX advance.
 
@@ -27,11 +30,12 @@ ACKs/wakes are ever created (plan/M30A remediation items 2/3).
 from __future__ import annotations
 
 import hashlib
+import time
 from typing import Any
 
 from ..continuation_store import ContinuationState, ContinuationStore
 from ..outcome import ContinuationKind, OutcomeEnvelope
-from .base import StepResult, apply_board_operation
+from .base import StepResult
 
 
 def _stable_digest(instance: dict[str, Any]) -> str:
@@ -88,31 +92,32 @@ class SemanticRefusalHandler:
             instance = store.get_instance(instance_id)
         assert instance is not None
 
-        # 1) Targeted trusted-origin notify+wake — never a direct send. This
-        # must succeed before we record the refusal ACK/quarantine below: the
-        # durable notify+wake repair plus semantic-refusal ACK is one semantic
-        # operation, so an ACK/active-wake repair failure remains retryable
-        # without a false success receipt (M30C).
+        # 1) Targeted trusted-origin wake — never a direct send, and never the
+        # generic notify-subscribe path (that fires a passive notify, not a
+        # typed origin wake). This must reach a durable *accepted* wake status
+        # before we record the refusal ACK/quarantine below: scheduling alone
+        # is not semantic completion, and an unaccepted wake leaves the
+        # instance retryable without a false success receipt (M30F).
         digest = _stable_digest(instance)
         endpoint = outcome.return_to_ref or outcome.origin_ref
-        subscribed = False
+        wake_satisfied = False
         if endpoint:
-            sub = apply_board_operation(
+            wake = self._ensure_origin_wake(
                 store,
                 instance_id,
-                step_id="0",
-                operation="subscribe",
-                payload={"task_id": outcome.source_task_id, "endpoint": endpoint},
-                idempotency_key=f"semantic_refusal_notify:{digest}:{endpoint}",
+                task_id=outcome.source_task_id,
+                endpoint=endpoint,
+                idempotency_key=f"semantic_refusal_wake:{digest}:{endpoint}",
+                legacy_key_prefix=f"semantic_refusal_notify:{digest}:",
                 adapter=adapter,
             )
-            if not sub.get("success"):
-                return self._fail(store, instance_id, "refusal_notify_failed")
-            subscribed = True
+            if not wake.get("success"):
+                return self._fail(store, instance_id, str(wake.get("error") or "refusal_wake_not_yet_accepted"))
+            wake_satisfied = True
 
         # 2) Durable semantic-refusal ACK (idempotent upsert on field_name),
-        # recorded only after trusted-origin subscribe/active-wake repair is
-        # known to have succeeded.
+        # recorded only after the trusted-origin wake is known to be durably
+        # accepted/started/completed.
         store.record_requirement_satisfaction(
             instance_id,
             field_name="semantic_refusal",
@@ -133,10 +138,96 @@ class SemanticRefusalHandler:
                 "created": creation["created"],
                 "refusal_ack": True,
                 "refusal_categories": list(refusal_categories),
-                "subscribed": subscribed,
+                "subscribed": wake_satisfied,
                 "endpoint": endpoint,
                 "created_tasks": 0,
             },
+        )
+
+    @staticmethod
+    def _origin_wake_satisfied(adapter: Any, task_id: str, endpoint: str) -> bool:
+        check = getattr(adapter, "origin_wake_satisfied", None)
+        if check is None:
+            return False
+        result = check(task_id, endpoint)
+        return bool(result and result.get("success"))
+
+    def _ensure_origin_wake(
+        self,
+        store: ContinuationStore,
+        instance_id: int,
+        *,
+        task_id: str,
+        endpoint: str,
+        idempotency_key: str,
+        legacy_key_prefix: str,
+        adapter: Any,
+    ) -> dict[str, Any]:
+        """Schedule one typed origin wake, then wait for durable acceptance.
+
+        ``wake-origin`` first records ``scheduled``. Scheduled is not semantic
+        completion; the outbox row stays pending until a later durable receipt
+        check sees accepted/started/completed. Once accepted, the same row is
+        marked applied without issuing another wake-origin call. Legacy pending
+        ``subscribe`` rows are reinterpreted in place for safe live replay.
+        """
+        store.outbox_reinterpret_pending(
+            instance_id,
+            from_operation="subscribe",
+            key_prefix=legacy_key_prefix,
+            to_operation="schedule_origin_wake",
+            new_idempotency_key=idempotency_key,
+        )
+        enqueued = store.outbox_enqueue(
+            instance_id,
+            step_id="0",
+            operation="schedule_origin_wake",
+            payload={"task_id": task_id, "endpoint": endpoint},
+            idempotency_key=idempotency_key,
+        )
+        row = enqueued["outbox"]
+        if row["state"] == "applied":
+            return {"success": True, "source": "outbox_applied"}
+
+        if self._origin_wake_satisfied(adapter, task_id, endpoint):
+            store.outbox_mark(row["id"], state="applied")
+            return {"success": True, "source": "origin_wake_receipt"}
+
+        now = time.time()
+        if float(row.get("next_attempt_at") or 0) > now:
+            return {"success": False, "error": "outbox_retry_not_due"}
+
+        # After a wake-origin call has been durably scheduled once, do not
+        # issue duplicates while waiting for the gateway receipt transition.
+        if str(row.get("last_error") or "") == "origin_wake_not_yet_accepted":
+            self._mark_wake_pending(store, row)
+            return {"success": False, "error": "origin_wake_not_yet_accepted"}
+
+        schedule = getattr(adapter, "schedule_origin_wake", None)
+        if schedule is None:
+            return {"success": False, "error": "adapter_missing_schedule_origin_wake"}
+        scheduled = schedule(task_id, endpoint)
+        if not scheduled.get("success"):
+            error = str(scheduled.get("error") or "origin_wake_schedule_failed")[:200]
+            self._mark_wake_pending(store, row, error=error)
+            return {"success": False, "error": error}
+        if self._origin_wake_satisfied(adapter, task_id, endpoint):
+            store.outbox_mark(row["id"], state="applied")
+            return {"success": True, "source": "scheduled_and_accepted"}
+        self._mark_wake_pending(store, row)
+        return {"success": False, "error": "origin_wake_not_yet_accepted"}
+
+    @staticmethod
+    def _mark_wake_pending(
+        store: ContinuationStore, row: dict[str, Any], *, error: str = "origin_wake_not_yet_accepted"
+    ) -> None:
+        attempts_after = int(row.get("attempts") or 0) + 1
+        delay = min(300.0, max(5.0, 5.0 * (2 ** min(attempts_after - 1, 6))))
+        store.outbox_mark(
+            row["id"],
+            state="pending",
+            next_attempt_at=time.time() + delay,
+            last_error=error,
         )
 
     def _fail(self, store: ContinuationStore, instance_id: int, reason: str) -> StepResult:

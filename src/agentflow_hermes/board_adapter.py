@@ -353,7 +353,18 @@ class RealBoardAdapter:
         except Exception:
             return {"success": False, "error": "canonical_db_connect_failed"}
         try:
-            return self._verify_existing_notify_wake_receipt(
+            delivered = self._verify_existing_notify_wake_receipt(
+                conn,
+                task_id,
+                platform=origin_flags["platform"],
+                chat_id=origin_flags["chat_id"],
+                thread_id=origin_flags.get("thread_id", ""),
+                chat_type="thread" if origin_flags.get("thread_id") else "channel",
+                user_id=origin_flags.get("user_id", ""),
+            )
+            if delivered.get("success"):
+                return delivered
+            return self._verify_existing_origin_wake_receipt(
                 conn,
                 task_id,
                 platform=origin_flags["platform"],
@@ -364,6 +375,58 @@ class RealBoardAdapter:
             )
         finally:
             conn.close()
+
+    def _verify_existing_origin_wake_receipt(
+        self,
+        conn: sqlite3.Connection,
+        task_id: str,
+        *,
+        platform: str,
+        chat_id: str,
+        thread_id: str = "",
+        chat_type: str = "",
+        user_id: str = "",
+    ) -> dict[str, Any]:
+        """Recognize accepted typed wake-origin receipts without passive notify."""
+        if not (_table_exists(conn, "kanban_task_origin") and _table_exists(conn, "kanban_notify_receipts")):
+            return {"success": False, "error": "receipt_schema_missing"}
+        origin_cols = _table_columns(conn, "kanban_task_origin")
+        receipt_cols = _table_columns(conn, "kanban_notify_receipts")
+        required_origin = {"task_id", "platform", "chat_id", "thread_id"}
+        required_receipt = {"task_id", "platform", "chat_id", "thread_id", "active_wake_status"}
+        if not required_origin.issubset(origin_cols) or not required_receipt.issubset(receipt_cols):
+            return {"success": False, "error": "receipt_schema_missing"}
+        origin_chat_type_expr = "chat_type" if "chat_type" in origin_cols else "''"
+        origin_user_id_expr = "user_id" if "user_id" in origin_cols else "''"
+        origin = conn.execute(
+            f"SELECT {origin_chat_type_expr}, {origin_user_id_expr} FROM kanban_task_origin WHERE task_id=? AND platform=? AND chat_id=? AND thread_id=?",
+            (task_id, platform, chat_id, thread_id),
+        ).fetchone()
+        if origin is None:
+            return {"success": False, "error": "typed_origin_missing"}
+        origin_chat_type, origin_user_id = origin
+        if chat_type and origin_chat_type and origin_chat_type not in (chat_type, "group"):
+            return {"success": False, "error": "typed_origin_chat_type_mismatch"}
+        if user_id and origin_user_id and origin_user_id != user_id:
+            return {"success": False, "error": "typed_origin_user_id_mismatch"}
+        receipt = conn.execute(
+            """
+            SELECT active_wake_status, consumer_ack_status
+            FROM kanban_notify_receipts
+            WHERE task_id=? AND platform=? AND chat_id=? AND thread_id=?
+            """,
+            (task_id, platform, chat_id, thread_id),
+        ).fetchone()
+        if receipt is None:
+            return {"success": False, "error": "origin_wake_receipt_missing"}
+        wake_status, consumer_ack_status = receipt
+        if wake_status not in {"accepted", "started", "completed"}:
+            return {"success": False, "error": "origin_wake_not_accepted"}
+        return {
+            "success": True,
+            "source": "existing_origin_wake_receipt",
+            "consumer_ack_status": consumer_ack_status or "",
+        }
 
     def schedule_origin_wake(self, task_id: str, endpoint: str) -> dict[str, Any]:
         """Schedule a durable origin wake through Hermes CLI, fail-closed.
@@ -379,7 +442,8 @@ class RealBoardAdapter:
             argv += ["--platform", origin_flags["platform"], "--chat-id", origin_flags["chat_id"]]
             if origin_flags.get("thread_id"):
                 argv += ["--thread-id", origin_flags["thread_id"]]
-        return self._run(argv)
+        argv += ["--json"]
+        return self._run_json(argv)
 
     def _ensure_durable_ack_rows(
         self, task_id: str, *, platform: str, chat_id: str, thread_id: str = ""

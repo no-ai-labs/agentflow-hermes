@@ -21,6 +21,7 @@ from agentflow_hermes.board_events import BoardEvent, FakeBoardEventSource
 from agentflow_hermes.continuation_config import load_contract_registry
 from agentflow_hermes.continuation_engine import ingest_board_once
 from agentflow_hermes.continuation_store import ContinuationStore
+from agentflow_hermes.continuations.semantic_refusal import _stable_digest
 from pathlib import Path
 
 _G421_YAML = Path(__file__).resolve().parents[1] / "contracts" / "warroom.g421.exposure-resolution.v1.yaml"
@@ -76,8 +77,10 @@ def test_unsafe_block_fails_closed_zero_tasks_notify_wake_and_durable_ack(label,
     # Zero fix/review/activation tasks — nothing auto-remediated.
     assert adapter.tasks == {}
 
-    # Targeted trusted-origin notify+wake: the source task subscribed to origin.
-    assert adapter.subscriptions == [("t_89e3c71f", "discord:#research")]
+    # Targeted trusted-origin wake: the source task's origin got a typed
+    # wake-origin call, never the generic notify-subscribe path.
+    assert adapter.subscriptions == []
+    assert adapter.scheduled_origin_wakes == [("t_89e3c71f", "discord:#research")]
     # No direct AgentFlow/Discord send stand-in.
     assert adapter.comments == []
     assert adapter.completed == []
@@ -109,100 +112,141 @@ def test_semantic_refusal_replay_creates_zero_duplicate_tasks_or_acks(tmp_path):
     first = _ingest(store, adapter, [_unsafe_event(run_metadata, summary)])
     assert first["results"][0]["router_success"] is True
     assert adapter.tasks == {}
-    assert len(adapter.subscriptions) == 1
+    assert adapter.subscriptions == []
+    assert len(adapter.scheduled_origin_wakes) == 1
     instance_id = store.list_instances()[0]["id"]
     assert len(store.list_requirement_satisfactions(instance_id)) == 1
 
     # Duplicate replay/restart: cursor already at 7305 -> zero new work, still
-    # exactly one instance, one subscription, one ACK.
+    # exactly one instance, one wake-origin call, one ACK.
     second = _ingest(store, adapter, [_unsafe_event(run_metadata, summary)])
     assert second["processed"] in (0, 1)
     assert adapter.tasks == {}
-    assert len(adapter.subscriptions) == 1
+    assert len(adapter.scheduled_origin_wakes) == 1
     assert len(store.list_instances()) == 1
     assert len(store.list_requirement_satisfactions(instance_id)) == 1
 
 
-class _FailingSubscribeAdapter(FakeBoardAdapter):
-    """notify-subscribe fails, like a real CLI subscribe that errored."""
+def test_semantic_refusal_no_prior_wake_zero_notify_subscribe_one_wake_origin(tmp_path):
+    """Reviewer BLOCK (M30F): the no-prior-wake branch must never invoke the
+    generic notify-subscribe path -- only a typed origin wake-origin call."""
+    store = ContinuationStore(tmp_path / "agentflow.sqlite")
+    adapter = FakeBoardAdapter()
+    label, run_metadata, summary = _UNSAFE_CASES[0]
 
-    def subscribe(self, task_id: str, endpoint: str) -> dict[str, Any]:
-        return {"success": False, "error": "cli_subscribe_failed"}
+    result = _ingest(store, adapter, [_unsafe_event(run_metadata, summary)])
+
+    assert result["results"][0]["router_success"] is True
+    assert adapter.subscriptions == []
+    assert adapter.scheduled_origin_wakes == [("t_89e3c71f", "discord:#research")]
 
 
-def test_semantic_refusal_notify_failure_leaves_cursor_retryable_then_retry(tmp_path):
+class _PendingWakeAdapter(FakeBoardAdapter):
+    """schedule_origin_wake succeeds (scheduled) but the wake is not yet
+    durably accepted -- mirrors the real CLI's fire-and-forget wake-origin
+    command, where acceptance is a separate, later gateway write. Scheduling
+    alone must never be treated as semantic completion (M30F)."""
+
+    def schedule_origin_wake(self, task_id: str, endpoint: str) -> dict[str, Any]:
+        pair = (task_id, endpoint)
+        if pair not in self.scheduled_origin_wakes:
+            self.scheduled_origin_wakes.append(pair)
+        return {"success": True, "scheduled": True}
+
+
+def test_semantic_refusal_scheduled_not_yet_accepted_leaves_cursor_retryable_then_accepted(tmp_path):
+    """E2E scheduled->accepted transition: zero child tasks, exactly one
+    wake-origin call across the whole retry lifecycle, one consumer ACK, and
+    the cursor advances exactly once once the wake is durably accepted."""
     store = ContinuationStore(tmp_path / "agentflow.sqlite")
     label, run_metadata, summary = _UNSAFE_CASES[0]
 
-    failing = _FailingSubscribeAdapter()
-    first = _ingest(store, failing, [_unsafe_event(run_metadata, summary)])
+    pending = _PendingWakeAdapter()
+    first = _ingest(store, pending, [_unsafe_event(run_metadata, summary)])
 
     item = first["results"][0]
     assert item["action"] == "semantic_refusal_applied"
     assert item["router_success"] is False
     # Fail closed: cursor did not advance past the failed event.
     assert store.get_cursor("warroom-os", "warroom-os-db") == 0
-    assert failing.tasks == {}
+    assert pending.tasks == {}
+    assert len(pending.scheduled_origin_wakes) == 1
     instance = store.list_instances()[0]
     assert instance["state"] == "failed_retryable"
     assert store.list_requirement_satisfactions(instance["id"]) == []
 
-    # Retry with a working adapter after the durable backoff becomes due:
-    # refusal completes, cursor advances, one ACK, one subscription, no duplicate instance.
+    # The gateway durably accepts the wake out of band; a retry after the
+    # durable backoff becomes due must not re-invoke wake-origin (the
+    # schedule outbox op already applied) and must record exactly one ACK.
+    pending.satisfied_origin_wakes.add(("t_89e3c71f", "discord:#research"))
     with store.connect() as con:
         con.execute("update board_outbox set next_attempt_at=0")
-    working = FakeBoardAdapter()
-    second = _ingest(store, working, [_unsafe_event(run_metadata, summary)])
+    second = _ingest(store, pending, [_unsafe_event(run_metadata, summary)])
     assert second["results"][0]["router_success"] is True
-    assert working.tasks == {}
-    assert len(working.subscriptions) == 1
+    assert pending.tasks == {}
+    assert len(pending.scheduled_origin_wakes) == 1
     assert store.get_cursor("warroom-os", "warroom-os-db") == 7305
     assert len(store.list_instances()) == 1
     assert store.list_instances()[0]["state"] == "blocked_invalid"
+    assert len(store.list_requirement_satisfactions(instance["id"])) == 1
 
 
-class _NestedAckFailureSubscribeAdapter(FakeBoardAdapter):
-    """Mirrors RealBoardAdapter.subscribe returning top-level success=True
-    with a failed nested ACK/active-wake repair (ack_schema_missing/
-    ack_ensure_failed) -- the exact M30C incident shape."""
-
-    def subscribe(self, task_id: str, endpoint: str) -> dict[str, Any]:
-        pair = (task_id, endpoint)
-        if pair not in self.subscriptions:
-            self.subscriptions.append(pair)
-        return {"success": True, "ack": {"success": False, "error": "ack_schema_missing"}}
-
-
-def test_semantic_refusal_nested_ack_failure_fails_closed_then_retry_succeeds_once(tmp_path):
+def test_semantic_refusal_prior_wake_receipt_skips_schedule_entirely(tmp_path):
+    """A durable prior wake receipt short-circuits straight to the ACK --
+    zero notify-subscribe and zero wake-origin calls."""
     store = ContinuationStore(tmp_path / "agentflow.sqlite")
+    adapter = FakeBoardAdapter()
+    adapter.satisfied_origin_wakes.add(("t_89e3c71f", "discord:#research"))
     label, run_metadata, summary = _UNSAFE_CASES[0]
 
-    failing = _NestedAckFailureSubscribeAdapter()
-    first = _ingest(store, failing, [_unsafe_event(run_metadata, summary)])
+    result = _ingest(store, adapter, [_unsafe_event(run_metadata, summary)])
 
-    item = first["results"][0]
-    assert item["action"] == "semantic_refusal_applied"
-    assert item["router_success"] is False
-    # Fail closed: cursor did not advance, and no false semantic success or
-    # quarantine transition happened despite the adapter's top-level success.
-    assert store.get_cursor("warroom-os", "warroom-os-db") == 0
+    assert result["results"][0]["router_success"] is True
+    assert adapter.subscriptions == []
+    assert adapter.scheduled_origin_wakes == []
     instance = store.list_instances()[0]
-    assert instance["state"] == "failed_retryable"
-    assert store.list_requirement_satisfactions(instance["id"]) == []
+    assert instance["state"] == "blocked_invalid"
+    assert len(store.list_requirement_satisfactions(instance["id"])) == 1
 
-    # Retry with a working adapter after the durable backoff becomes due:
-    # exactly one wake/refusal receipt, zero duplicate tasks/wakes, and the
-    # retry advances exactly once.
-    with store.connect() as con:
-        con.execute("update board_outbox set next_attempt_at=0")
-    working = FakeBoardAdapter()
-    second = _ingest(store, working, [_unsafe_event(run_metadata, summary)])
-    assert second["results"][0]["router_success"] is True
-    assert working.tasks == {}
-    assert len(working.subscriptions) == 1
-    assert store.get_cursor("warroom-os", "warroom-os-db") == 7305
-    assert len(store.list_instances()) == 1
-    assert store.list_instances()[0]["state"] == "blocked_invalid"
+
+def test_semantic_refusal_reinterprets_legacy_subscribe_outbox_row(tmp_path):
+    """A live pre-fix semantic_refusal subscribe outbox row is migrated in
+    place to schedule_origin_wake, preserving the row and avoiding
+    notify-subscribe replay."""
+    store = ContinuationStore(tmp_path / "agentflow.sqlite")
+    creation = store.create_instance(
+        board="warroom-os",
+        source_task_id="t_89e3c71f",
+        source_event_id="7305",
+        source_graph_id="g_89",
+        verdict="BLOCK",
+        continuation_kind="semantic_refusal",
+        origin_ref="discord:#research",
+        return_to_ref="discord:#research",
+    )
+    instance = creation["instance"]
+    digest = _stable_digest(instance)
+    legacy = store.outbox_enqueue(
+        instance["id"],
+        step_id="0",
+        operation="subscribe",
+        payload={"task_id": "t_89e3c71f", "endpoint": "discord:#research"},
+        idempotency_key=f"semantic_refusal_notify:{digest}:discord:#research",
+    )["outbox"]
+    adapter = FakeBoardAdapter()
+    label, run_metadata, summary = _UNSAFE_CASES[0]
+
+    result = _ingest(store, adapter, [_unsafe_event(run_metadata, summary)])
+
+    assert result["results"][0]["router_success"] is True
+    rows = store.list_outbox()
+    assert len(rows) == 1
+    assert rows[0]["id"] == legacy["id"]
+    assert rows[0]["operation"] == "schedule_origin_wake"
+    assert rows[0]["idempotency_key"].startswith("semantic_refusal_wake:")
+    assert rows[0]["state"] == "applied"
+    assert adapter.subscriptions == []
+    assert adapter.scheduled_origin_wakes == [("t_89e3c71f", "discord:#research")]
 
 
 def test_dry_run_semantic_refusal_is_proposal_only_no_board_writes(tmp_path):

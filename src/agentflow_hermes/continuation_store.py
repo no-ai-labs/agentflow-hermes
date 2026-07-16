@@ -587,6 +587,45 @@ class ContinuationStore:
             row = con.execute("select * from board_outbox where id=?", (outbox_id,)).fetchone()
         return dict(row)
 
+    def outbox_reinterpret_pending(
+        self,
+        instance_id: int,
+        *,
+        from_operation: str,
+        key_prefix: str,
+        to_operation: str,
+        new_idempotency_key: str,
+    ) -> dict[str, Any] | None:
+        """Deterministically reinterpret a stale not-yet-applied legacy outbox
+        row (e.g. an old ``operation='subscribe'`` semantic-refusal notify
+        attempt) onto a new operation/idempotency key in place. Preserves the
+        row id, attempts, and created_at as durable evidence; never touches an
+        already-``applied`` row (left untouched as historical evidence of its
+        original semantics) and never deletes rows or edits cursors."""
+        self.init()
+        with self.connect() as con:
+            existing_new = con.execute(
+                "select * from board_outbox where idempotency_key=?", (new_idempotency_key,)
+            ).fetchone()
+            if existing_new is not None:
+                return dict(existing_new)
+            row = con.execute(
+                """
+                select * from board_outbox
+                where continuation_id=? and operation=? and idempotency_key like ? and state!='applied'
+                order by id desc limit 1
+                """,
+                (instance_id, from_operation, f"{key_prefix}%"),
+            ).fetchone()
+            if row is None:
+                return None
+            con.execute(
+                "update board_outbox set operation=?, idempotency_key=?, updated_at=? where id=?",
+                (to_operation, new_idempotency_key, time.time(), row["id"]),
+            )
+            updated = con.execute("select * from board_outbox where id=?", (row["id"],)).fetchone()
+            return dict(updated)
+
     def list_outbox(self, *, state: str | None = None) -> list[dict[str, Any]]:
         self.init()
         with self.connect() as con:

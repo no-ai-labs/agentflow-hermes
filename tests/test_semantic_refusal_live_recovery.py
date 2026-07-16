@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from pathlib import Path
 
@@ -118,6 +119,31 @@ def _adapter(db: Path, calls: list[list[str]]) -> RealBoardAdapter:
         calls.append(argv)
         if "--help" in argv:
             return 0, "usage: hermes kanban notify-subscribe --delivery-mode notify+wake --chat-type channel", ""
+        if "wake-origin" in argv:
+            con = sqlite3.connect(db)
+            con.execute(
+                """
+                insert into kanban_task_origin(
+                    task_id, platform, chat_id, thread_id, notifier_profile, chat_type, created_at, updated_at
+                ) values (?, 'discord', '1497895797579190357', '', 'default', 'group', 1, 1)
+                on conflict(task_id) do update set updated_at=excluded.updated_at
+                """,
+                ("t_source",),
+            )
+            con.execute(
+                """
+                insert into kanban_notify_receipts(
+                    task_id, platform, chat_id, thread_id,
+                    active_wake_status, active_wake_at, consumer_ack_status, updated_at
+                ) values (?, 'discord', '1497895797579190357', '', 'scheduled', 2, NULL, 2)
+                on conflict(task_id, platform, chat_id, thread_id) do update set
+                    active_wake_status='scheduled', active_wake_at=2, updated_at=2
+                """,
+                ("t_source",),
+            )
+            con.commit()
+            con.close()
+            return 0, json.dumps({"task_id": "t_source", "active_wake_status": "scheduled"}), ""
         return 0, "Subscribed", ""
 
     return RealBoardAdapter(runner=runner, board="agentflow-hermes", board_db_path=db)
@@ -157,18 +183,30 @@ def test_semantic_refusal_accepts_existing_one_shot_receipt_and_backs_off_retry(
     assert len(rows) == 1
     assert rows[0]["state"] == "pending"
     assert rows[0]["attempts"] == 1
-    assert rows[0]["last_error"] == "canonical_row_missing"
+    assert rows[0]["last_error"] == "origin_wake_not_yet_accepted"
     assert rows[0]["next_attempt_at"] > rows[0]["updated_at"]
+    # Never the generic notify-subscribe path -- only a typed wake-origin call.
+    assert [c for c in calls if "notify-subscribe" in c and "--help" not in c] == []
+    assert len([c for c in calls if "wake-origin" in c]) == 1
 
-    call_count_after_first = len([c for c in calls if "notify-subscribe" in c and "--help" not in c])
+    call_count_after_first = len([c for c in calls if "wake-origin" in c])
     second = _route(store, board_db, calls)
     rows = store.list_outbox()
     assert second["cursor"] == 0
     assert second["results"][0]["router_success"] is False
     assert rows[0]["attempts"] == 1
-    assert len([c for c in calls if "notify-subscribe" in c and "--help" not in c]) == call_count_after_first
+    assert len([c for c in calls if "wake-origin" in c]) == call_count_after_first
 
-    _insert_delivered_one_shot_receipt(board_db)
+    con = sqlite3.connect(board_db)
+    con.execute(
+        """
+        update kanban_notify_receipts
+        set active_wake_status='accepted', active_wake_at=3, updated_at=3
+        where task_id='t_source'
+        """
+    )
+    con.commit()
+    con.close()
     con = sqlite3.connect(store.path)
     con.execute("update board_outbox set next_attempt_at=0")
     con.commit()
@@ -185,6 +223,9 @@ def test_semantic_refusal_accepts_existing_one_shot_receipt_and_backs_off_retry(
     final_rows = store.list_outbox()
     assert final_rows[0]["state"] == "applied"
     assert final_rows[0]["attempts"] == 2
+    # The now-present receipt satisfies the durable check directly -- no
+    # second wake-origin call was needed.
+    assert len([c for c in calls if "wake-origin" in c]) == 1
 
 
 def test_real_adapter_verifies_existing_one_shot_receipt_without_consumer_ack(tmp_path):
