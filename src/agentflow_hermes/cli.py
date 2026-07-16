@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shlex
 from pathlib import Path
 from typing import Sequence
 
@@ -40,8 +41,99 @@ from .store import AgentFlowStore, render_dispatch_prompt
 from .continuation_store import ContinuationStore
 
 
+def _default_agentflowd_unit_dir() -> Path:
+    xdg_config_home = Path.home() / ".config"
+    return xdg_config_home / "systemd" / "user"
+
+
+def _read_text_if_exists(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8") if path.exists() else ""
+    except OSError:
+        return ""
+
+
+def _extract_exec_args(unit_text: str) -> list[str]:
+    for line in unit_text.splitlines():
+        if line.startswith("ExecStart="):
+            try:
+                return shlex.split(line.split("=", 1)[1])
+            except ValueError:
+                return []
+    return []
+
+
+def _arg_value(argv: list[str], flag: str) -> str:
+    try:
+        idx = argv.index(flag)
+    except ValueError:
+        return ""
+    next_idx = idx + 1
+    return argv[next_idx] if next_idx < len(argv) else ""
+
+
+def _agentflowd_service_status(unit_dir: Path | None = None) -> dict:
+    from .service_install import RECONCILE_SERVICE_NAME, RECONCILE_TIMER_NAME, SERVICE_NAME
+
+    root = unit_dir or _default_agentflowd_unit_dir()
+    service_path = root / SERVICE_NAME
+    reconcile_path = root / RECONCILE_SERVICE_NAME
+    timer_path = root / RECONCILE_TIMER_NAME
+    service_text = _read_text_if_exists(service_path)
+    reconcile_text = _read_text_if_exists(reconcile_path)
+    service_args = _extract_exec_args(service_text)
+    reconcile_args = _extract_exec_args(reconcile_text)
+    service_apply = "--apply" in service_args
+    reconcile_apply = "--apply" in reconcile_args
+    db = _arg_value(service_args, "--db") or _arg_value(reconcile_args, "--db")
+    boards_root = _arg_value(service_args, "--boards-root") or _arg_value(reconcile_args, "--boards-root")
+    return {
+        "unit_dir": str(root),
+        "installed": {
+            SERVICE_NAME: service_path.exists(),
+            RECONCILE_SERVICE_NAME: reconcile_path.exists(),
+            RECONCILE_TIMER_NAME: timer_path.exists(),
+        },
+        "fully_installed": service_path.exists() and reconcile_path.exists() and timer_path.exists(),
+        "service_apply": service_apply,
+        "reconcile_apply": reconcile_apply,
+        "apply": service_apply and reconcile_apply,
+        "db": db,
+        "boards_root": boards_root,
+    }
+
+
+def _continuation_runtime_status(args: argparse.Namespace) -> dict:
+    from .daemon import AgentflowDaemon, DaemonConfig, default_boards_root
+
+    service = _agentflowd_service_status(Path(args.agentflowd_unit_dir) if getattr(args, "agentflowd_unit_dir", "") else None)
+    boards_root = Path(getattr(args, "boards_root", "") or service.get("boards_root") or default_boards_root())
+    continuation_db = getattr(args, "continuation_db", "") or service.get("db") or ""
+    store = ContinuationStore(Path(continuation_db)) if continuation_db else ContinuationStore.canonical()
+    config = DaemonConfig(
+        store=store,
+        boards_root=boards_root,
+        overrides_path=Path(args.overrides) if getattr(args, "overrides", "") else None,
+        contracts_dir=Path(args.contracts_dir) if getattr(args, "contracts_dir", "") else None,
+        apply=bool(service.get("apply")),
+    )
+    report = AgentflowDaemon(config).runtime_report()
+    runtime = dict(report["continuation_runtime"])
+    runtime["service"] = service
+    runtime["direct_dispatch_policy"] = report["direct_dispatch_policy"]
+    return runtime
+
+
 def _dump(data: dict, **kwargs) -> str:
     return json.dumps(data, ensure_ascii=False, **kwargs)
+
+
+def _add_status_surface_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--boards-root", default="", help="Override board discovery root for read-only status.")
+    parser.add_argument("--continuation-db", default="", help="Override canonical continuation DB for read-only status.")
+    parser.add_argument("--overrides", default="", help="Optional board registry override file.")
+    parser.add_argument("--contracts-dir", default="", help="Optional contracts directory.")
+    parser.add_argument("--agentflowd-unit-dir", default="", help="Override systemd user unit dir for service/apply inspection.")
 
 
 def _add_autopilot_args(parser: argparse.ArgumentParser) -> None:
@@ -201,7 +293,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("init")
-    sub.add_parser("doctor")
+    doctor = sub.add_parser("doctor")
+    _add_status_surface_args(doctor)
 
     enqueue = sub.add_parser("enqueue")
     enqueue.add_argument("--title", required=True)
@@ -226,6 +319,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     live = sub.add_parser("live")
     live_sub = live.add_subparsers(dest="live_cmd", required=True)
     live_status = live_sub.add_parser("status")
+    _add_status_surface_args(live_status)
     live_enable = live_sub.add_parser("enable")
     live_enable.add_argument("--dispatch", action="store_true", help="enable live dispatch (operator-only)")
     live_disable = live_sub.add_parser("disable")
@@ -347,6 +441,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         with store.connect() as con:
             version = store._schema_version(con)
         policy = load_policy()
+        continuation_runtime = _continuation_runtime_status(args)
+        direct_dispatch_policy = {
+            "scope": "legacy_canary_only",
+            "live_dispatch_enabled": policy.live_dispatch_enabled,
+            "active_wake_enabled": policy.active_wake_enabled,
+            "kanban_apply_enabled": policy.kanban_apply_enabled,
+            "allowed_targets": list(policy.allowed_targets),
+            "canary_targets": list(policy.canary_targets),
+            "kill_switch": policy.kill_switch,
+        }
         print(_dump({
             "success": True,
             "db": str(store.path),
@@ -354,6 +458,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             "schema_version": version,
             "policy": policy.as_dict(),
             "policy_path": str(policy_path()),
+            "direct_dispatch_policy": direct_dispatch_policy,
+            "continuation_runtime": continuation_runtime,
+            "boards": continuation_runtime["boards"],
+            "warnings": continuation_runtime["warnings"],
         }))
         return 0
     if args.cmd == "enqueue":
@@ -411,11 +519,25 @@ def main(argv: Sequence[str] | None = None) -> int:
             with store.connect() as con:
                 degraded_row = con.execute("select value from agentflow_meta where key='degraded'").fetchone()
             degraded = degraded_row is not None and degraded_row["value"] == "1"
+            continuation_runtime = _continuation_runtime_status(args)
+            direct_dispatch_policy = {
+                "scope": "legacy_canary_only",
+                "live_dispatch_enabled": policy.live_dispatch_enabled,
+                "active_wake_enabled": policy.active_wake_enabled,
+                "kanban_apply_enabled": policy.kanban_apply_enabled,
+                "allowed_targets": list(policy.allowed_targets),
+                "canary_targets": list(policy.canary_targets),
+                "kill_switch": policy.kill_switch,
+            }
             print(_dump({
                 "success": True,
                 "policy": policy.as_dict(),
                 "policy_path": str(policy_path()),
                 "degraded": degraded,
+                "direct_dispatch_policy": direct_dispatch_policy,
+                "continuation_runtime": continuation_runtime,
+                "boards": continuation_runtime["boards"],
+                "warnings": continuation_runtime["warnings"],
             }))
             return 0
         if args.live_cmd == "enable":

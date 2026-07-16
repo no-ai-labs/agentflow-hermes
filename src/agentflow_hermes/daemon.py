@@ -26,6 +26,7 @@ import asyncio
 import contextlib
 import os
 import signal
+import sqlite3
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -113,6 +114,100 @@ def discover_boards(
 CALLBACK_TRANSPORT = "kanban_notify_wake"
 
 
+def _board_table_columns(db_path: str | Path, table: str) -> set[str]:
+    path = Path(db_path)
+    if not path.exists():
+        return set()
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return set()
+    try:
+        return {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")}
+    except sqlite3.Error:
+        return set()
+    finally:
+        conn.close()
+
+
+def _board_has_notify_rows(db_path: str | Path) -> bool:
+    path = Path(db_path)
+    if not path.exists():
+        return False
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return False
+    try:
+        row = conn.execute("select 1 from kanban_notify_subs limit 1").fetchone()
+        return row is not None
+    except sqlite3.Error:
+        return False
+    finally:
+        conn.close()
+
+
+def _store_cursor_status(store: ContinuationStore, board: str, db_identity: str) -> tuple[int, bool]:
+    """Read cursor state without initializing or migrating the canonical store."""
+    if not store.path.exists():
+        return 0, False
+    try:
+        conn = sqlite3.connect(f"file:{store.path}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return 0, False
+    try:
+        row = conn.execute(
+            "select last_seq from board_cursors where board=? and db_identity=?",
+            (board, db_identity),
+        ).fetchone()
+    except sqlite3.Error:
+        return 0, False
+    finally:
+        conn.close()
+    if row is None:
+        return 0, False
+    return int(row[0] or 0), True
+
+
+def _board_protection_verdict(entry: BoardRegistryEntry, *, apply: bool) -> dict[str, Any]:
+    """Read-only per-board semantic protection verdict for doctor/live status.
+
+    The global daemon can discover every board, but an operator still needs to
+    see whether terminal semantic events have an effective return path: a typed
+    origin/default endpoint, a notify+wake-capable board schema, and live apply
+    mode. This deliberately does not expand any legacy direct-send allowlist.
+    """
+    notify_cols = _board_table_columns(entry.db_path, "kanban_notify_subs")
+    legacy_ack_cols = _board_table_columns(entry.db_path, "ack_subscription")
+    legacy_wake_cols = _board_table_columns(entry.db_path, "ack_active_wake")
+    has_typed_rows = _board_has_notify_rows(entry.db_path)
+    typed_origin_available = bool(entry.default_endpoint or has_typed_rows)
+    canonical_notify_wake_available = "delivery_mode" in notify_cols
+    legacy_active_wake_available = bool(legacy_ack_cols and legacy_wake_cols)
+    notify_wake_available = canonical_notify_wake_available or legacy_active_wake_available
+    effective = bool(apply and typed_origin_available and notify_wake_available)
+
+    missing: list[str] = []
+    if not apply:
+        missing.append("apply_disabled")
+    if not typed_origin_available:
+        missing.append("typed_origin_missing")
+    if not notify_wake_available:
+        missing.append("notify_wake_unavailable")
+
+    return {
+        "effective_semantic_protection": effective,
+        "typed_origin_available": typed_origin_available,
+        "typed_origin_source": "default_endpoint" if entry.default_endpoint else ("kanban_notify_subs" if has_typed_rows else ""),
+        "notify_wake_available": notify_wake_available,
+        "canonical_notify_wake_available": canonical_notify_wake_available,
+        "legacy_active_wake_available": legacy_active_wake_available,
+        "apply_available": bool(apply),
+        "warning": "" if effective else "board_lacks_effective_semantic_protection",
+        "missing": missing,
+    }
+
+
 def runtime_report(
     *,
     boards_root: Path,
@@ -143,15 +238,39 @@ def runtime_report(
             "enrolled": True,
             "db_identity": db_identity,
             "default_endpoint": entry.default_endpoint,
+            "db_path": entry.db_path,
             # Global-by-discovery: coverage comes from the daemon observing the
             # board, not from any per-channel allowlist or direct-send canary.
             "continuation_protected": True,
             "protection": "global_continuation_daemon",
         }
+        board_row["protection_verdict"] = _board_protection_verdict(entry, apply=apply)
+        board_row["effective_semantic_protection"] = board_row["protection_verdict"][
+            "effective_semantic_protection"
+        ]
         if store is not None:
-            board_row["cursor"] = store.get_cursor(board, db_identity)
-            board_row["cursor_seeded"] = store.cursor_exists(board, db_identity)
+            cursor, cursor_seeded = _store_cursor_status(store, board, db_identity)
+            board_row["cursor"] = cursor
+            board_row["cursor_seeded"] = cursor_seeded
         boards.append(board_row)
+
+    warnings = [
+        {"board": b["board"], "warning": b["protection_verdict"]["warning"], "missing": b["protection_verdict"]["missing"]}
+        for b in boards
+        if b["protection_verdict"]["warning"]
+    ]
+
+    continuation_runtime = {
+        "runtime": "global_continuation_daemon",
+        "apply": apply,
+        "discovered_boards": len(boards),
+        "enrolled_boards": [b["board"] for b in boards],
+        "boards": boards,
+        "semantic_handlers": handlers,
+        "callback_transport": CALLBACK_TRANSPORT,
+        "canonical_db": str(store.path) if store is not None else "",
+        "warnings": warnings,
+    }
 
     return {
         "runtime": "global_continuation_daemon",
@@ -166,6 +285,9 @@ def runtime_report(
         # policy. Its scope never implies a board observed by this daemon is
         # unprotected — continuation coverage is global-by-discovery.
         "legacy_direct_dispatch": "canary_only_independent_of_continuation_coverage",
+        "direct_dispatch_policy": {"scope": "legacy_canary_only", "separate_from_continuation_runtime": True},
+        "continuation_runtime": continuation_runtime,
+        "warnings": warnings,
     }
 
 
