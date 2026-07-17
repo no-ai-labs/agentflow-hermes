@@ -90,6 +90,16 @@ def test_live_source_cursor_bounds_exclude_seen(tmp_path):
     assert source.fetch_events_since(41) == []
 
 
+def test_live_source_exact_lookup_keeps_terminal_filter(tmp_path):
+    db = tmp_path / "kanban.db"
+    _make_db(db)
+    source = LiveBoardEventSource(board="warroom-os", db_path=db, db_identity="warroom-os")
+
+    assert [event.event_seq for event in source.fetch_events_by_seq(41)] == [41]
+    assert source.fetch_events_by_seq(42) == []
+    assert source.fetch_event_by_id("kanban-event-42") is None
+
+
 def test_live_source_defers_terminal_event_until_run_row_is_visible(tmp_path):
     db = tmp_path / "kanban.db"
     _make_db(db)

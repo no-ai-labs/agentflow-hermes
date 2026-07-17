@@ -90,6 +90,33 @@ def _live_db(tmp_path: Path) -> Path:
     return db
 
 
+def _insert_earlier_terminal_events(db: Path, *, count: int = 250) -> None:
+    """Insert enough older terminal rows to push 8488 past the first live page."""
+    conn = sqlite3.connect(db)
+    try:
+        for seq in range(1, count + 1):
+            task_id = f"t_earlier_{seq:03d}"
+            run_id = 100_000 + seq
+            conn.execute(
+                "insert into tasks(id, title, assignee, status, workspace_path, workflow_template_id)"
+                " values(?,?,?,?,?,?)",
+                (task_id, f"earlier terminal {seq}", "worker", "done", "/tmp/ws", "earlier.graph"),
+            )
+            conn.execute(
+                "insert into task_runs(id, task_id, step_key, status, summary, metadata)"
+                " values(?,?,?,?,?,?)",
+                (run_id, task_id, "impl", "completed", f"Verdict: GO earlier {seq}", "{}"),
+            )
+            conn.execute(
+                "insert into task_events(id, task_id, run_id, kind, payload, created_at)"
+                " values(?,?,?,?,?,?)",
+                (seq, task_id, run_id, "completed", "{}", 1_000 + seq),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def _source(tmp_path: Path) -> LiveBoardEventSource:
     return LiveBoardEventSource(
         board="warroom-os",
@@ -183,6 +210,52 @@ def test_mixed_identity_forms_converge_on_one_instance_no_duplicate_graph(tmp_pa
     assert second["instance_id"] == first["instance_id"] == third["instance_id"]
     assert len(store.list_instances()) == 1
     assert len(store.list_requirement_satisfactions(first["instance_id"])) == 1
+    assert adapter.tasks == {}
+
+
+def test_exact_historical_event_lookup_bypasses_live_source_page_limit(tmp_path):
+    """M31B4: exact 8488 must resolve even after >200 older terminal rows."""
+    db = _live_db(tmp_path)
+    _insert_earlier_terminal_events(db, count=250)
+    source = _source(tmp_path)
+    store = ContinuationStore(tmp_path / "agentflow.sqlite")
+    adapter = FakeBoardAdapter()
+
+    first_page = source.fetch_events_since(0)
+    assert len(first_page) == 200
+    assert 8488 not in [event.event_seq for event in first_page]
+
+    first = record_operator_resolution_receipt(
+        board="warroom-os", source=source, store=store, event_id="kanban-event-8488",
+        operator_receipt_ref="operator:m31b4:8488",
+    )
+
+    assert first["success"] is True
+    assert first["created"] is True
+    assert first["action"] == "superseded_by_operator"
+    assert first["created_tasks"] == 0
+    assert first["receipt_key"] == "warroom-os:kanban-event-8488"
+    assert first["event_seq"] == 8488
+    assert store.get_cursor("warroom-os", "warroom-os") == 0
+
+    store.advance_cursor("warroom-os", "warroom-os", first["event_seq"])
+    assert store.get_cursor("warroom-os", "warroom-os") == 8488
+
+    duplicate = record_operator_resolution_receipt(
+        board="warroom-os", source=_source(tmp_path), store=store, event_id="8488",
+        operator_receipt_ref="operator:m31b4:8488",
+    )
+    restart = record_operator_resolution_receipt(
+        board="warroom-os", source=_source(tmp_path), store=store, event_seq=8488,
+        operator_receipt_ref="operator:m31b4:8488",
+    )
+
+    assert duplicate["created"] is False
+    assert restart["created"] is False
+    assert duplicate["instance_id"] == first["instance_id"] == restart["instance_id"]
+    assert len(store.list_instances()) == 1
+    assert len(store.list_requirement_satisfactions(first["instance_id"])) == 1
+    assert store.get_cursor("warroom-os", "warroom-os") == 8488
     assert adapter.tasks == {}
 
 

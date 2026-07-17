@@ -90,21 +90,21 @@ def resolve_board_event(
     if has_id and has_seq and ref_from_id is not None and ref_from_id != ref_from_seq:
         return None, "event_reference_mismatch"
 
-    events = list(source.fetch_events_since(0))
-
     if has_id:
         wanted = str(event_id).strip()
-        for event in events:
-            if event.event_id == wanted:
+        if ref_from_id is None:
+            event = source.fetch_event_by_id(wanted)
+            if event is not None:
                 if has_seq and int(event.event_seq) != ref_from_seq:
                     return None, "event_reference_mismatch"
                 return event, ""
-        if ref_from_id is None:
             # Not an exact id and not a canonical reference -> never guess.
             return None, "event_reference_invalid"
 
     ref = ref_from_id if ref_from_id is not None else ref_from_seq
-    matches = [e for e in events if board_event_numeric_identity(e) == ref]
+    if ref is None:
+        return None, "event_reference_invalid"
+    matches = source.fetch_events_by_seq(int(ref))
     if not matches:
         return None, "event_not_found"
     if len(matches) > 1:
@@ -137,6 +137,10 @@ class BoardEventSource(Protocol):
 
     def fetch_events_since(self, last_seq: int) -> list[BoardEvent]: ...
 
+    def fetch_events_by_seq(self, event_seq: int) -> list[BoardEvent]: ...
+
+    def fetch_event_by_id(self, event_id: str) -> BoardEvent | None: ...
+
     def current_max_seq(self) -> int: ...
 
 
@@ -152,6 +156,15 @@ class FakeBoardEventSource:
 
     def fetch_events_since(self, last_seq: int) -> list[BoardEvent]:
         return sorted((e for e in self.events if e.event_seq > last_seq), key=lambda e: e.event_seq)
+
+    def fetch_events_by_seq(self, event_seq: int) -> list[BoardEvent]:
+        seq = int(event_seq)
+        return sorted((e for e in self.events if board_event_numeric_identity(e) == seq), key=lambda e: e.event_seq)
+
+    def fetch_event_by_id(self, event_id: str) -> BoardEvent | None:
+        wanted = str(event_id).strip()
+        matches = [e for e in self.events if e.event_id == wanted]
+        return matches[0] if len(matches) == 1 else None
 
     def current_max_seq(self) -> int:
         return max((e.event_seq for e in self.events), default=0)
@@ -213,8 +226,37 @@ class LiveBoardEventSource:
         if conn is None:
             return []
         try:
-            placeholders = ",".join("?" for _ in self._TERMINAL_KINDS)
-            query = f"""
+            query = self._event_select_sql("e.id > ?", "order by e.id asc\n                limit ?")
+            rows = conn.execute(query, (int(last_seq), *self._TERMINAL_KINDS, self.limit)).fetchall()
+            return [self._row_to_event(conn, row) for row in rows]
+        except sqlite3.Error:
+            return []
+        finally:
+            conn.close()
+
+    def fetch_events_by_seq(self, event_seq: int) -> list[BoardEvent]:
+        conn = self._connect()
+        if conn is None:
+            return []
+        try:
+            query = self._event_select_sql("e.id = ?", "limit 1")
+            rows = conn.execute(query, (int(event_seq), *self._TERMINAL_KINDS)).fetchall()
+            return [self._row_to_event(conn, row) for row in rows]
+        except sqlite3.Error:
+            return []
+        finally:
+            conn.close()
+
+    def fetch_event_by_id(self, event_id: str) -> BoardEvent | None:
+        seq = parse_board_event_ref(event_id)
+        if seq is None:
+            return None
+        matches = self.fetch_events_by_seq(seq)
+        return matches[0] if len(matches) == 1 else None
+
+    def _event_select_sql(self, predicate: str, suffix: str) -> str:
+        placeholders = ",".join("?" for _ in self._TERMINAL_KINDS)
+        return f"""
                 select
                     e.id as event_id,
                     e.task_id as task_id,
@@ -233,17 +275,10 @@ class LiveBoardEventSource:
                 from task_events e
                 join tasks t on t.id = e.task_id
                 left join task_runs r on r.id = e.run_id
-                where e.id > ? and e.kind in ({placeholders})
+                where {predicate} and e.kind in ({placeholders})
                   and (e.run_id is null or r.id is not null)
-                order by e.id asc
-                limit ?
+                {suffix}
             """
-            rows = conn.execute(query, (int(last_seq), *self._TERMINAL_KINDS, self.limit)).fetchall()
-            return [self._row_to_event(conn, row) for row in rows]
-        except sqlite3.Error:
-            return []
-        finally:
-            conn.close()
 
     def _row_to_event(self, conn: sqlite3.Connection, row: sqlite3.Row) -> BoardEvent:
         task_id = str(row["task_id"] or "")
