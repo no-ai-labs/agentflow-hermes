@@ -21,7 +21,12 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-from .board_events import BoardEventSource, BoardRegistryEntry, LiveBoardEventSource
+from .board_events import (
+    BoardEventSource,
+    BoardRegistryEntry,
+    LiveBoardEventSource,
+    resolve_board_event,
+)
 from .board_adapter import RealBoardAdapter, default_board_kanban_db_path
 from .continuation import get_handler
 from .continuation_config import ContractRegistry, UnknownContractError
@@ -747,7 +752,7 @@ def record_operator_resolution_receipt(
     board: str,
     source: BoardEventSource,
     store: ContinuationStore,
-    event_id: str = "",
+    event_id: str | int = "",
     event_seq: int | None = None,
     operator_receipt_ref: str = "",
     resolution: str = "superseded_by_operator",
@@ -761,15 +766,25 @@ def record_operator_resolution_receipt(
     walks the instance to RESUMED with zero adapter calls/tasks. Replay is
     idempotent because both ``create_instance`` and requirement satisfaction are
     upserts on that source event.
+
+    M31B3: the event reference is canonicalized against the source, so numeric
+    ``8488``, canonical ``kanban-event-8488`` and ``event_seq=8488`` all resolve
+    to the SAME canonical live board event and therefore the same durable
+    receipt/idempotency key. A mismatched board or an invalid/unknown/ambiguous
+    reference fails closed without touching the store.
     """
-    events = list(source.fetch_events_since(0))
-    match = None
-    for event in events:
-        if (event_id and event.event_id == event_id) or (event_seq is not None and event.event_seq == event_seq):
-            match = event
-            break
+    source_board = str(getattr(source, "board", "") or "")
+    if source_board and source_board != board:
+        return {
+            "success": False,
+            "error": "board_mismatch",
+            "board": board,
+            "source_board": source_board,
+        }
+
+    match, error = resolve_board_event(source=source, event_id=event_id, event_seq=event_seq)
     if match is None:
-        return {"success": False, "error": "event_not_found", "event_id": event_id, "event_seq": event_seq}
+        return {"success": False, "error": error, "event_id": event_id, "event_seq": event_seq}
 
     compiled = compile_outcome(
         run_metadata=match.run_metadata,
@@ -825,6 +840,8 @@ def record_operator_resolution_receipt(
         "instance_id": instance_id,
         "created": creation["created"],
         "receipt_key": receipt_key,
+        "event_id": envelope.event_id,
+        "event_seq": match.event_seq,
         "state": (store.get_instance(instance_id) or instance)["state"],
         "created_tasks": 0,
     }

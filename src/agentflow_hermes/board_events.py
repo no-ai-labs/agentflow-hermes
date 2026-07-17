@@ -21,6 +21,97 @@ from typing import Any, Protocol
 from .roadmap_config import parse_minimal_yaml
 
 
+CANONICAL_EVENT_PREFIX = "kanban-event-"
+
+
+def canonical_board_event_id(event_seq: int) -> str:
+    """The canonical live board event identity for a board event sequence."""
+    return f"{CANONICAL_EVENT_PREFIX}{int(event_seq)}"
+
+
+def parse_board_event_ref(value: Any) -> int | None:
+    """Normalize an operator-supplied board event reference to its numeric identity.
+
+    Accepts the three spellings operators actually use for one live event:
+    ``8488``, ``"8488"`` and ``"kanban-event-8488"``. Anything else (a foreign
+    prefix like ``oracle-lab-event-8488``, a non-numeric tail, whitespace in the
+    middle, a non-positive value) is NOT a canonical reference and returns
+    ``None`` so callers fail closed rather than guessing.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    if text.startswith(CANONICAL_EVENT_PREFIX):
+        text = text[len(CANONICAL_EVENT_PREFIX) :]
+    if not (text.isascii() and text.isdigit()):
+        return None
+    seq = int(text)
+    return seq if seq > 0 else None
+
+
+def board_event_numeric_identity(event: "BoardEvent") -> int | None:
+    """The numeric identity of a board event, preferring its own event_id."""
+    parsed = parse_board_event_ref(event.event_id)
+    if parsed is not None:
+        return parsed
+    seq = int(event.event_seq or 0)
+    return seq if seq > 0 else None
+
+
+def resolve_board_event(
+    *,
+    source: "BoardEventSource",
+    event_id: Any = "",
+    event_seq: int | None = None,
+) -> tuple["BoardEvent | None", str]:
+    """Resolve an operator-supplied event reference to ONE canonical board event.
+
+    Returns ``(event, "")`` on success or ``(None, error)`` fail-closed. An exact
+    ``event_id`` string match wins (so non-canonical sources keep working);
+    otherwise the reference is canonicalized to its numeric identity and matched
+    against the source's canonical live board event identity. A caller supplying
+    both ``event_id`` and ``event_seq`` must have them agree.
+    """
+    has_id = event_id is not None and str(event_id).strip() != ""
+    has_seq = event_seq is not None
+    if not has_id and not has_seq:
+        return None, "event_reference_required"
+
+    ref_from_seq = parse_board_event_ref(event_seq) if has_seq else None
+    if has_seq and ref_from_seq is None:
+        return None, "event_reference_invalid"
+    ref_from_id = parse_board_event_ref(event_id) if has_id else None
+    if has_id and has_seq and ref_from_id is not None and ref_from_id != ref_from_seq:
+        return None, "event_reference_mismatch"
+
+    events = list(source.fetch_events_since(0))
+
+    if has_id:
+        wanted = str(event_id).strip()
+        for event in events:
+            if event.event_id == wanted:
+                if has_seq and int(event.event_seq) != ref_from_seq:
+                    return None, "event_reference_mismatch"
+                return event, ""
+        if ref_from_id is None:
+            # Not an exact id and not a canonical reference -> never guess.
+            return None, "event_reference_invalid"
+
+    ref = ref_from_id if ref_from_id is not None else ref_from_seq
+    matches = [e for e in events if board_event_numeric_identity(e) == ref]
+    if not matches:
+        return None, "event_not_found"
+    if len(matches) > 1:
+        return None, "event_reference_ambiguous"
+    return matches[0], ""
+
+
 @dataclass(frozen=True)
 class BoardEvent:
     event_id: str
@@ -165,7 +256,7 @@ class LiveBoardEventSource:
             or f"graph:{task_id}"
         )
         return BoardEvent(
-            event_id=f"kanban-event-{int(row['event_id'])}",
+            event_id=canonical_board_event_id(int(row["event_id"])),
             event_seq=int(row["event_id"]),
             source_task_id=task_id,
             source_graph_id=graph_id or f"graph:{task_id}",

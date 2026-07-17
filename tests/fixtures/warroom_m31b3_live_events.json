@@ -1,0 +1,83 @@
+{
+  "_comment": "Sanitized EXACT offline copy of three real warroom-os terminal board events (8488/8517/8523), read read-only from the live Kanban DB and committed as an offline fixture. Event ids, seqs, task ids, kinds and run-metadata shape are exact; absolute paths and chat snowflakes are sanitized. Never read production at test time.",
+  "board": "warroom-os",
+  "db_identity": "warroom-os",
+  "tasks": [
+    {
+      "id": "t_fc21ca00",
+      "title": "Review first-process startup remediation",
+      "assignee": "ccreviewer",
+      "status": "blocked",
+      "workspace_path": "/workspace/board/.worktrees/t_fc21ca00",
+      "workflow_template_id": null
+    },
+    {
+      "id": "t_0e72730a",
+      "title": "Re-review startup exception taxonomy fix",
+      "assignee": "ccreviewer",
+      "status": "done",
+      "workspace_path": "/workspace/board/.worktrees/t_0e72730a",
+      "workflow_template_id": null
+    },
+    {
+      "id": "t_b556f023",
+      "title": "Final re-cutover startup exception fix",
+      "assignee": "ccsupervisor",
+      "status": "archived",
+      "workspace_path": "/workspace/board/.worktrees/t_b556f023",
+      "workflow_template_id": null
+    }
+  ],
+  "task_runs": [
+    {
+      "id": 758,
+      "task_id": "t_fc21ca00",
+      "step_key": null,
+      "status": "blocked",
+      "summary": "Verdict: BLOCK — startup outage tests pass, but implementation violates explicit “reject generic catch/retry masking”: bootstrap catches Exception per symbol and lazy resync catches Exception, swallowing unexpected RuntimeError as needs_snapshot. Narrow exception taxonomy and add negative test.",
+      "metadata": null
+    },
+    {
+      "id": 760,
+      "task_id": "t_0e72730a",
+      "step_key": null,
+      "status": "done",
+      "summary": "Verdict: BLOCK — reviewed candidate 56a25692f5ba100e8f4765286fd803340a136c88 for t_0e72730a. The candidate is not a descendant of required base 9db9ad0, startup TransportError is no longer recovered, and the first-process >=4h long-runtime test file was deleted/missing; targeted exception-taxonomy tests pass but acceptance criteria fail closed.",
+      "metadata": "{\"verdict\": \"BLOCK\", \"task\": \"t_0e72730a\", \"reviewed_commit\": \"56a25692f5ba100e8f4765286fd803340a136c88\", \"required_base\": \"9db9ad0fd322ff1a96818eff6018db9a68e35a24\", \"findings\": [{\"severity\": \"blocking\", \"issue\": \"Candidate is not descendant of required base 9db9ad0\", \"evidence\": \"git merge-base --is-ancestor 9db9ad0 56a25692f5ba100e8f4765286fd803340a136c88 returned 1; merge-base is 128389c.\"}, {\"severity\": \"blocking\", \"issue\": \"Startup TransportError recovery is missing\", \"evidence\": \"Manual FlakyBootstrapClient probe raised TransportError from BinanceWsStreamState.bootstrap instead of recovering/failing closed.\"}, {\"severity\": \"blocking\", \"issue\": \"First-process >=4h coverage removed/missing\", \"evidence\": \"tests/binance_spot_phase1/test_sla6_standing_serve_long_runtime.py is deleted in diff and pytest path exits 4 file not found.\"}], \"verified_commands\": [{\"command\": \"git status --short --untracked-files=all\", \"result\": \"clean at detached reviewed commit\"}, {\"command\": \"git merge-base --is-ancestor 9db9ad0 56a25692f5ba100e8f4765286fd803340a136c88\", \"result\": \"exit 1 (not ancestor)\"}, {\"command\": \"python -m pytest -q tests/binance_spot_phase1/test_binance_ws_public_stream.py -k 'unexpected_exception_is_not_swallowed or depth_diff_gap_triggers_automatic_resync_with_injected_client or no_rest_cadence_polling_after_bootstrap'\", \"result\": \"5 passed, 32 deselected\"}, {\"command\": \"python -m pytest -q tests/binance_spot_phase1/test_sla6_standing_serve_long_runtime.py\", \"result\": \"exit 4, file or directory not found\"}, {\"command\": \"python -m ruff check changed files\", \"result\": \"passed\"}, {\"command\": \"python -m pytest -q tests/binance_spot_phase1/test_sla5_standing_production_runner.py tests/binance_spot_phase1/test_sla6_standing_continuous_cli.py tests/binance_spot_phase1/test_sla6_standing_continuous_service.py\", \"result\": \"65 passed\"}, {\"command\": \"python -m pytest -q\", \"result\": \"4810 passed, 4 failed (pre-existing missing G421 readiness artifacts)\"}], \"changed_files_reviewed\": [\"trading_os/runtime/binance_spot_public_market_source.py\", \"tests/binance_spot_phase1/test_binance_ws_public_stream.py\", \"tests/binance_spot_phase1/test_sla6_standing_continuous_cli.py\", \"tests/binance_spot_phase1/test_sla6_standing_serve_long_runtime.py\", \"trading_os/cli/binance_spot_standing_production_runner.py\", \"trading_os/live/consumer.py\", \"trading_os/runtime/binance_spot_live_executor.py\"], \"origin\": \"#research watchdog\", \"next_action\": \"Implementation worker must rebase/descend from 9db9ad0, preserve TransportError bootstrap/lazy recovery without catching RuntimeError/AssertionError, and restore first-process >=4h coverage.\", \"worker_session_id\": \"20260717_082828_8decf0\"}"
+    },
+    {
+      "id": 761,
+      "task_id": "t_b556f023",
+      "step_key": null,
+      "status": "blocked",
+      "summary": "Verdict: BLOCK\nTask: t_b556f023 / Final re-cutover startup exception fix\nOrigin/return_to: parent origin #research watchdog\nChanged: none\nVerified: kanban_show parent handoff; git status --short --untracked-files=all (clean); git branch --show-current (cutover/standing-bootstrap-exception-taxonomy); git rev-parse HEAD (128389c2717d8d2560467016cd9f49996da73e61); Claude Code/tmux availability checked.\nEvidence: Required precondition is \"after exact reviewer GO\", but parent t_0e72730a reports Verdict: BLOCK for reviewed candidate 56a25692f5ba100e8f4765286fd803340a136c88 with non-descendant base, missing TransportError recovery, and missing long-runtime test coverage. Final LIVE GO cannot be produced without exact reviewer GO.\nBlockers/Risks: Activation/cutover would violate fail-closed review gate; no live/symlink/start action was attempted.\nNext action: create/route an implementation remediation for the parent review findings, obtain exact reviewer GO on the corrected candidate, then re-run a fresh cutover task.",
+      "metadata": null
+    }
+  ],
+  "task_events": [
+    {
+      "id": 8488,
+      "task_id": "t_fc21ca00",
+      "run_id": 758,
+      "kind": "blocked",
+      "payload": "{\"reason\": \"Verdict: BLOCK \\u2014 startup outage tests pass, but implementation violates explicit \\u201creject generic catch/retry masking\\u201d: bootstrap catches Exception per symbol and lazy resync catches Exception, swallowing unexpected RuntimeError as needs_snapshot. Narrow exception taxonomy and add negative test.\", \"kind\": \"needs_input\", \"recurrences\": 1}",
+      "created_at": 1784275107
+    },
+    {
+      "id": 8517,
+      "task_id": "t_0e72730a",
+      "run_id": 760,
+      "kind": "completed",
+      "payload": "{\"result_len\": 0, \"summary\": \"Verdict: BLOCK \\u2014 reviewed candidate 56a25692f5ba100e8f4765286fd803340a136c88 for t_0e72730a. The candidate is not a descendant of required base 9db9ad0, startup TransportError is no longer recovered, and the first-process >=4h long-runtime test file was deleted/missing; targeted exception-taxonomy tests pass but acceptance criteria fail closed.\"}",
+      "created_at": 1784277104
+    },
+    {
+      "id": 8523,
+      "task_id": "t_b556f023",
+      "run_id": 761,
+      "kind": "blocked",
+      "payload": "{\"reason\": \"Verdict: BLOCK\\nTask: t_b556f023 / Final re-cutover startup exception fix\\nOrigin/return_to: parent origin #research watchdog\\nChanged: none\\nVerified: kanban_show parent handoff; git status --short --untracked-files=all (clean); git branch --show-current (cutover/standing-bootstrap-exception-taxonomy); git rev-parse HEAD (128389c2717d8d2560467016cd9f49996da73e61); Claude Code/tmux availability checked.\\nEvidence: Required precondition is \\\"after exact reviewer GO\\\", but parent t_0e72730a reports Verdict: BLOCK for reviewed candidate 56a25692f5ba100e8f4765286fd803340a136c88 with non-descendant base, missing TransportError recovery, and missing long-runtime test coverage. Final LIVE GO cannot be produced without exact reviewer GO.\\nBlockers/Risks: Activation/cutover would violate fail-closed review gate; no live/symlink/start action was attempted.\\nNext action: create/route an implementation remediation for the parent review findings, obtain exact reviewer GO on the corrected candidate, then re-run a fresh cutover task.\", \"kind\": \"needs_input\", \"recurrences\": 1}",
+      "created_at": 1784277197
+    }
+  ]
+}
