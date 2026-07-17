@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
 from agentflow_hermes.board_adapter import FakeBoardAdapter
 from agentflow_hermes.board_events import BoardEvent, FakeBoardEventSource
 from agentflow_hermes.continuation_config import load_contract_registry
@@ -347,38 +349,39 @@ def test_backfill_missed_event_detects_manual_remediation_and_does_not_duplicate
     assert adapter.tasks == {}
 
 
-def test_operator_resolution_receipt_for_8517_is_explicit_idempotent_and_creates_zero_tasks(tmp_path):
+@pytest.mark.parametrize("event_id", ["8488", "8517", "8523"])
+def test_operator_resolution_receipt_is_explicit_idempotent_and_creates_zero_tasks(tmp_path, event_id):
     store = ContinuationStore(tmp_path / "agentflow.sqlite")
     adapter = FakeBoardAdapter()
     source = FakeBoardEventSource(
         db_identity="warroom-os-db",
-        events=[_t89_event(event_id="8517", event_seq=8517, source_task_id="t_0e72730a")],
+        events=[_t89_event(event_id=event_id, event_seq=int(event_id), source_task_id="t_0e72730a")],
     )
 
     report = record_operator_resolution_receipt(
         board="warroom-os",
         source=source,
         store=store,
-        event_id="8517",
-        operator_receipt_ref="operator:m31b2:8517",
+        event_id=event_id,
+        operator_receipt_ref=f"operator:m31b2:{event_id}",
     )
 
     assert report["success"] is True
     assert report["action"] == "superseded_by_operator"
-    assert report["receipt_key"] == "warroom-os:8517"
+    assert report["receipt_key"] == f"warroom-os:{event_id}"
     assert report["created_tasks"] == 0
     assert report["state"] == "resumed"
     assert adapter.tasks == {}
     sats = store.list_requirement_satisfactions(report["instance_id"])
     assert sats[0]["source_kind"] == "operator_resolution_receipt"
-    assert sats[0]["value"]["source_event_id"] == "8517"
+    assert sats[0]["value"]["source_event_id"] == event_id
 
     again = record_operator_resolution_receipt(
         board="warroom-os",
         source=source,
         store=store,
-        event_id="8517",
-        operator_receipt_ref="operator:m31b2:8517",
+        event_id=event_id,
+        operator_receipt_ref=f"operator:m31b2:{event_id}",
     )
     assert again["created"] is False
     assert len(store.list_instances()) == 1
