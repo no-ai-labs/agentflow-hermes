@@ -742,6 +742,94 @@ def backfill_code_fix_event(
     }
 
 
+def record_operator_resolution_receipt(
+    *,
+    board: str,
+    source: BoardEventSource,
+    store: ContinuationStore,
+    event_id: str = "",
+    event_seq: int | None = None,
+    operator_receipt_ref: str = "",
+    resolution: str = "superseded_by_operator",
+) -> dict[str, Any]:
+    """Durably account for one historical event that an operator already resolved.
+
+    M31B2 deliberately requires an explicit receipt keyed by
+    ``(board, source_event_id)`` rather than guessing that an unrelated manual
+    graph is equivalent. The receipt path creates the normal source-scoped
+    continuation instance, records a typed operator-resolution satisfaction, and
+    walks the instance to RESUMED with zero adapter calls/tasks. Replay is
+    idempotent because both ``create_instance`` and requirement satisfaction are
+    upserts on that source event.
+    """
+    events = list(source.fetch_events_since(0))
+    match = None
+    for event in events:
+        if (event_id and event.event_id == event_id) or (event_seq is not None and event.event_seq == event_seq):
+            match = event
+            break
+    if match is None:
+        return {"success": False, "error": "event_not_found", "event_id": event_id, "event_seq": event_seq}
+
+    compiled = compile_outcome(
+        run_metadata=match.run_metadata,
+        summary=match.summary,
+        event_id=match.event_id,
+        board=board,
+        source_task_id=match.source_task_id,
+        source_graph_id=match.source_graph_id,
+        origin_ref=match.origin_ref,
+        return_to_ref=match.return_to_ref,
+        workspace_ref=match.workspace_ref,
+        assignee=match.assignee,
+        occurred_at=match.occurred_at,
+        title=match.title,
+        event_kind=match.event_kind,
+    )
+    envelope = compiled.envelope
+    creation = store.create_instance(
+        board=envelope.board,
+        source_task_id=envelope.source_task_id,
+        source_event_id=envelope.event_id,
+        source_graph_id=envelope.source_graph_id,
+        contract_ref=envelope.contract_ref,
+        verdict=envelope.verdict.value,
+        continuation_kind=envelope.continuation_kind.value,
+        origin_ref=envelope.origin_ref,
+        return_to_ref=envelope.return_to_ref,
+        workspace_ref=envelope.workspace_ref,
+    )
+    instance = creation["instance"]
+    instance_id = instance["id"]
+    receipt_key = f"{board}:{envelope.event_id}"
+    store.record_requirement_satisfaction(
+        instance_id,
+        field_name="operator_resolution_receipt",
+        value={
+            "board": board,
+            "source_event_id": envelope.event_id,
+            "source_task_id": envelope.source_task_id,
+            "resolution": resolution,
+            "operator_receipt_ref": operator_receipt_ref,
+        },
+        source_kind="operator_resolution_receipt",
+        source_ref=receipt_key,
+    )
+    if instance["state"] == ContinuationState.DETECTED.value:
+        store.transition(instance_id, ContinuationState.MATERIALIZING, reason="operator_resolution_receipt")
+        store.transition(instance_id, ContinuationState.RESUMABLE, reason=resolution)
+        store.transition(instance_id, ContinuationState.RESUMED, reason="operator_resolution_satisfied")
+    return {
+        "success": True,
+        "action": resolution,
+        "instance_id": instance_id,
+        "created": creation["created"],
+        "receipt_key": receipt_key,
+        "state": (store.get_instance(instance_id) or instance)["state"],
+        "created_tasks": 0,
+    }
+
+
 def _summary_marker(text: str, marker: str) -> str:
     wanted = marker.strip().lower()
     for line in (text or "").splitlines():

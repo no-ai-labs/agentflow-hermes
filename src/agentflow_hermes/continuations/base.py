@@ -16,6 +16,24 @@ from ..outcome import ContinuationKind, OutcomeEnvelope
 CALLBACK_ONLY_OPERATIONS = {"schedule_origin_wake", "record_consumer_ack"}
 CALLBACK_RETRY_CAP = 5
 
+# Callback-routing errors that mean the *board* has no typed return edge to
+# deliver on, as opposed to a transient adapter/CLI failure that a later retry
+# could still converge. Neither class is a semantic materialization failure.
+CALLBACK_UNROUTABLE_ERRORS = {"typed_origin_missing", "consumer_ack_missing", "unparseable_origin_endpoint"}
+
+
+def callback_status_for(result: dict[str, Any]) -> str:
+    """Classify a failed callback-only outbox apply into the operator-facing
+    routing status. Never returns a semantic verdict: a callback edge that is
+    unroutable/deferred/deadlettered says nothing about whether the semantic
+    protection (quarantine, fix/review graph) is durable (M31B/M31B2)."""
+    if str(result.get("state") or "") == "callback_deadletter":
+        return "callback_deadletter"
+    error = str(result.get("error") or "")
+    if error in CALLBACK_UNROUTABLE_ERRORS:
+        return "callback_unroutable"
+    return "callback_deferred"
+
 
 def pending_outbox_retry_not_due(store: Any, instance_id: int, *, now: float | None = None) -> bool:
     """Return True when an existing pending outbox row is still in backoff.
@@ -139,6 +157,8 @@ def apply_board_operation(
 def _apply_schedule_origin_wake(store: Any, row: dict[str, Any], payload: dict[str, Any], adapter: Any) -> dict[str, Any]:
     task_id = str(payload.get("task_id") or "")
     endpoint = str(payload.get("endpoint") or "")
+    if row["state"] == "callback_deadletter":
+        return _deadletter_result(row)
     if row["state"] == "applied":
         if _origin_wake_satisfied(adapter, task_id, endpoint):
             return {"success": True, "task_id": row.get("board_task_id", "")}
@@ -162,8 +182,8 @@ def _apply_schedule_origin_wake(store: Any, row: dict[str, Any], payload: dict[s
         store.outbox_mark(row["id"], state="applied")
         return {"success": True, "task_id": row.get("board_task_id", "")}
     error = str(result.get("error") or "origin_wake_not_yet_accepted")[:200]
-    _mark_outbox_pending(store, row, error)
-    return {"success": False, "error": error}
+    state = _mark_outbox_pending(store, row, error)
+    return {"success": False, "error": error, "state": state}
 
 
 def _origin_wake_satisfied(adapter: Any, task_id: str, endpoint: str) -> bool:
@@ -178,6 +198,12 @@ def _apply_record_consumer_ack(store: Any, row: dict[str, Any], payload: dict[st
     task_id = str(payload.get("task_id") or "")
     endpoint = str(payload.get("endpoint") or "")
     status = str(payload.get("status") or "")
+    # Terminal callback state is checked before anything else, including the
+    # adapter probe: a deadlettered callback edge must cost zero adapter calls
+    # and zero durable growth on every later retry/restart/reconcile pass
+    # (M31B2 acceptance item 2).
+    if row["state"] == "callback_deadletter":
+        return _deadletter_result(row)
     if adapter is None:
         return {"success": False, "error": "no_adapter"}
     check = getattr(adapter, "consumer_ack_satisfied", None)
@@ -186,8 +212,8 @@ def _apply_record_consumer_ack(store: Any, row: dict[str, Any], payload: dict[st
             verified = check(task_id, endpoint, status)
             if verified and verified.get("success"):
                 return {"success": True, "task_id": row.get("board_task_id", "")}
-        _mark_outbox_pending(store, row, "consumer_ack_not_verified")
-        return {"success": False, "error": "consumer_ack_not_verified"}
+        state = _mark_outbox_pending(store, row, "consumer_ack_not_verified")
+        return {"success": False, "error": "consumer_ack_not_verified", "state": state}
     if row["state"] == "pending" and float(row.get("next_attempt_at") or 0) > time.time():
         return {"success": False, "error": "outbox_retry_not_due"}
     record = getattr(adapter, "record_consumer_ack", None)
@@ -201,17 +227,30 @@ def _apply_record_consumer_ack(store: Any, row: dict[str, Any], payload: dict[st
             return {"success": True, "task_id": row.get("board_task_id", "")}
         result = {"success": False, "error": "consumer_ack_not_verified", "ack": verified}
     error = str(result.get("error") or "consumer_ack_failed")[:200]
-    _mark_outbox_pending(store, row, error)
-    return {"success": False, "error": error}
+    state = _mark_outbox_pending(store, row, error)
+    return {"success": False, "error": error, "state": state}
 
 
-def _mark_outbox_pending(store: Any, row: dict[str, Any], error: str) -> None:
+def _mark_outbox_pending(store: Any, row: dict[str, Any], error: str) -> str:
+    """Record one failed attempt and return the durable state it landed in:
+    ``pending`` while retries remain, ``callback_deadletter`` once a
+    callback-only operation has burned its bounded retry cap."""
     attempts_after = int(row.get("attempts") or 0) + 1
     if str(row.get("operation") or "") in CALLBACK_ONLY_OPERATIONS and attempts_after >= CALLBACK_RETRY_CAP:
         store.outbox_mark(row["id"], state="callback_deadletter", next_attempt_at=0, last_error=error)
-        return
+        return "callback_deadletter"
     delay = min(300.0, max(5.0, 5.0 * (2 ** min(attempts_after - 1, 6))))
     store.outbox_mark(row["id"], state="pending", next_attempt_at=time.time() + delay, last_error=error)
+    return "pending"
+
+
+def _deadletter_result(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "success": False,
+        "error": str(row.get("last_error") or "callback_deadletter"),
+        "state": "callback_deadletter",
+        "terminal": True,
+    }
 
 
 def _has_failed_nested_ack(result: dict[str, Any]) -> bool:

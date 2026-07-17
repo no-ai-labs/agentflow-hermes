@@ -11,14 +11,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import sqlite3
 import time
 from pathlib import Path
 from typing import Any
 
-from .board_adapter import FakeBoardAdapter, RealBoardAdapter
+from .board_adapter import FakeBoardAdapter, RealBoardAdapter, default_board_kanban_db_path
 from .board_events import BoardEvent, FakeBoardEventSource
 from .continuation_config import ContractRegistry, UnknownContractError, load_contract_registry
 from .continuation_engine import ingest_board_once
+from .continuations.base import apply_board_operation
 from .continuation_store import (
     ContinuationState,
     ContinuationStore,
@@ -31,6 +33,37 @@ from .continuation_store import (
 from .live.sanitize import safe_event_payload
 
 _DEFAULT_CONTRACTS_DIR = Path(__file__).resolve().parents[2] / "contracts"
+
+
+def _board_max_event_id(board: str) -> int | None:
+    db_path = default_board_kanban_db_path(board)
+    if not db_path.exists():
+        return None
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            row = conn.execute("select coalesce(max(id), 0) as max_event_id from task_events").fetchone()
+            return int(row[0] or 0) if row is not None else 0
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+
+
+def _cursor_lag_rows(cursors: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for cursor in cursors:
+        board = str(cursor.get("board") or "")
+        last_event_id = int(cursor.get("last_event_id") or 0)
+        max_event_id = _board_max_event_id(board)
+        rows.append({
+            "board": board,
+            "db_identity": str(cursor.get("db_identity") or ""),
+            "last_event_id": last_event_id,
+            "max_event_id": max_event_id,
+            "lag": (max(0, int(max_event_id) - last_event_id) if max_event_id is not None else None),
+        })
+    return rows
 
 
 def _default_contract_paths() -> list[Path]:
@@ -220,27 +253,28 @@ def run_continuation_retry(args: argparse.Namespace) -> tuple[int, dict[str, Any
         return 2, {"success": False, "error": str(exc)}
     pending = [row for row in store.list_outbox() if row["continuation_id"] == args.instance_id and row["state"] == "pending"]
     retried = []
+    failed = []
     for row in pending:
         payload = json.loads(row["payload_json"])
         operation = row.get("operation") or "create_task"
-        if operation == "create_task":
-            result = adapter.create_task(payload)
-        elif operation == "subscribe":
-            result = adapter.subscribe(str(payload.get("task_id") or ""), str(payload.get("endpoint") or ""))
-        elif operation == "complete_owner_anchor":
-            result = adapter.complete_owner_anchor(
-                str(payload.get("task_id") or ""), receipt_ref=str(payload.get("receipt_ref") or "")
-            )
-        else:
-            result = {"success": False, "error": "unknown_outbox_operation"}
+        result = apply_board_operation(
+            store,
+            args.instance_id,
+            step_id=row.get("step_id") or "",
+            operation=operation,
+            payload=payload,
+            idempotency_key=row["idempotency_key"],
+            adapter=adapter,
+        )
         if result.get("success"):
             task_id = result.get("task_id", "")
-            store.outbox_mark(row["id"], state="applied", board_task_id=task_id)
             step_id = row.get("step_id") or ""
             if step_id:
                 store.mark_step(int(step_id), state="applied", board_task_id=task_id)
             retried.append(row["idempotency_key"])
-    return 0, safe_event_payload({"success": True, "retried": retried, "pending_before": len(pending)})
+        else:
+            failed.append(row["idempotency_key"])
+    return 0, safe_event_payload({"success": True, "retried": retried, "failed": failed, "pending_before": len(pending)})
 
 
 def run_continuation_doctor(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
@@ -280,9 +314,23 @@ def run_continuation_doctor(args: argparse.Namespace) -> tuple[int, dict[str, An
         pending = [r for r in outbox_rows if r["state"] == "pending"]
         dead = [r for r in outbox_rows if r["state"] != "pending"]
         typed_origin_missing = [r for r in outbox_rows if r.get("last_error") == "typed_origin_missing"]
+        lag_rows = _cursor_lag_rows(cursors)
+        lag_values = [int(r["lag"]) for r in lag_rows if r.get("lag") is not None]
+        oldest_poison = None
+        if outbox_rows:
+            oldest_row = min(outbox_rows, key=lambda r: float(r.get("continuation_updated_at") or 0))
+            oldest_poison = {
+                "board": oldest_row["board"],
+                "source_event_id": oldest_row["source_event_id"],
+                "continuation_id": oldest_row["continuation_id"],
+                "age_seconds": now - float(oldest_row.get("continuation_updated_at") or now),
+            }
         result["cursor_health"] = {
             "cursors": cursors,
-            "cursor_lag_available": False,
+            "cursor_lag_available": bool(lag_rows),
+            "cursor_lag": lag_rows,
+            "max_cursor_lag": max(lag_values) if lag_values else None,
+            "oldest_poison": oldest_poison,
             "poison_candidates": [
                 {
                     "board": r["board"],

@@ -159,6 +159,42 @@ def test_doctor_reports_callback_routing_separate_from_semantic_protection(tmp_p
     assert report["cursor_health"]["poison_candidates"][0]["source_event_id"] == "8401"
 
 
+def test_doctor_reports_cursor_lag_and_oldest_poison(tmp_path, capsys, monkeypatch):
+    db_path = tmp_path / "continuation.sqlite"
+    store = ContinuationStore(db_path)
+    store.advance_cursor("warroom-os", "warroom-os-db", 8388)
+    instance = store.create_instance(
+        board="warroom-os",
+        source_task_id="t_source",
+        source_event_id="8517",
+        continuation_kind="code_fix",
+    )["instance"]
+    store.transition(instance["id"], ContinuationState.MATERIALIZING)
+    store.transition(instance["id"], ContinuationState.FAILED_RETRYABLE)
+    store.outbox_enqueue(
+        instance["id"],
+        step_id="0",
+        operation="record_consumer_ack",
+        payload={"task_id": "t_source", "endpoint": "discord:missing", "status": "semantic_block_remediation_created"},
+        idempotency_key="ack:t_source",
+    )
+    row = store.list_outbox()[0]
+    store.outbox_mark(row["id"], state="pending", last_error="typed_origin_missing", next_attempt_at=9999999999)
+
+    from agentflow_hermes import continuation_cli
+
+    monkeypatch.setattr(continuation_cli, "_board_max_event_id", lambda board: 8523 if board == "warroom-os" else None)
+    rc, report = _run_capture(["continuation", "doctor"], tmp_path, capsys)
+
+    assert rc == 0
+    assert report["cursor_health"]["cursor_lag_available"] is True
+    assert report["cursor_health"]["cursor_lag"][0]["last_event_id"] == 8388
+    assert report["cursor_health"]["cursor_lag"][0]["max_event_id"] == 8523
+    assert report["cursor_health"]["cursor_lag"][0]["lag"] == 135
+    assert report["cursor_health"]["max_cursor_lag"] == 135
+    assert report["cursor_health"]["oldest_poison"]["source_event_id"] == "8517"
+
+
 def test_migrate_store_cli_copies_from_explicit_legacy_db(tmp_path, capsys):
     legacy_path = tmp_path / "legacy.sqlite"
     legacy_store = ContinuationStore(legacy_path)
@@ -237,3 +273,50 @@ def test_retry_reconciles_pending_outbox_create_and_subscribe(tmp_path, capsys):
         ("create_task", "applied", 1),
         ("subscribe", "applied", 1),
     ]
+
+
+def test_retry_uses_callback_policy_for_consumer_ack_deadletter(tmp_path, capsys, monkeypatch):
+    from agentflow_hermes import continuation_cli
+    from agentflow_hermes.board_adapter import FakeBoardAdapter
+
+    class MissingAckAdapter(FakeBoardAdapter):
+        def record_consumer_ack(self, task_id: str, endpoint: str, status: str) -> dict[str, object]:
+            return {"success": False, "error": "typed_origin_missing"}
+
+    db_path = tmp_path / "continuation.sqlite"
+    store = ContinuationStore(db_path)
+    instance = store.create_instance(
+        board="warroom-os",
+        source_task_id="t_source",
+        source_event_id="ev_ack",
+        continuation_kind="code_fix",
+    )["instance"]
+    store.outbox_enqueue(
+        instance["id"],
+        step_id="0",
+        operation="record_consumer_ack",
+        payload={"task_id": "t_source", "endpoint": "discord:#missing", "status": "semantic_block_remediation_created"},
+        idempotency_key="ack:t_source",
+    )
+    monkeypatch.setattr(continuation_cli, "_adapter", lambda args: MissingAckAdapter())
+
+    for _ in range(5):
+        with store.connect() as con:
+            con.execute("update board_outbox set next_attempt_at=0")
+        rc = cli.main(["continuation", "retry", str(instance["id"]), "--db", str(db_path)])
+        report = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+        assert rc == 0
+        assert report["failed"] == ["ack:t_source"]
+
+    row = store.list_outbox()[0]
+    assert row["operation"] == "record_consumer_ack"
+    assert row["state"] == "callback_deadletter"
+    assert row["attempts"] == 5
+
+    # A terminal callback row is no longer selected by CLI retry, so attempts
+    # remain frozen and no adapter call is made after deadletter.
+    rc = cli.main(["continuation", "retry", str(instance["id"]), "--db", str(db_path)])
+    report = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert rc == 0
+    assert report["pending_before"] == 0
+    assert store.list_outbox()[0]["attempts"] == 5

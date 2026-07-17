@@ -13,7 +13,7 @@ from typing import Any
 from agentflow_hermes.board_adapter import FakeBoardAdapter
 from agentflow_hermes.board_events import BoardEvent, FakeBoardEventSource
 from agentflow_hermes.continuation_config import load_contract_registry
-from agentflow_hermes.continuation_engine import backfill_code_fix_event, ingest_board_once
+from agentflow_hermes.continuation_engine import backfill_code_fix_event, ingest_board_once, record_operator_resolution_receipt
 from agentflow_hermes.continuation_store import ContinuationStore
 from pathlib import Path
 
@@ -203,7 +203,7 @@ class _FailingConsumerAckAdapter(FakeBoardAdapter):
         return {"success": False, "error": "consumer_ack_cli_failed"}
 
 
-def test_code_fix_consumer_ack_failure_fails_closed_then_retry_succeeds_once(tmp_path):
+def test_code_fix_consumer_ack_failure_is_callback_only_after_graph_is_durable(tmp_path):
     store = ContinuationStore(tmp_path / "agentflow.sqlite")
 
     failing = _FailingConsumerAckAdapter()
@@ -211,30 +211,80 @@ def test_code_fix_consumer_ack_failure_fails_closed_then_retry_succeeds_once(tmp
 
     item = first["results"][0]
     assert item["action"] == "code_fix_applied"
-    assert item["router_success"] is False
-    # Fail closed: cursor did not advance despite the fix/review graph and
-    # return-edge subscription already being durable.
-    assert store.get_cursor("warroom-os", "warroom-os-db") == 0
+    assert item["router_success"] is True
+    # M31B2: once fix/review graph and the review return-edge subscription are
+    # durable, consumer ACK is callback-only. It must not pin cursor progress or
+    # roll the continuation back to failed_retryable.
+    assert store.get_cursor("warroom-os", "warroom-os-db") == 7305
     instance = store.list_instances()[0]
-    assert instance["state"] == "failed_retryable"
+    assert instance["state"] == "waiting_review"
     assert len(failing.tasks) == 2
     assert len(failing.subscriptions) == 1
     assert failing.consumer_acks == []
+    assert item["code_fix"]["callback_status"] == "callback_deferred"
+    assert item["code_fix"]["consumer_ack_status"] == "callback_deferred"
 
-    # Retry with a working adapter after the durable backoff is due: the
-    # already-applied fix/review/subscribe steps dedupe locally, exactly one
-    # consumer ACK is recorded, and the cursor advances exactly once.
+    # Event replay after cursor advance creates no tasks/subscriptions and does
+    # not re-enter materialization.
     with store.connect() as con:
         con.execute("update board_outbox set next_attempt_at=0")
     working = FakeBoardAdapter()
     second = _ingest(store, working, [_t89_event()])
-    assert second["results"][0]["router_success"] is True
+    assert second["processed"] == 0
     assert working.tasks == {}
     assert working.subscriptions == []
-    assert working.consumer_acks == [("t_89e3c71f", "discord:#research", "semantic_block_remediation_created")]
     assert store.get_cursor("warroom-os", "warroom-os-db") == 7305
     assert len(store.list_instances()) == 1
     assert store.list_instances()[0]["state"] == "waiting_review"
+
+
+class _MissingConsumerAckAdapter(FakeBoardAdapter):
+    def record_consumer_ack(self, task_id: str, endpoint: str, status: str) -> dict[str, Any]:
+        return {"success": False, "error": "typed_origin_missing"}
+
+
+def test_code_fix_callback_deadletter_is_terminal_and_later_event_processes(tmp_path):
+    from agentflow_hermes.daemon import reconcile_outbox
+
+    store = ContinuationStore(tmp_path / "agentflow.sqlite")
+    store.advance_cursor("warroom-os", "warroom-os-db", 7299)
+    first = _t89_event(event_id="7305", event_seq=7305, source_task_id="t_no_origin")
+    later = _t89_event(event_id="8517", event_seq=8517, source_task_id="t_later_block")
+    adapter = _MissingConsumerAckAdapter()
+
+    result = ingest_board_once(
+        board="warroom-os",
+        source=FakeBoardEventSource(db_identity="warroom-os-db", events=[first, later]),
+        store=store,
+        contract_registry=_contracts(),
+        adapter=adapter,
+        apply=True,
+    )
+
+    assert result["cursor"] == 8517
+    assert [r["router_success"] for r in result["results"]] == [True, True]
+    assert [r["code_fix"]["callback_status"] for r in result["results"]] == [
+        "callback_unroutable",
+        "callback_unroutable",
+    ]
+    assert len(adapter.tasks) == 4
+    assert len(adapter.subscriptions) == 2
+    assert [i["state"] for i in store.list_instances()] == ["waiting_review", "waiting_review"]
+
+    ack_row = next(r for r in store.list_outbox() if r["operation"] == "record_consumer_ack")
+    for _ in range(5):
+        with store.connect() as con:
+            con.execute("update board_outbox set next_attempt_at=0 where id=?", (ack_row["id"],))
+        reconcile_outbox(store, adapter_by_board={"warroom-os": adapter})
+    dead = next(r for r in store.list_outbox() if r["id"] == ack_row["id"])
+    assert dead["state"] == "callback_deadletter"
+    attempts = dead["attempts"]
+    calls_before = len(adapter.consumer_acks)
+    reconcile_outbox(store, adapter_by_board={"warroom-os": adapter})
+    again = next(r for r in store.list_outbox() if r["id"] == ack_row["id"])
+    assert again["attempts"] == attempts
+    assert len(adapter.consumer_acks) == calls_before
+    assert len(adapter.tasks) == 4
 
 
 def test_delivered_subscription_is_the_semantic_return_not_a_direct_send(tmp_path):
@@ -291,6 +341,44 @@ def test_backfill_missed_event_detects_manual_remediation_and_does_not_duplicate
     again = backfill_code_fix_event(
         board="warroom-os", source=source, store=store, event_id="7305", adapter=adapter,
         existing_remediation_ids=["t_566a2b1b", "t_706d3754"],
+    )
+    assert again["created"] is False
+    assert len(store.list_instances()) == 1
+    assert adapter.tasks == {}
+
+
+def test_operator_resolution_receipt_for_8517_is_explicit_idempotent_and_creates_zero_tasks(tmp_path):
+    store = ContinuationStore(tmp_path / "agentflow.sqlite")
+    adapter = FakeBoardAdapter()
+    source = FakeBoardEventSource(
+        db_identity="warroom-os-db",
+        events=[_t89_event(event_id="8517", event_seq=8517, source_task_id="t_0e72730a")],
+    )
+
+    report = record_operator_resolution_receipt(
+        board="warroom-os",
+        source=source,
+        store=store,
+        event_id="8517",
+        operator_receipt_ref="operator:m31b2:8517",
+    )
+
+    assert report["success"] is True
+    assert report["action"] == "superseded_by_operator"
+    assert report["receipt_key"] == "warroom-os:8517"
+    assert report["created_tasks"] == 0
+    assert report["state"] == "resumed"
+    assert adapter.tasks == {}
+    sats = store.list_requirement_satisfactions(report["instance_id"])
+    assert sats[0]["source_kind"] == "operator_resolution_receipt"
+    assert sats[0]["value"]["source_event_id"] == "8517"
+
+    again = record_operator_resolution_receipt(
+        board="warroom-os",
+        source=source,
+        store=store,
+        event_id="8517",
+        operator_receipt_ref="operator:m31b2:8517",
     )
     assert again["created"] is False
     assert len(store.list_instances()) == 1

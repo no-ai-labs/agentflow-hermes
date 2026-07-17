@@ -25,7 +25,7 @@ from typing import Any
 
 from ..continuation_store import ContinuationState, ContinuationStore
 from ..outcome import ContinuationKind, OutcomeEnvelope
-from .base import StepResult, apply_board_operation, pending_outbox_retry_not_due
+from .base import StepResult, apply_board_operation, callback_status_for, pending_outbox_retry_not_due
 
 
 def _stable_digest(instance: dict[str, Any]) -> str:
@@ -160,8 +160,13 @@ class CodeFixHandler:
 
         # 3) Subscribe the review task back to the source's trusted origin via
         #    the board's own notify + active-wake path (never a direct send).
+        #    The subscribe IS the return graph edge, so a subscribe failure is
+        #    still a semantic materialization failure and stays fail-closed.
         endpoint = outcome.return_to_ref or outcome.origin_ref
         subscribed = False
+        callback_status = "not_requested"
+        callback_errors: list[str] = []
+        consumer_ack_status = "not_requested"
         if endpoint:
             sub = apply_board_operation(
                 store,
@@ -174,6 +179,15 @@ class CodeFixHandler:
             )
             if not sub.get("success"):
                 return self._fail(store, instance_id, "review_subscribe_failed", instance_id_meta=instance_id)
+            subscribed = True
+
+            # 4) Best-effort callback routing ledger. The fix/review graph and
+            # its return edge are durable at this point, so a missing/no-origin
+            # consumer ACK is a callback limitation — not a semantic failure.
+            # It must not roll the continuation back to FAILED_RETRYABLE, must
+            # not pin the board cursor, and must not re-create any task. The
+            # outbox row stays durable for reconcile/doctor under the bounded
+            # retry/deadletter policy in continuations.base (M31B2 item 1).
             consumer_ack = apply_board_operation(
                 store,
                 instance_id,
@@ -187,9 +201,16 @@ class CodeFixHandler:
                 idempotency_key=f"code_fix_consumer_ack:{review_key}:{endpoint}",
                 adapter=adapter,
             )
-            if not consumer_ack.get("success"):
-                return self._fail(store, instance_id, "consumer_ack_failed", instance_id_meta=instance_id)
-            subscribed = True
+            if consumer_ack.get("success"):
+                consumer_ack_status = "semantic_block_remediation_created"
+                callback_status = "delivered"
+            else:
+                callback_status = callback_status_for(consumer_ack)
+                consumer_ack_status = callback_status
+                callback_errors.append(str(consumer_ack.get("error") or "consumer_ack_failed"))
+        else:
+            callback_status = "callback_unroutable"
+            callback_errors.append("code_fix_origin_missing")
 
         if instance["state"] == ContinuationState.MATERIALIZING.value:
             store.transition(instance_id, ContinuationState.WAITING_REVIEW, reason="code_fix_graph_materialized")
@@ -203,7 +224,9 @@ class CodeFixHandler:
                 "fix_task_id": fix_task_id,
                 "review_task_id": review_task_id,
                 "subscribed": subscribed,
-                "consumer_ack_status": "semantic_block_remediation_created" if subscribed else "",
+                "consumer_ack_status": consumer_ack_status,
+                "callback_status": callback_status,
+                "callback_errors": callback_errors,
                 "endpoint": endpoint,
             },
         )
