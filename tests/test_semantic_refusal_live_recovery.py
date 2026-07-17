@@ -5,10 +5,10 @@ import sqlite3
 import subprocess
 from pathlib import Path
 
-from agentflow_hermes.board_adapter import RealBoardAdapter
+from agentflow_hermes.board_adapter import FakeBoardAdapter, RealBoardAdapter
 from agentflow_hermes.board_events import BoardEvent, FakeBoardEventSource
 from agentflow_hermes.continuation_config import load_contract_registry
-from agentflow_hermes.continuation_engine import ingest_board_once
+from agentflow_hermes.continuation_engine import ingest_board_once, reconcile_outbox
 from agentflow_hermes.continuation_store import ContinuationState, ContinuationStore
 from agentflow_hermes.continuations.semantic_refusal import SemanticRefusalHandler, _stable_digest
 from agentflow_hermes.outcome import ContinuationKind, OutcomeEnvelope, Verdict
@@ -242,8 +242,9 @@ def test_semantic_refusal_cli_failure_backoff_bounds_events_and_clears_on_conver
         )
 
     first = route()
-    assert first["cursor"] == 0
-    assert first["results"][0]["router_success"] is False
+    assert first["cursor"] == 3968
+    assert first["results"][0]["router_success"] is True
+    assert first["results"][0]["refusal"]["callback_status"] == "callback_unroutable"
     instance = store.list_instances()[0]
     event_count_after_attempt = len(store.list_events(instance["id"]))
     row_after_attempt = store.list_outbox()[0]
@@ -253,8 +254,7 @@ def test_semantic_refusal_cli_failure_backoff_bounds_events_and_clears_on_conver
 
     for _ in range(5):
         replay = route()
-        assert replay["cursor"] == 0
-        assert replay["results"][0]["router_success"] is False
+        assert replay["processed"] == 0
 
     assert len(store.list_events(instance["id"])) == event_count_after_attempt
     assert store.list_outbox()[0]["attempts"] == 1
@@ -264,20 +264,6 @@ def test_semantic_refusal_cli_failure_backoff_bounds_events_and_clears_on_conver
     with store.connect() as con:
         con.execute("update board_outbox set next_attempt_at=0")
 
-    recovered = route()
-    assert recovered["cursor"] == 3968
-    assert recovered["results"][0]["router_success"] is True
-    rows = {row["operation"]: row for row in store.list_outbox()}
-    assert rows["schedule_origin_wake"]["state"] == "applied"
-    assert rows["schedule_origin_wake"]["last_error"] == ""
-    assert rows["schedule_origin_wake"]["next_attempt_at"] == 0
-    assert rows["record_consumer_ack"]["state"] == "applied"
-    assert rows["record_consumer_ack"]["last_error"] == ""
-    assert rows["record_consumer_ack"]["next_attempt_at"] == 0
-    assert len([c for c in calls if "wake-origin" in c]) == 2
-    assert len([c for c in calls if "consumer-ack-origin" in c]) == 1
-
-    terminal_event_count = len(store.list_events(instance["id"]))
     outcome = OutcomeEnvelope(
         schema_version=1,
         event_id="kanban-event-3968",
@@ -290,6 +276,25 @@ def test_semantic_refusal_cli_failure_backoff_bounds_events_and_clears_on_conver
         return_to_ref="discord:1497895797579190357",
     )
     adapter = RealBoardAdapter(runner=runner, board="agentflow-hermes", board_db_path=board_db)
+    recovered = SemanticRefusalHandler().materialize(
+        outcome,
+        store=store,
+        adapter=adapter,
+        blockers=("credentials required from user",),
+        refusal_categories=("credentials",),
+    )
+    assert recovered.success is True
+    rows = {row["operation"]: row for row in store.list_outbox()}
+    assert rows["schedule_origin_wake"]["state"] == "applied"
+    assert rows["schedule_origin_wake"]["last_error"] == ""
+    assert rows["schedule_origin_wake"]["next_attempt_at"] == 0
+    assert rows["record_consumer_ack"]["state"] == "applied"
+    assert rows["record_consumer_ack"]["last_error"] == ""
+    assert rows["record_consumer_ack"]["next_attempt_at"] == 0
+    assert len([c for c in calls if "wake-origin" in c]) == 2
+    assert len([c for c in calls if "consumer-ack-origin" in c]) == 2
+
+    terminal_event_count = len(store.list_events(instance["id"]))
     for _ in range(3):
         result = SemanticRefusalHandler().materialize(
             outcome,
@@ -318,11 +323,12 @@ def test_semantic_refusal_accepts_existing_one_shot_receipt_and_backs_off_retry(
 
     first = _route(store, board_db, calls)
 
-    assert first["cursor"] == 0
-    assert first["results"][0]["router_success"] is False
+    assert first["cursor"] == 3968
+    assert first["results"][0]["router_success"] is True
+    assert first["results"][0]["refusal"]["callback_status"] == "callback_deferred"
     rows = store.list_outbox()
-    assert len(rows) == 1
-    wake_row = rows[0]
+    assert len(rows) == 2
+    wake_row = {row["operation"]: row for row in rows}["schedule_origin_wake"]
     assert wake_row["state"] == "pending"
     assert wake_row["operation"] == "schedule_origin_wake"
     assert wake_row["attempts"] == 1
@@ -335,8 +341,7 @@ def test_semantic_refusal_accepts_existing_one_shot_receipt_and_backs_off_retry(
     call_count_after_first = len([c for c in calls if "wake-origin" in c])
     second = _route(store, board_db, calls)
     rows = store.list_outbox()
-    assert second["cursor"] == 0
-    assert second["results"][0]["router_success"] is False
+    assert second["processed"] == 0
     assert rows[0]["attempts"] == 1
     assert len([c for c in calls if "wake-origin" in c]) == call_count_after_first
 
@@ -355,10 +360,26 @@ def test_semantic_refusal_accepts_existing_one_shot_receipt_and_backs_off_retry(
     con.commit()
     con.close()
 
-    third = _route(store, board_db, calls)
+    outcome = OutcomeEnvelope(
+        schema_version=1,
+        event_id="kanban-event-3968",
+        board="agentflow-hermes",
+        source_task_id="t_source",
+        source_graph_id="graph:t_source",
+        verdict=Verdict.BLOCK,
+        continuation_kind=ContinuationKind.SEMANTIC_REFUSAL,
+        origin_ref="discord:1497895797579190357",
+        return_to_ref="discord:1497895797579190357",
+    )
+    third = SemanticRefusalHandler().materialize(
+        outcome,
+        store=store,
+        adapter=_adapter(board_db, calls),
+        blockers=("credentials required from user",),
+        refusal_categories=("credentials",),
+    )
 
-    assert third["cursor"] == 3968
-    assert third["results"][0]["router_success"] is True
+    assert third.success is True
     instance = store.list_instances()[0]
     assert instance["state"] == "blocked_invalid"
     assert store.list_requirement_satisfactions(instance["id"])[0]["field_name"] == "semantic_refusal"
@@ -392,6 +413,100 @@ def test_real_adapter_verifies_existing_one_shot_receipt_without_consumer_ack(tm
     assert result["ack"]["source"] == "existing_notify_wake_receipt"
     assert result["ack"]["consumer_ack_status"] == ""
     assert [c for c in calls if "notify-subscribe" in c and "--help" not in c] == []
+
+
+def test_no_origin_semantic_refusal_advances_past_later_event_without_duplicates(tmp_path):
+    store = ContinuationStore(tmp_path / "agentflow.sqlite")
+    store.advance_cursor("warroom-os", "warroom-os-db", 8387)
+    first = BoardEvent(
+        event_id="8401",
+        event_seq=8388,
+        source_task_id="t_no_origin",
+        source_graph_id="graph:t_no_origin",
+        run_metadata={
+            "agentflow_outcome": {
+                "schema_version": 1,
+                "verdict": "BLOCK",
+                "continuation_kind": "semantic_refusal",
+                "refusal_categories": ["credentials"],
+                "blockers": ["missing typed origin"],
+            }
+        },
+    )
+    later = BoardEvent(
+        event_id="8517",
+        event_seq=8517,
+        source_task_id="t_later_block",
+        source_graph_id="graph:t_later_block",
+        run_metadata={
+            "agentflow_outcome": {
+                "schema_version": 1,
+                "verdict": "BLOCK",
+                "continuation_kind": "semantic_refusal",
+                "refusal_categories": ["secrets"],
+                "blockers": ["later unsafe block"],
+            }
+        },
+    )
+
+    result = ingest_board_once(
+        board="warroom-os",
+        source=FakeBoardEventSource(db_identity="warroom-os-db", events=[first, later]),
+        store=store,
+        contract_registry=_contracts(),
+        adapter=FakeBoardAdapter(),
+        default_endpoint="",
+        apply=True,
+    )
+
+    assert result["cursor"] == 8517
+    assert [r["router_success"] for r in result["results"]] == [True, True]
+    assert [r["refusal"]["callback_status"] for r in result["results"]] == ["callback_unroutable", "callback_unroutable"]
+    assert [i["state"] for i in store.list_instances()] == ["blocked_invalid", "blocked_invalid"]
+    assert store.list_outbox() == []
+
+    replay = ingest_board_once(
+        board="warroom-os",
+        source=FakeBoardEventSource(db_identity="warroom-os-db", events=[first, later]),
+        store=store,
+        contract_registry=_contracts(),
+        adapter=FakeBoardAdapter(),
+        default_endpoint="",
+        apply=True,
+    )
+    assert replay["processed"] == 0
+    assert len(store.list_instances()) == 2
+
+
+def test_callback_only_reconcile_deadletters_after_retry_cap(tmp_path):
+    store = ContinuationStore(tmp_path / "agentflow.sqlite")
+    instance = store.create_instance(
+        board="warroom-os",
+        source_task_id="t_source",
+        source_event_id="8401",
+        continuation_kind="semantic_refusal",
+    )["instance"]
+    row = store.outbox_enqueue(
+        instance["id"],
+        step_id="0",
+        operation="record_consumer_ack",
+        payload={"task_id": "t_source", "endpoint": "discord:missing", "status": "semantic_refusal_ack"},
+        idempotency_key="ack:t_source",
+    )["outbox"]
+    store.outbox_mark(row["id"], state="pending", last_error="typed_origin_missing", next_attempt_at=0)
+    class FailingAckAdapter:
+        def record_consumer_ack(self, task_id, endpoint, status):
+            return {"success": False, "error": "typed_origin_missing"}
+
+    adapter = FailingAckAdapter()
+    for _ in range(5):
+        with store.connect() as con:
+            con.execute("update board_outbox set next_attempt_at=0")
+        reconcile_outbox(store, adapter_by_board={"warroom-os": adapter})
+
+    final = store.list_outbox()[0]
+    assert final["state"] == "callback_deadletter"
+    assert final["attempts"] == 5
 
 
 def test_recovery_of_terminal_instance_missing_consumer_ack_enqueues_only_that(tmp_path):
@@ -549,8 +664,9 @@ def test_consumer_ack_cli_timeout_persists_bounded_error_and_non_due_retry_is_qu
         apply=True,
     )
 
-    assert first["cursor"] == 0
-    assert first["results"][0]["router_success"] is False
+    assert first["cursor"] == 3968
+    assert first["results"][0]["router_success"] is True
+    assert first["results"][0]["refusal"]["callback_status"] == "callback_deferred"
     rows = {row["operation"]: row for row in store.list_outbox()}
     assert rows["record_consumer_ack"]["state"] == "pending"
     assert rows["record_consumer_ack"]["last_error"] == "cli_runner_timeout"
@@ -569,8 +685,7 @@ def test_consumer_ack_cli_timeout_persists_bounded_error_and_non_due_retry_is_qu
         apply=True,
     )
 
-    assert second["cursor"] == 0
-    assert second["results"][0]["router_success"] is False
+    assert second["processed"] == 0
     assert len([c for c in calls if "consumer-ack-origin" in c]) == 1
     assert len([e for e in store.list_events(instance["id"]) if e["kind"] == "state_transition"]) == transition_count
 
@@ -601,6 +716,7 @@ def test_consumer_ack_cli_lock_error_is_sanitized(tmp_path):
         apply=True,
     )
 
-    assert result["cursor"] == 0
+    assert result["cursor"] == 3968
+    assert result["results"][0]["router_success"] is True
     rows = {row["operation"]: row for row in store.list_outbox()}
     assert rows["record_consumer_ack"]["last_error"] == "cli_runner_db_locked"

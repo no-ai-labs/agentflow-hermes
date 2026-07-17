@@ -5,7 +5,7 @@ import json
 import pytest
 
 from agentflow_hermes import cli
-from agentflow_hermes.continuation_store import ContinuationStore
+from agentflow_hermes.continuation_store import ContinuationState, ContinuationStore
 
 
 def _events_file(tmp_path, events):
@@ -127,6 +127,36 @@ def test_doctor_reports_selected_store(tmp_path, capsys):
     assert report["success"] is True
     assert "selected" in report
     assert "legacy_residue" in report
+    assert "callback_routing" in report
+    assert report["callback_routing"]["typed_origin_missing_is_semantic_protection_absent"] is False
+
+
+def test_doctor_reports_callback_routing_separate_from_semantic_protection(tmp_path, capsys):
+    db_path = tmp_path / "continuation.sqlite"
+    store = ContinuationStore(db_path)
+    instance = store.create_instance(
+        board="warroom-os",
+        source_task_id="t_source",
+        source_event_id="8401",
+        continuation_kind="semantic_refusal",
+    )["instance"]
+    store.transition(instance["id"], ContinuationState.MATERIALIZING)
+    store.transition(instance["id"], ContinuationState.FAILED_RETRYABLE)
+    store.outbox_enqueue(
+        instance["id"],
+        step_id="0",
+        operation="record_consumer_ack",
+        payload={"task_id": "t_source", "endpoint": "discord:missing", "status": "semantic_refusal_ack"},
+        idempotency_key="ack:t_source",
+    )
+    row = store.list_outbox()[0]
+    store.outbox_mark(row["id"], state="pending", last_error="typed_origin_missing", next_attempt_at=9999999999)
+
+    rc, report = _run_capture(["continuation", "doctor"], tmp_path, capsys)
+    assert rc == 0
+    assert report["callback_routing"]["typed_origin_missing"] == 1
+    assert report["callback_routing"]["typed_origin_missing_is_semantic_protection_absent"] is False
+    assert report["cursor_health"]["poison_candidates"][0]["source_event_id"] == "8401"
 
 
 def test_migrate_store_cli_copies_from_explicit_legacy_db(tmp_path, capsys):

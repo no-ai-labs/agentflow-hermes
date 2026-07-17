@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from pathlib import Path
 from typing import Any
 
@@ -252,6 +253,58 @@ def run_continuation_doctor(args: argparse.Namespace) -> tuple[int, dict[str, An
     # doctor_store_selection itself never inspects (e.g. the M26 needs-input
     # watchdog DB).
     result["legacy_residue"] = legacy_residue_report()
+    selected = result.get("selected")
+    if selected:
+        store = ContinuationStore(Path(str(selected)))
+        store.init()
+        now = time.time()
+        with store.connect() as con:
+            cursors = [dict(r) for r in con.execute("select board, db_identity, last_event_id, updated_at from board_cursors order by board, db_identity").fetchall()]
+            outbox_rows = [dict(r) for r in con.execute(
+                """
+                select o.id, o.continuation_id, o.operation, o.state, o.attempts, o.last_error, o.next_attempt_at,
+                       c.board, c.source_task_id, c.source_event_id, c.continuation_kind, c.state as continuation_state, c.updated_at as continuation_updated_at
+                  from board_outbox o join continuation_instances c on c.id=o.continuation_id
+                 where o.operation in ('schedule_origin_wake', 'record_consumer_ack')
+                   and o.state in ('pending', 'callback_deadletter', 'callback_unroutable', 'callback_deferred')
+                 order by o.updated_at, o.id
+                """
+            ).fetchall()]
+            oldest = con.execute(
+                """
+                select min(updated_at) as oldest
+                  from continuation_instances
+                 where state in ('failed_retryable', 'materializing', 'waiting_review')
+                """
+            ).fetchone()
+        pending = [r for r in outbox_rows if r["state"] == "pending"]
+        dead = [r for r in outbox_rows if r["state"] != "pending"]
+        typed_origin_missing = [r for r in outbox_rows if r.get("last_error") == "typed_origin_missing"]
+        result["cursor_health"] = {
+            "cursors": cursors,
+            "cursor_lag_available": False,
+            "poison_candidates": [
+                {
+                    "board": r["board"],
+                    "source_event_id": r["source_event_id"],
+                    "continuation_id": r["continuation_id"],
+                    "operation": r["operation"],
+                    "state": r["state"],
+                    "attempts": r["attempts"],
+                    "last_error": r["last_error"],
+                }
+                for r in outbox_rows if r["continuation_state"] == ContinuationState.FAILED_RETRYABLE.value
+            ],
+            "oldest_blocked_age_seconds": (now - float(oldest["oldest"])) if oldest and oldest["oldest"] is not None else None,
+        }
+        result["callback_routing"] = {
+            "pending": len(pending),
+            "deadletter": len(dead),
+            "typed_origin_missing": len(typed_origin_missing),
+            "unhealthy": len(outbox_rows),
+            "typed_origin_missing_is_semantic_protection_absent": False,
+            "rows": outbox_rows[:20],
+        }
     return (0 if result.get("success") else 2), result
 
 

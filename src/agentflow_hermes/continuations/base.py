@@ -13,6 +13,9 @@ from typing import Any, Protocol
 
 from ..outcome import ContinuationKind, OutcomeEnvelope
 
+CALLBACK_ONLY_OPERATIONS = {"schedule_origin_wake", "record_consumer_ack"}
+CALLBACK_RETRY_CAP = 5
+
 
 def pending_outbox_retry_not_due(store: Any, instance_id: int, *, now: float | None = None) -> bool:
     """Return True when an existing pending outbox row is still in backoff.
@@ -204,6 +207,9 @@ def _apply_record_consumer_ack(store: Any, row: dict[str, Any], payload: dict[st
 
 def _mark_outbox_pending(store: Any, row: dict[str, Any], error: str) -> None:
     attempts_after = int(row.get("attempts") or 0) + 1
+    if str(row.get("operation") or "") in CALLBACK_ONLY_OPERATIONS and attempts_after >= CALLBACK_RETRY_CAP:
+        store.outbox_mark(row["id"], state="callback_deadletter", next_attempt_at=0, last_error=error)
+        return
     delay = min(300.0, max(5.0, 5.0 * (2 ** min(attempts_after - 1, 6))))
     store.outbox_mark(row["id"], state="pending", next_attempt_at=time.time() + delay, last_error=error)
 

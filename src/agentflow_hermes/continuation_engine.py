@@ -25,6 +25,7 @@ from .board_events import BoardEventSource, BoardRegistryEntry, LiveBoardEventSo
 from .board_adapter import RealBoardAdapter, default_board_kanban_db_path
 from .continuation import get_handler
 from .continuation_config import ContractRegistry, UnknownContractError
+from .continuations.base import CALLBACK_ONLY_OPERATIONS, CALLBACK_RETRY_CAP
 from .continuation_store import ContinuationState, ContinuationStore
 from .graph_creator import propose_next_slice_graph, propose_remediation_graph
 from .input_contract import InputContract
@@ -324,6 +325,9 @@ def reconcile_outbox(store: ContinuationStore, *, adapter_by_board: dict[str, An
 
     def _mark_pending(row: dict[str, Any], error: str) -> None:
         attempts_after = int(row.get("attempts") or 0) + 1
+        if str(row.get("operation") or "") in CALLBACK_ONLY_OPERATIONS and attempts_after >= CALLBACK_RETRY_CAP:
+            store.outbox_mark(row["id"], state="callback_deadletter", next_attempt_at=0, last_error=error[:200])
+            return
         delay = min(300.0, max(5.0, 5.0 * (2 ** min(attempts_after - 1, 6))))
         store.outbox_mark(row["id"], state="pending", next_attempt_at=time.time() + delay, last_error=error[:200])
 

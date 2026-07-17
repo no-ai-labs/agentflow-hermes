@@ -35,7 +35,7 @@ from typing import Any
 
 from ..continuation_store import ContinuationState, ContinuationStore
 from ..outcome import ContinuationKind, OutcomeEnvelope
-from .base import StepResult, apply_board_operation, pending_outbox_retry_not_due
+from .base import StepResult, apply_board_operation
 
 
 def _stable_digest(instance: dict[str, Any]) -> str:
@@ -84,15 +84,6 @@ class SemanticRefusalHandler:
 
         # Normalize into MATERIALIZING from a fresh detection or a prior failed
         # attempt so a retry re-derives the same terminal quarantine.
-        if instance["state"] == ContinuationState.FAILED_RETRYABLE.value and pending_outbox_retry_not_due(
-            store, instance_id
-        ):
-            return StepResult(
-                success=False,
-                reason="outbox_retry_not_due",
-                state=instance["state"],
-                metadata={"instance_id": instance_id, "created": creation["created"], "retry_due": False},
-            )
         if instance["state"] in (
             ContinuationState.DETECTED.value,
             ContinuationState.FAILED_RETRYABLE.value,
@@ -101,15 +92,31 @@ class SemanticRefusalHandler:
             instance = store.get_instance(instance_id)
         assert instance is not None
 
-        # 1) Targeted trusted-origin wake — never a direct send, and never the
-        # generic notify-subscribe path (that fires a passive notify, not a
-        # typed origin wake). This must reach a durable *accepted* wake status
-        # before we record the refusal ACK/quarantine below: scheduling alone
-        # is not semantic completion, and an unaccepted wake leaves the
-        # instance retryable without a false success receipt (M30F).
+        # 1) Internal semantic safety ACK + quarantine. This is the durable
+        # semantic state that protects downstream dependencies/cursor progress;
+        # callback delivery is recorded separately below and must never roll it
+        # back when the source has no typed origin (M31B cursor poison fix).
         digest = _stable_digest(instance)
         endpoint = outcome.return_to_ref or outcome.origin_ref
+        store.record_requirement_satisfaction(
+            instance_id,
+            field_name="semantic_refusal",
+            value={"categories": list(refusal_categories), "blockers": list(blockers)},
+            source_kind="semantic_refusal_ack",
+            source_ref=",".join(refusal_categories),
+        )
+        if instance["state"] != ContinuationState.BLOCKED_INVALID.value:
+            store.transition(instance_id, ContinuationState.BLOCKED_INVALID, reason="semantic_refusal_quarantined")
+
+        # 2) Best-effort callback routing ledger. A missing/no-origin callback
+        # edge is a callback limitation, not a semantic materialization failure.
+        # The outbox rows below remain durable for reconcile/doctor, have a
+        # bounded retry/deadletter policy in continuations.base/reconcile_outbox,
+        # and do not hold the board cursor after the quarantine is durable.
+        callback_status = "not_requested"
+        callback_errors: list[str] = []
         wake_satisfied = False
+        consumer_ack_status = "not_requested"
         if endpoint:
             wake = self._ensure_origin_wake(
                 store,
@@ -120,43 +127,41 @@ class SemanticRefusalHandler:
                 legacy_key_prefix=f"semantic_refusal_notify:{digest}:",
                 adapter=adapter,
             )
-            if not wake.get("success"):
-                return self._fail(store, instance_id, str(wake.get("error") or "refusal_wake_not_yet_accepted"))
-            wake_satisfied = True
+            if wake.get("success"):
+                wake_satisfied = True
+                callback_status = "wake_satisfied"
+            else:
+                error = str(wake.get("error") or "refusal_wake_not_yet_accepted")
+                callback_errors.append(error)
+                callback_status = "callback_deferred"
+
+            consumer_ack = apply_board_operation(
+                store,
+                instance_id,
+                step_id="0",
+                operation="record_consumer_ack",
+                payload={
+                    "task_id": outcome.source_task_id,
+                    "endpoint": endpoint,
+                    "status": "semantic_refusal_ack",
+                },
+                idempotency_key=f"semantic_refusal_consumer_ack:{digest}:{endpoint}",
+                adapter=adapter,
+            )
+            if consumer_ack.get("success"):
+                consumer_ack_status = "semantic_refusal_ack"
+                callback_status = "delivered" if wake_satisfied else callback_status
+            else:
+                error = str(consumer_ack.get("error") or "consumer_ack_failed")
+                callback_errors.append(error)
+                consumer_ack_status = "callback_deferred"
+                if error in {"typed_origin_missing", "consumer_ack_missing", "unparseable_origin_endpoint"}:
+                    callback_status = "callback_unroutable"
+                elif callback_status != "callback_unroutable":
+                    callback_status = "callback_deferred"
         else:
-            return self._fail(store, instance_id, "semantic_refusal_origin_missing")
-
-        consumer_ack = apply_board_operation(
-            store,
-            instance_id,
-            step_id="0",
-            operation="record_consumer_ack",
-            payload={
-                "task_id": outcome.source_task_id,
-                "endpoint": endpoint,
-                "status": "semantic_refusal_ack",
-            },
-            idempotency_key=f"semantic_refusal_consumer_ack:{digest}:{endpoint}",
-            adapter=adapter,
-        )
-        if not consumer_ack.get("success"):
-            return self._fail(store, instance_id, str(consumer_ack.get("error") or "consumer_ack_failed"))
-
-        # 2) Internal requirement ACK (idempotent upsert on field_name),
-        # recorded only after the trusted-origin wake and durable Hermes
-        # consumer ACK are both verified. The internal row is not a substitute
-        # for the public Hermes consumer-ack boundary.
-        store.record_requirement_satisfaction(
-            instance_id,
-            field_name="semantic_refusal",
-            value={"categories": list(refusal_categories), "blockers": list(blockers)},
-            source_kind="semantic_refusal_ack",
-            source_ref=",".join(refusal_categories),
-        )
-
-        # 3) Durable quarantine — explicitly not a successful CODE_FIX advance.
-        if instance["state"] != ContinuationState.BLOCKED_INVALID.value:
-            store.transition(instance_id, ContinuationState.BLOCKED_INVALID, reason="semantic_refusal_quarantined")
+            callback_status = "callback_unroutable"
+            callback_errors.append("semantic_refusal_origin_missing")
 
         return StepResult(
             success=True,
@@ -165,7 +170,9 @@ class SemanticRefusalHandler:
                 "instance_id": instance_id,
                 "created": creation["created"],
                 "refusal_ack": True,
-                "consumer_ack_status": "semantic_refusal_ack",
+                "consumer_ack_status": consumer_ack_status,
+                "callback_status": callback_status,
+                "callback_errors": callback_errors,
                 "refusal_categories": list(refusal_categories),
                 "subscribed": wake_satisfied,
                 "endpoint": endpoint,

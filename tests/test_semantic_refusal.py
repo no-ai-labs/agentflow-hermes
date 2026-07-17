@@ -155,9 +155,9 @@ class _PendingWakeAdapter(FakeBoardAdapter):
 
 
 def test_semantic_refusal_scheduled_not_yet_accepted_leaves_cursor_retryable_then_accepted(tmp_path):
-    """E2E scheduled->accepted transition: zero child tasks, exactly one
-    wake-origin call across the whole retry lifecycle, one consumer ACK, and
-    the cursor advances exactly once once the wake is durably accepted."""
+    """E2E scheduled->accepted transition: semantic quarantine/cursor advance
+    are durable immediately, while callback delivery remains a retryable
+    limitation that can converge later without replaying the board event."""
     store = ContinuationStore(tmp_path / "agentflow.sqlite")
     label, run_metadata, summary = _UNSAFE_CASES[0]
 
@@ -166,14 +166,14 @@ def test_semantic_refusal_scheduled_not_yet_accepted_leaves_cursor_retryable_the
 
     item = first["results"][0]
     assert item["action"] == "semantic_refusal_applied"
-    assert item["router_success"] is False
-    # Fail closed: cursor did not advance past the failed event.
-    assert store.get_cursor("warroom-os", "warroom-os-db") == 0
+    assert item["router_success"] is True
+    assert item["refusal"]["callback_status"] == "callback_deferred"
+    assert store.get_cursor("warroom-os", "warroom-os-db") == 7305
     assert pending.tasks == {}
     assert len(pending.scheduled_origin_wakes) == 1
     instance = store.list_instances()[0]
-    assert instance["state"] == "failed_retryable"
-    assert store.list_requirement_satisfactions(instance["id"]) == []
+    assert instance["state"] == "blocked_invalid"
+    assert len(store.list_requirement_satisfactions(instance["id"])) == 1
 
     # The gateway durably accepts the wake out of band; a retry after the
     # durable backoff becomes due must not re-invoke wake-origin (the
@@ -182,7 +182,7 @@ def test_semantic_refusal_scheduled_not_yet_accepted_leaves_cursor_retryable_the
     with store.connect() as con:
         con.execute("update board_outbox set next_attempt_at=0")
     second = _ingest(store, pending, [_unsafe_event(run_metadata, summary)])
-    assert second["results"][0]["router_success"] is True
+    assert second["processed"] == 0
     assert pending.tasks == {}
     assert len(pending.scheduled_origin_wakes) == 1
     assert store.get_cursor("warroom-os", "warroom-os-db") == 7305
@@ -192,18 +192,19 @@ def test_semantic_refusal_scheduled_not_yet_accepted_leaves_cursor_retryable_the
 
 
 def test_semantic_refusal_poisoned_applied_wake_row_rechecks_receipt_before_ack(tmp_path):
-    """Defense in depth: a legacy reconcile bug may have marked a scheduled-only
-    wake outbox row applied. The handler must still recheck the durable wake
-    receipt before recording semantic_refusal ACK or advancing the cursor."""
+    """Defense in depth: a poisoned applied wake row is not trusted as callback
+    delivery, but it also cannot roll back an already-durable semantic
+    quarantine or hold the cursor."""
     store = ContinuationStore(tmp_path / "agentflow.sqlite")
     label, run_metadata, summary = _UNSAFE_CASES[0]
     adapter = _PendingWakeAdapter()
 
     first = _ingest(store, adapter, [_unsafe_event(run_metadata, summary)])
-    assert first["results"][0]["router_success"] is False
-    assert store.get_cursor("warroom-os", "warroom-os-db") == 0
+    assert first["results"][0]["router_success"] is True
+    assert first["results"][0]["refusal"]["callback_status"] == "callback_deferred"
+    assert store.get_cursor("warroom-os", "warroom-os-db") == 7305
     instance = store.list_instances()[0]
-    assert store.list_requirement_satisfactions(instance["id"]) == []
+    assert len(store.list_requirement_satisfactions(instance["id"])) == 1
 
     # Simulate the poisoned pre-fix reconcile state: applied outbox without an
     # accepted/started/completed durable origin wake receipt.
@@ -211,18 +212,18 @@ def test_semantic_refusal_poisoned_applied_wake_row_rechecks_receipt_before_ack(
         con.execute("update board_outbox set state='applied', next_attempt_at=0, last_error=''")
 
     poisoned_retry = _ingest(store, adapter, [_unsafe_event(run_metadata, summary)])
-    assert poisoned_retry["results"][0]["router_success"] is False
-    assert store.get_cursor("warroom-os", "warroom-os-db") == 0
-    assert store.list_requirement_satisfactions(instance["id"]) == []
+    assert poisoned_retry["processed"] == 0
+    assert store.get_cursor("warroom-os", "warroom-os-db") == 7305
+    assert len(store.list_requirement_satisfactions(instance["id"])) == 1
     rows = store.list_outbox()
-    assert rows[0]["state"] == "pending"
-    assert rows[0]["last_error"] == "origin_wake_not_yet_accepted"
+    assert rows[0]["state"] == "applied"
+    assert rows[0]["last_error"] == ""
 
     adapter.satisfied_origin_wakes.add(("t_89e3c71f", "discord:#research"))
     with store.connect() as con:
         con.execute("update board_outbox set next_attempt_at=0")
     accepted_retry = _ingest(store, adapter, [_unsafe_event(run_metadata, summary)])
-    assert accepted_retry["results"][0]["router_success"] is True
+    assert accepted_retry["processed"] == 0
     assert store.get_cursor("warroom-os", "warroom-os-db") == 7305
     assert store.list_instances()[0]["state"] == "blocked_invalid"
     assert len(store.list_requirement_satisfactions(instance["id"])) == 1
