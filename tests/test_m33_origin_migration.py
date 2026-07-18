@@ -20,6 +20,8 @@ from agentflow_hermes import origin_migration as om
 from agentflow_hermes.cli import main as cli_main
 
 FROM = "research"
+FROM_HASH = "#research"
+FROM_OLD = "#research-old"
 TO = "1499390151393284106"
 
 # Real per-board Kanban shape (only the columns the migration/adapter read).
@@ -83,14 +85,14 @@ def _sub(con, task_id, chat_id, thread_id=""):
 
 
 def build_board_db(tmp_path: Path) -> Path:
-    """Board with: a plain symbolic origin+receipt+sub (t_plain), a collision
-    where both symbolic and numeric receipt rows exist (t_collide), and a
-    control numeric-only task (t_numeric) that must be left untouched."""
+    """Board with exact bare/literal aliases, a non-alias symbolic control,
+    numeric controls, and collision rows. Only ``research``/``#research`` are
+    in the bounded migration alias set; ``#research-old`` must stay untouched."""
     db = tmp_path / "kanban.db"
     con = sqlite3.connect(db)
     con.executescript(_BOARD_SCHEMA)
     # Task rows carry a secret in body/summary to prove they are never surfaced.
-    for tid in ("t_plain", "t_collide", "t_numeric"):
+    for tid in ("t_plain", "t_collide", "t_hash_plain", "t_hash_collide", "t_old", "t_numeric"):
         con.execute(
             "insert into tasks(id, title, body, assignee, status, workspace_path, workflow_template_id)"
             " values(?, 'title', 'API_KEY=sk-secret-do-not-print', 'worker', 'blocked', '/tmp/ws', 'g')",
@@ -111,6 +113,19 @@ def build_board_db(tmp_path: Path) -> Path:
     # numeric side already present: weak notify/wake but an ACK
     _receipt(con, "t_collide", TO, notify="pending", wake="pending", ack="acked", updated_at=9)
     _sub(con, "t_collide", FROM)
+
+    _origin(con, "t_hash_plain", FROM_HASH)
+    _receipt(con, "t_hash_plain", FROM_HASH, notify="delivered", wake="accepted", ack=None)
+    _sub(con, "t_hash_plain", FROM_HASH)
+
+    _origin(con, "t_hash_collide", FROM_HASH)
+    _receipt(con, "t_hash_collide", FROM_HASH, notify="delivered", wake="accepted", ack=None, updated_at=6)
+    _receipt(con, "t_hash_collide", TO, notify="pending", wake="pending", ack="acked", updated_at=10)
+    _sub(con, "t_hash_collide", FROM_HASH)
+
+    _origin(con, "t_old", FROM_OLD)
+    _receipt(con, "t_old", FROM_OLD, notify="delivered", wake="accepted", ack="acked")
+    _sub(con, "t_old", FROM_OLD)
 
     _origin(con, "t_numeric", TO)
     _receipt(con, "t_numeric", TO, notify="delivered", wake="completed", ack="acked")
@@ -191,8 +206,11 @@ def test_list_symbolic_origins(tmp_path):
     db = build_board_db(tmp_path)
     rows = om.list_symbolic_discord_origins(db)
     ids = sorted(r["task_id"] for r in rows)
-    assert ids == ["t_collide", "t_plain"]  # t_numeric excluded
-    assert all(r["chat_id"] == FROM for r in rows)
+    assert ids == ["t_collide", "t_hash_collide", "t_hash_plain", "t_old", "t_plain"]  # t_numeric excluded
+
+    filtered = om.list_symbolic_discord_origins(db, from_id="#research")
+    assert sorted(r["task_id"] for r in filtered) == ["t_collide", "t_hash_collide", "t_hash_plain", "t_plain"]
+    assert {r["chat_id"] for r in filtered} == {FROM, FROM_HASH}
 
 
 # --------------------------------------------------------------------------- #
@@ -206,13 +224,18 @@ def test_dry_run_report_shape(tmp_path):
     report = om.plan_discord_migration(board="warroom-os", from_id="#research", to_id=TO, board_db=db, store=store)
     assert report["success"] and report["writes"] == 0 and report["created_tasks"] == 0
     assert report["cursor_rewrites"] == 0
-    assert sorted(r["task_id"] for r in report["task_origin_rows"]) == ["t_collide", "t_plain"]
-    assert [c["task_id"] for c in report["collisions"]] == ["t_collide"]
+    assert report["from"] == FROM_HASH
+    assert report["from_aliases"] == [FROM_HASH, FROM]
+    assert report["source_token_counts"][FROM_HASH] == {"origins": 2, "receipts": 2, "subscriptions": 2, "total": 6}
+    assert report["source_token_counts"][FROM] == {"origins": 2, "receipts": 2, "subscriptions": 2, "total": 6}
+    assert report["source_total_counts"] == {"origins": 4, "receipts": 4, "subscriptions": 4, "total": 12}
+    assert sorted(r["task_id"] for r in report["task_origin_rows"]) == ["t_collide", "t_hash_collide", "t_hash_plain", "t_plain"]
+    assert sorted(c["task_id"] for c in report["collisions"]) == ["t_collide", "t_hash_collide"]
     merged = {m["task_id"]: m for m in report["merged_receipts"]}["t_collide"]
     assert merged["notify_delivery_status"] == "delivered"
     assert merged["active_wake_status"] == "accepted"
     assert merged["consumer_ack_status"] == "acked"
-    assert sorted(s["task_id"] for s in report["alias_subs_to_delete"]) == ["t_collide", "t_plain"]
+    assert sorted(s["task_id"] for s in report["alias_subs_to_delete"]) == ["t_collide", "t_hash_collide", "t_hash_plain", "t_plain"]
     assert [d["outbox_id"] for d in report["affected_deadletters"]]
     assert "<timestamp>" in report["planned_backups"]["board_db"]
 
@@ -235,6 +258,7 @@ def test_dry_run_byte_and_state_equality(tmp_path):
     after = board_snapshot()
     assert r1 == r2  # byte-identical dry runs
     assert before == after  # zero writes
+    assert json.loads(r1)["source_total_counts"] == {"origins": 4, "receipts": 4, "subscriptions": 4, "total": 12}
 
 
 # --------------------------------------------------------------------------- #
@@ -249,20 +273,31 @@ def test_apply_migrates_origins_and_merges_receipts(tmp_path):
     )
     assert report["success"], report
     m = report["board_migration"]
-    assert m["origins_migrated"] == 2
-    assert m["receipts_rekeyed"] == 1  # t_plain
-    assert m["receipts_merged"] == 1   # t_collide
-    assert m["alias_subs_deleted"] == 2
+    assert m["origins_migrated"] == 4
+    assert m["receipts_rekeyed"] == 2  # t_plain + t_hash_plain
+    assert m["receipts_merged"] == 2   # t_collide + t_hash_collide
+    assert m["alias_subs_deleted"] == 4
 
     con = sqlite3.connect(db)
     # all symbolic gone
     assert con.execute("select count(*) from kanban_task_origin where chat_id=?", (FROM,)).fetchone()[0] == 0
     assert con.execute("select count(*) from kanban_notify_receipts where chat_id=?", (FROM,)).fetchone()[0] == 0
     assert con.execute("select count(*) from kanban_notify_subs where chat_id=?", (FROM,)).fetchone()[0] == 0
+    assert con.execute("select count(*) from kanban_task_origin where chat_id=?", (FROM_HASH,)).fetchone()[0] == 0
+    assert con.execute("select count(*) from kanban_notify_receipts where chat_id=?", (FROM_HASH,)).fetchone()[0] == 0
+    assert con.execute("select count(*) from kanban_notify_subs where chat_id=?", (FROM_HASH,)).fetchone()[0] == 0
+    assert con.execute("select count(*) from kanban_task_origin where chat_id=?", (FROM_OLD,)).fetchone()[0] == 1
+    assert con.execute("select count(*) from kanban_notify_receipts where chat_id=?", (FROM_OLD,)).fetchone()[0] == 1
+    assert con.execute("select count(*) from kanban_notify_subs where chat_id=?", (FROM_OLD,)).fetchone()[0] == 1
     # merged numeric receipt preserves strongest facts
     row = con.execute(
         "select notify_delivery_status, active_wake_status, consumer_ack_status from kanban_notify_receipts"
         " where task_id='t_collide' and chat_id=?", (TO,)
+    ).fetchone()
+    assert row == ("delivered", "accepted", "acked")
+    row = con.execute(
+        "select notify_delivery_status, active_wake_status, consumer_ack_status from kanban_notify_receipts"
+        " where task_id='t_hash_collide' and chat_id=?", (TO,)
     ).fetchone()
     assert row == ("delivered", "accepted", "acked")
     # numeric-only control untouched (single row)
@@ -530,8 +565,8 @@ def test_cli_list_json(tmp_path, capsys):
     out = capsys.readouterr().out
     assert rc == 0
     payload = json.loads(out)
-    assert payload["count"] == 2
-    assert sorted(r["task_id"] for r in payload["symbolic_origins"]) == ["t_collide", "t_plain"]
+    assert payload["count"] == 5
+    assert sorted(r["task_id"] for r in payload["symbolic_origins"]) == ["t_collide", "t_hash_collide", "t_hash_plain", "t_old", "t_plain"]
 
 
 def test_cli_help_runs(capsys):
