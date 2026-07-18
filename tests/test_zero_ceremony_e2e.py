@@ -31,10 +31,15 @@ from agentflow_hermes.standing_policy import create_standing_policy
 
 _CONTRACTS_DIR = Path(__file__).resolve().parents[1] / "contracts"
 _BOARDS = ("agentflow-hermes", "warroom-os", "oracle-lab")
+# Canonical numeric Discord channel ids. AgentFlow-generated board default
+# endpoints must be numeric (M33 prevention rejects symbolic chat ids like
+# ``#research`` at board-registry load, before task/outbox materialization);
+# these are the numeric ids the legacy #hermes-main/#research/#shaman lanes map
+# to. Numbers only, no ``#name`` placeholder.
 _ENDPOINTS = {
-    "agentflow-hermes": "discord:#hermes-main",
-    "warroom-os": "discord:#research",
-    "oracle-lab": "discord:#shaman",
+    "agentflow-hermes": "discord:1497895797579190357",
+    "warroom-os": "discord:1499390151393284106",
+    "oracle-lab": "discord:1500539609413849200",
 }
 
 PLUGIN_FILE = Path(__file__).resolve().parents[1] / "plugins" / "hermes-agentflow" / "__init__.py"
@@ -250,7 +255,7 @@ def test_13_3_h1_natural_reply_resumes_via_real_plugin_bridge(tmp_path, monkeypa
 
     ctx = _plugin_ctx(monkeypatch, store_path, "hermes_agentflow_e2e_h1")
 
-    inbox_result = json.loads(_find_tool(ctx, "agentflow_input_inbox")["handler"]({"endpoint": "discord:#research"}))
+    inbox_result = json.loads(_find_tool(ctx, "agentflow_input_inbox")["handler"]({"endpoint": "discord:1499390151393284106"}))
     assert inbox_result["success"] is True
     assert len(inbox_result["cases"]) == 1
     case = inbox_result["cases"][0]
@@ -260,7 +265,7 @@ def test_13_3_h1_natural_reply_resumes_via_real_plugin_bridge(tmp_path, monkeypa
 
     submit_result = json.loads(
         _find_tool(ctx, "agentflow_submit_input_text")["handler"](
-            {"case_id": case_id, "endpoint": "discord:#research", "text": "https://example.com/result-natural", "owner_ref": "operator-main"}
+            {"case_id": case_id, "endpoint": "discord:1499390151393284106", "text": "https://example.com/result-natural", "owner_ref": "operator-main"}
         )
     )
     assert submit_result["success"] is True
@@ -307,14 +312,14 @@ def test_13_4_batched_case_one_question_resolves_three_with_no_duplicate_cards(t
     assert {m["continuation_id"] for m in members} == set(instance_ids)
 
     ctx = _plugin_ctx(monkeypatch, store_path, "hermes_agentflow_e2e_batch")
-    inbox_result = json.loads(_find_tool(ctx, "agentflow_input_inbox")["handler"]({"endpoint": "discord:#research"}))
+    inbox_result = json.loads(_find_tool(ctx, "agentflow_input_inbox")["handler"]({"endpoint": "discord:1499390151393284106"}))
     assert len(inbox_result["cases"]) == 1
     case_id = inbox_result["cases"][0]["case_id"]
 
     reply_text = "1 https://example.com/x, 2 recv_42, 3 looks good"
     submit_result = json.loads(
         _find_tool(ctx, "agentflow_submit_input_text")["handler"](
-            {"case_id": case_id, "endpoint": "discord:#research", "text": reply_text, "owner_ref": "operator-main"}
+            {"case_id": case_id, "endpoint": "discord:1499390151393284106", "text": reply_text, "owner_ref": "operator-main"}
         )
     )
     assert submit_result["success"] is True
@@ -356,7 +361,7 @@ def test_13_5_policy_reuse_second_equivalent_continuation_is_h0(tmp_path, monkey
     case_id = inbox_result["cases"][0]["case_id"]
     submit_result = json.loads(
         _find_tool(ctx, "agentflow_submit_input_text")["handler"](
-            {"case_id": case_id, "endpoint": "discord:#shaman", "text": "approve", "owner_ref": "operator-main"}
+            {"case_id": case_id, "endpoint": "discord:1500539609413849200", "text": "approve", "owner_ref": "operator-main"}
         )
     )
     assert submit_result["success"] is True

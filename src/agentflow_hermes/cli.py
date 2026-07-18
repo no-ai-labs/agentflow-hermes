@@ -35,6 +35,7 @@ from .roadmap_register import (
     run_roadmap_unregister,
 )
 from .maintenance.runner import run_runner_evaluate
+from .origin_migration import add_origin_cli_args, run_origin_list, run_origin_migrate_discord
 from .maintenance.trust import create_trust_grant, inspect_trust_grants, revoke_trust_grant
 from .maintenance.units import UnitRenderError
 from .store import AgentFlowStore, render_dispatch_prompt
@@ -354,6 +355,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     continuation = sub.add_parser("continuation")
     continuation_sub = continuation.add_subparsers(dest="continuation_cmd", required=True)
     add_continuation_cli_args(continuation_sub)
+
+    origin = sub.add_parser("origin")
+    origin_sub = origin.add_subparsers(dest="origin_cmd", required=True)
+    add_origin_cli_args(origin_sub)
 
     loop = sub.add_parser("loop")
     loop_sub = loop.add_subparsers(dest="loop_cmd", required=True)
@@ -679,6 +684,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             "migrate-store": run_continuation_migrate_store,
         }
         rc, report = handlers[args.continuation_cmd](args)
+        print(_dump(report))
+        return rc
+    if args.cmd == "origin":
+        origin_handlers = {
+            "migrate-discord": run_origin_migrate_discord,
+            "list": run_origin_list,
+        }
+        rc, report = origin_handlers[args.origin_cmd](args)
         print(_dump(report))
         return rc
     if args.cmd == "loop" and args.loop_cmd == "evaluate":
