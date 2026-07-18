@@ -94,8 +94,30 @@ def reject_symbolic_discord_endpoint(endpoint: str) -> str | None:
 
 # --- input validation -------------------------------------------------------
 
+_RESEARCH_SOURCE_ALIASES = ("#research", "research")
+
+
 def normalize_source(from_id: str) -> str:
-    return str(from_id or "").lstrip("#").strip()
+    """Return the exact source token after whitespace trimming only.
+
+    Do not strip ``#`` here: live Warroom rows can physically store the literal
+    ``#research`` chat_id, and SQL matching must be exact and explicit.
+    """
+    return str(from_id or "").strip()
+
+
+def source_match_tokens(from_id: str) -> tuple[str, ...]:
+    """Bounded exact source tokens to match for this migration.
+
+    ``#research`` and ``research`` are deliberate aliases for the same Devhub
+    lane; everything else remains an exact token. This avoids fuzzy/substring
+    matches and never includes numeric or neighboring symbolic values such as
+    ``#research-old``.
+    """
+    src = normalize_source(from_id)
+    if src in _RESEARCH_SOURCE_ALIASES:
+        return _RESEARCH_SOURCE_ALIASES
+    return (src,) if src else ()
 
 
 def validate_migration_inputs(from_id: str, to_id: str) -> str | None:
@@ -104,7 +126,7 @@ def validate_migration_inputs(from_id: str, to_id: str) -> str | None:
     dst = str(to_id or "").strip()
     if not dst.isdigit():
         return "discord_target_not_numeric"
-    if not src:
+    if not src or not src.strip("#"):
         return "discord_source_empty"
     if src == dst:
         return "discord_source_equals_target"
@@ -175,13 +197,13 @@ def list_symbolic_discord_origins(board_db: Path, *, from_id: str = "") -> list[
         ).fetchall()
     finally:
         con.close()
-    src = normalize_source(from_id)
+    source_tokens = source_match_tokens(from_id)
     out: list[dict[str, Any]] = []
     for r in rows:
-        chat_id = str(r["chat_id"] or "").lstrip("#")
+        chat_id = str(r["chat_id"] or "")
         if chat_id.isdigit():
             continue
-        if src and chat_id != src:
+        if source_tokens and chat_id not in source_tokens:
             continue
         out.append({"task_id": r["task_id"], "chat_id": chat_id, "thread_id": str(r["thread_id"] or "")})
     return out
@@ -272,57 +294,78 @@ def build_plan(
     ambiguous receipt merge, mismatched/cross-board deadletter selection).
     """
     src = normalize_source(from_id)
+    source_tokens = source_match_tokens(from_id)
     dst = str(to_id).strip()
     board_db = Path(board_db)
     if not board_db.exists():
         raise MigrationError("board_db_missing", path=str(board_db))
 
+    source_token_counts = {
+        token: {"origins": 0, "receipts": 0, "subscriptions": 0, "total": 0}
+        for token in source_tokens
+    }
+
     con = _connect_ro(board_db)
     try:
         _require_board_schema(con)
-        origin_rows = con.execute(
-            "select task_id, thread_id from kanban_task_origin where platform='discord' and chat_id=? order by task_id, thread_id",
-            (src,),
-        ).fetchall()
-        task_origin_rows = [{"task_id": r["task_id"], "from_chat_id": src, "to_chat_id": dst, "thread_id": str(r["thread_id"] or "")} for r in origin_rows]
+        task_origin_rows: list[dict[str, Any]] = []
+        for token in source_tokens:
+            origin_rows = con.execute(
+                "select task_id, thread_id from kanban_task_origin where platform='discord' and chat_id=? order by task_id, thread_id",
+                (token,),
+            ).fetchall()
+            source_token_counts[token]["origins"] = len(origin_rows)
+            task_origin_rows.extend(
+                {"task_id": r["task_id"], "from_chat_id": token, "to_chat_id": dst, "thread_id": str(r["thread_id"] or "")}
+                for r in origin_rows
+            )
 
         receipt_cols = _columns(con, "kanban_notify_receipts")
-        src_receipts = con.execute(
-            "select task_id, thread_id from kanban_notify_receipts where platform='discord' and chat_id=? order by task_id, thread_id",
-            (src,),
-        ).fetchall()
-
         receipt_plan: list[dict[str, Any]] = []
         collisions: list[dict[str, Any]] = []
         merged_previews: list[dict[str, Any]] = []
-        for r in src_receipts:
-            task_id = r["task_id"]
-            thread_id = str(r["thread_id"] or "")
-            source_full = _receipt_row_dict(con, receipt_cols, task_id=task_id, chat_id=src, thread_id=thread_id)
-            target_full = _receipt_row_dict(con, receipt_cols, task_id=task_id, chat_id=dst, thread_id=thread_id)
-            if target_full is None:
-                receipt_plan.append({"task_id": task_id, "thread_id": thread_id, "action": "rekey"})
-            else:
-                merged = merge_receipt_facts(source_full or {}, target_full)  # may raise ambiguous_receipt_merge
-                receipt_plan.append({"task_id": task_id, "thread_id": thread_id, "action": "merge"})
-                collisions.append({"task_id": task_id, "thread_id": thread_id})
-                merged_previews.append({"task_id": task_id, "thread_id": thread_id, **{k: merged[k] for k in _RECEIPT_MERGE_COLS}})
+        for token in source_tokens:
+            src_receipts = con.execute(
+                "select task_id, thread_id from kanban_notify_receipts where platform='discord' and chat_id=? order by task_id, thread_id",
+                (token,),
+            ).fetchall()
+            source_token_counts[token]["receipts"] = len(src_receipts)
+            for r in src_receipts:
+                task_id = r["task_id"]
+                thread_id = str(r["thread_id"] or "")
+                source_full = _receipt_row_dict(con, receipt_cols, task_id=task_id, chat_id=token, thread_id=thread_id)
+                target_full = _receipt_row_dict(con, receipt_cols, task_id=task_id, chat_id=dst, thread_id=thread_id)
+                if target_full is None:
+                    receipt_plan.append({"task_id": task_id, "from_chat_id": token, "thread_id": thread_id, "action": "rekey"})
+                else:
+                    merged = merge_receipt_facts(source_full or {}, target_full)  # may raise ambiguous_receipt_merge
+                    receipt_plan.append({"task_id": task_id, "from_chat_id": token, "thread_id": thread_id, "action": "merge"})
+                    collisions.append({"task_id": task_id, "from_chat_id": token, "thread_id": thread_id})
+                    merged_previews.append({"task_id": task_id, "from_chat_id": token, "thread_id": thread_id, **{k: merged[k] for k in _RECEIPT_MERGE_COLS}})
 
         alias_subs: list[dict[str, Any]] = []
         if _table_exists(con, "kanban_notify_subs"):
             sub_cols = _columns(con, "kanban_notify_subs")
             if {"platform", "chat_id"}.issubset(sub_cols):
                 thread_expr = "thread_id" if "thread_id" in sub_cols else "''"
-                sub_rows = con.execute(
-                    f"select task_id, {thread_expr} as thread_id from kanban_notify_subs where platform='discord' and chat_id=? order by task_id",
-                    (src,),
-                ).fetchall()
-                alias_subs = [{"task_id": r["task_id"], "thread_id": str(r["thread_id"] or "")} for r in sub_rows]
+                for token in source_tokens:
+                    sub_rows = con.execute(
+                        f"select task_id, {thread_expr} as thread_id from kanban_notify_subs where platform='discord' and chat_id=? order by task_id",
+                        (token,),
+                    ).fetchall()
+                    source_token_counts[token]["subscriptions"] = len(sub_rows)
+                    alias_subs.extend(
+                        {"task_id": r["task_id"], "from_chat_id": token, "thread_id": str(r["thread_id"] or "")}
+                        for r in sub_rows
+                    )
     finally:
         con.close()
 
+    for counts in source_token_counts.values():
+        counts["total"] = counts["origins"] + counts["receipts"] + counts["subscriptions"]
+
     deadletters = _select_deadletters(
-        store, board=board, from_id=src, to_id=dst,
+        store, board=board, from_tokens=source_tokens, to_id=dst,
         deadletter_ids=deadletter_ids, deadletter_refs=deadletter_refs,
     )
     affected_source_tasks = sorted({row["task_id"] for row in task_origin_rows} | {d["task_id"] for d in deadletters if d["task_id"]})
@@ -330,7 +373,15 @@ def build_plan(
     return {
         "board": board,
         "from": src,
+        "from_aliases": list(source_tokens),
         "to": dst,
+        "source_token_counts": source_token_counts,
+        "source_total_counts": {
+            "origins": sum(c["origins"] for c in source_token_counts.values()),
+            "receipts": sum(c["receipts"] for c in source_token_counts.values()),
+            "subscriptions": sum(c["subscriptions"] for c in source_token_counts.values()),
+            "total": sum(c["total"] for c in source_token_counts.values()),
+        },
         "task_origin_rows": task_origin_rows,
         "receipt_rows": receipt_plan,
         "collisions": collisions,
@@ -340,12 +391,11 @@ def build_plan(
         "affected_source_tasks": affected_source_tasks,
     }
 
-
 def _select_deadletters(
     store: ContinuationStore,
     *,
     board: str,
-    from_id: str,
+    from_tokens: tuple[str, ...],
     to_id: str,
     deadletter_ids: list[int] | None,
     deadletter_refs: list[str] | None,
@@ -401,7 +451,7 @@ def _select_deadletters(
                 raise MigrationError("deadletter_board_task_mismatch", outbox_id=int(row["id"]), reason="not_callback_deadletter")
             payload = _json.loads(row["payload_json"] or "{}")
             _endpoint, chat_id = _endpoint_chat_id(payload)
-            if chat_id not in {from_id, to_id}:
+            if chat_id not in {*from_tokens, to_id}:
                 raise MigrationError("deadletter_board_task_mismatch", outbox_id=int(row["id"]), reason="endpoint_channel_mismatch")
             selected[int(row["id"])] = _deadletter_entry(row, payload)
     else:
@@ -410,7 +460,7 @@ def _select_deadletters(
                 continue
             payload = _json.loads(row["payload_json"] or "{}")
             _endpoint, chat_id = _endpoint_chat_id(payload)
-            if chat_id not in {from_id, to_id}:
+            if chat_id not in {*from_tokens, to_id}:
                 continue
             selected[int(row["id"])] = _deadletter_entry(row, payload)
 
@@ -530,6 +580,7 @@ def apply_discord_migration(
         return {"success": False, "mode": "apply", "error": exc.code, "refusals": [exc.as_refusal()], "writes": 0}
 
     src = plan["from"]
+    source_tokens = tuple(plan["from_aliases"])
     dst = plan["to"]
     nothing_to_migrate = not (plan["task_origin_rows"] or plan["receipt_rows"] or plan["alias_subs_to_delete"])
 
@@ -549,7 +600,7 @@ def apply_discord_migration(
     if not nothing_to_migrate:
         try:
             board_migration = _apply_board_transaction(
-                board_db, src=src, dst=dst, allow_active_writers=allow_active_writers
+                board_db, source_tokens=source_tokens, dst=dst, allow_active_writers=allow_active_writers
             )
         except MigrationError as exc:
             # Board transaction failed/rolled back: origin migration NOT applied.
@@ -567,7 +618,10 @@ def apply_discord_migration(
         "mode": "apply",
         "board": board,
         "from": src,
+        "from_aliases": list(source_tokens),
         "to": dst,
+        "source_token_counts": plan["source_token_counts"],
+        "source_total_counts": plan["source_total_counts"],
         "backups": backups,
         "board_migration": board_migration,
         "callback_repair": repair,
@@ -581,7 +635,7 @@ def apply_discord_migration(
     }
 
 
-def _apply_board_transaction(board_db: Path, *, src: str, dst: str, allow_active_writers: bool) -> dict[str, Any]:
+def _apply_board_transaction(board_db: Path, *, source_tokens: tuple[str, ...], dst: str, allow_active_writers: bool) -> dict[str, Any]:
     """Migrate origins + receipts + delete alias subs in one board transaction.
 
     Refuses ``active_writers_present`` when the board DB is locked, unless the
@@ -603,49 +657,52 @@ def _apply_board_transaction(board_db: Path, *, src: str, dst: str, allow_active
         stats = {"origins_migrated": 0, "receipts_rekeyed": 0, "receipts_merged": 0, "alias_subs_deleted": 0}
 
         # 1) task-origin rows (PK task_id, no collision on chat_id rewrite).
-        cur = con.execute(
-            "update kanban_task_origin set chat_id=? where platform='discord' and chat_id=?",
-            (dst, src),
-        )
-        stats["origins_migrated"] = cur.rowcount
+        for token in source_tokens:
+            cur = con.execute(
+                "update kanban_task_origin set chat_id=? where platform='discord' and chat_id=?",
+                (dst, token),
+            )
+            stats["origins_migrated"] += cur.rowcount
 
         # 2) receipt composite-PK rows: merge collisions, else rekey.
-        src_receipts = con.execute(
-            "select task_id, thread_id from kanban_notify_receipts where platform='discord' and chat_id=? order by task_id, thread_id",
-            (src,),
-        ).fetchall()
-        for r in src_receipts:
-            task_id = r["task_id"]
-            thread_id = str(r["thread_id"] or "")
-            source_full = _receipt_row_dict(con, receipt_cols, task_id=task_id, chat_id=src, thread_id=thread_id)
-            target_full = _receipt_row_dict(con, receipt_cols, task_id=task_id, chat_id=dst, thread_id=thread_id)
-            if target_full is None:
-                con.execute(
-                    "update kanban_notify_receipts set chat_id=? where task_id=? and platform='discord' and chat_id=? and thread_id=?",
-                    (dst, task_id, src, thread_id),
-                )
-                stats["receipts_rekeyed"] += 1
-            else:
-                merged = merge_receipt_facts(source_full or {}, target_full)
-                set_cols = [c for c in _RECEIPT_MERGE_COLS if c in receipt_cols]
-                assignments = ", ".join(f"{c}=?" for c in set_cols)
-                con.execute(
-                    f"update kanban_notify_receipts set {assignments} where task_id=? and platform='discord' and chat_id=? and thread_id=?",
-                    (*[merged[c] for c in set_cols], task_id, dst, thread_id),
-                )
-                con.execute(
-                    "delete from kanban_notify_receipts where task_id=? and platform='discord' and chat_id=? and thread_id=?",
-                    (task_id, src, thread_id),
-                )
-                stats["receipts_merged"] += 1
+        for token in source_tokens:
+            src_receipts = con.execute(
+                "select task_id, thread_id from kanban_notify_receipts where platform='discord' and chat_id=? order by task_id, thread_id",
+                (token,),
+            ).fetchall()
+            for r in src_receipts:
+                task_id = r["task_id"]
+                thread_id = str(r["thread_id"] or "")
+                source_full = _receipt_row_dict(con, receipt_cols, task_id=task_id, chat_id=token, thread_id=thread_id)
+                target_full = _receipt_row_dict(con, receipt_cols, task_id=task_id, chat_id=dst, thread_id=thread_id)
+                if target_full is None:
+                    con.execute(
+                        "update kanban_notify_receipts set chat_id=? where task_id=? and platform='discord' and chat_id=? and thread_id=?",
+                        (dst, task_id, token, thread_id),
+                    )
+                    stats["receipts_rekeyed"] += 1
+                else:
+                    merged = merge_receipt_facts(source_full or {}, target_full)
+                    set_cols = [c for c in _RECEIPT_MERGE_COLS if c in receipt_cols]
+                    assignments = ", ".join(f"{c}=?" for c in set_cols)
+                    con.execute(
+                        f"update kanban_notify_receipts set {assignments} where task_id=? and platform='discord' and chat_id=? and thread_id=?",
+                        (*[merged[c] for c in set_cols], task_id, dst, thread_id),
+                    )
+                    con.execute(
+                        "delete from kanban_notify_receipts where task_id=? and platform='discord' and chat_id=? and thread_id=?",
+                        (task_id, token, thread_id),
+                    )
+                    stats["receipts_merged"] += 1
 
         # 3) delete leftover symbolic alias subs -- only now, numeric rows durable.
         if _table_exists(con, "kanban_notify_subs") and {"platform", "chat_id"}.issubset(_columns(con, "kanban_notify_subs")):
-            cur = con.execute(
-                "delete from kanban_notify_subs where platform='discord' and chat_id=?",
-                (src,),
-            )
-            stats["alias_subs_deleted"] = cur.rowcount
+            for token in source_tokens:
+                cur = con.execute(
+                    "delete from kanban_notify_subs where platform='discord' and chat_id=?",
+                    (token,),
+                )
+                stats["alias_subs_deleted"] += cur.rowcount
 
         con.execute("COMMIT")
         return stats
