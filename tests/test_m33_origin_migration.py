@@ -364,6 +364,46 @@ def test_missing_schema_refused(tmp_path):
     assert not report["success"] and report["error"] == "board_schema_missing"
 
 
+def test_dry_run_missing_canonical_store_stays_absent(tmp_path):
+    """Regression: a dry-run's deadletter selection must be genuinely
+    read-only. It must not call ContinuationStore.init() or otherwise
+    create/migrate a missing canonical continuation DB just to report
+    writes=0 -- the store path must remain absent afterward."""
+    db = build_board_db(tmp_path)
+    missing_store_path = tmp_path / "control-plane.sqlite"
+    assert not missing_store_path.exists()
+    store = ContinuationStore(missing_store_path)
+    report = om.plan_discord_migration(board="warroom-os", from_id="research", to_id=TO, board_db=db, store=store)
+    assert report["success"] and report["writes"] == 0
+    assert report["affected_deadletters"] == []
+    assert not missing_store_path.exists()  # never created/migrated by a dry run
+
+
+def test_apply_missing_canonical_db_refused_before_any_write(tmp_path):
+    """Regression: apply must fail closed before store.init()/build_plan when
+    the canonical AgentFlow DB path (e.g. a typo/wrong --db) does not already
+    exist. It must not create/back up an empty DB or mutate the board DB."""
+    db = build_board_db(tmp_path)
+    missing_store_path = tmp_path / "typo-control-plane.sqlite"
+    assert not missing_store_path.exists()
+    store = ContinuationStore(missing_store_path)
+    before = sqlite3.connect(f"file:{db}?mode=ro", uri=True).execute(
+        "select count(*) from kanban_task_origin where chat_id=?", (FROM,)
+    ).fetchone()[0]
+
+    report = om.apply_discord_migration(board="warroom-os", from_id="research", to_id=TO, board_db=db, store=store, now=lambda: 1.0)
+
+    assert not report["success"]
+    assert report["error"] == "canonical_db_missing"
+    assert report["writes"] == 0
+    assert not missing_store_path.exists()  # never created/migrated
+    assert not any(tmp_path.glob("*.bak"))  # no backups taken
+    after = sqlite3.connect(f"file:{db}?mode=ro", uri=True).execute(
+        "select count(*) from kanban_task_origin where chat_id=?", (FROM,)
+    ).fetchone()[0]
+    assert before == after
+
+
 # --------------------------------------------------------------------------- #
 # active writers refusal + coordinated contract
 # --------------------------------------------------------------------------- #
