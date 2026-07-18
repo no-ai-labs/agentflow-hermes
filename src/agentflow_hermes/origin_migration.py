@@ -408,14 +408,23 @@ def _select_deadletters(
     (``deadletter_board_task_mismatch``). Without explicit selection, every
     board-matching callback deadletter for this Discord channel is auto-included.
     """
-    store.init()
     import json as _json
 
     explicit_ids = set(deadletter_ids or [])
     explicit_refs = set(deadletter_refs or [])
     explicit = bool(explicit_ids or explicit_refs)
 
-    with store.connect() as con:
+    if not store.path.exists():
+        if explicit:
+            # Explicit --deadletter-id/--deadletter-ref cannot be validated
+            # against an absent store: fail closed rather than guess.
+            raise MigrationError("canonical_db_missing", path=str(store.path))
+        # Implicit selection against a missing store is a safe empty report;
+        # never create/migrate the canonical DB just to plan a dry run.
+        return []
+
+    con = _connect_ro(store.path)
+    try:
         rows = [dict(r) for r in con.execute(
             """
             select o.id, o.idempotency_key, o.operation, o.state, o.payload_json,
@@ -423,6 +432,8 @@ def _select_deadletters(
             from board_outbox o join continuation_instances c on c.id = o.continuation_id
             """
         ).fetchall()]
+    finally:
+        con.close()
 
     by_id = {int(r["id"]): r for r in rows}
     by_ref = {str(r["idempotency_key"]): r for r in rows}
@@ -568,7 +579,7 @@ def apply_discord_migration(
     if err:
         return {"success": False, "mode": "apply", "error": err, "writes": 0}
 
-    if not store.path.exists() and not str(store.path):
+    if not store.path.exists():
         return {"success": False, "mode": "apply", "error": "canonical_db_missing", "writes": 0}
 
     try:
