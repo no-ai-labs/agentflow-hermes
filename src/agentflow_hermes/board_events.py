@@ -381,6 +381,15 @@ def load_board_registry(path: str | Path) -> dict[str, BoardRegistryEntry]:
     boards = payload.get("boards") if isinstance(payload, dict) else None
     if not isinstance(boards, dict):
         return {}
+    # Prevention (M33): a board's declared ``default_endpoint`` is an
+    # AgentFlow-generated Discord origin/return_to endpoint — it is used as a
+    # created task's origin whenever a source event carries none. Reject a
+    # symbolic Discord chat id (e.g. ``discord:#research``) here, before any
+    # task is created / outbox is materialized from it. Numeric Discord ids and
+    # every non-Discord (generic) platform pass through unchanged; no Discord
+    # name lookup is performed.
+    from .origin_migration import reject_symbolic_discord_endpoint
+
     registry: dict[str, BoardRegistryEntry] = {}
     for board, spec in boards.items():
         if not isinstance(spec, dict):
@@ -388,12 +397,16 @@ def load_board_registry(path: str | Path) -> dict[str, BoardRegistryEntry]:
         db = str(spec.get("db_identity") or spec.get("db") or "")
         handlers = spec.get("outcome_handlers")
         enabled = spec.get("enabled")
+        default_endpoint = str(spec.get("default_endpoint") or "")
+        symbolic_error = reject_symbolic_discord_endpoint(default_endpoint)
+        if symbolic_error:
+            raise ValueError(f"{symbolic_error}:board={board}")
         registry[str(board)] = BoardRegistryEntry(
             board=str(board),
             db_identity=db or str(board),
             outcome_handlers=tuple(str(h) for h in handlers) if isinstance(handlers, (list, tuple)) else (),
             enabled=enabled if isinstance(enabled, bool) else True,
-            default_endpoint=str(spec.get("default_endpoint") or ""),
+            default_endpoint=default_endpoint,
             db_path=str(spec.get("db_path") or ""),
             roadmap_config_path=str(spec.get("roadmap_config_path") or spec.get("roadmap_config") or ""),
             roadmap_receipts_file=str(spec.get("roadmap_receipts_file") or spec.get("roadmap_receipts") or ""),
