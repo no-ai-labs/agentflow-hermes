@@ -459,6 +459,29 @@ def test_deadletter_repair_success_and_readback(tmp_path):
     assert row["state"] == "applied" and row["last_error"] == ""
 
 
+def test_deadletter_repair_literal_hash_endpoint_targets_numeric_channel(tmp_path):
+    """Regression: a stored literal ``discord:#research`` deadletter must ACK
+    the numeric Discord destination, never the symbolic fallback route."""
+    db, store, oid, report, calls = _apply_with_repair(tmp_path, endpoint="discord:#research")
+    assert report["success"], report
+    assert [r["outbox_id"] for r in report["callback_repair"]["repaired"]] == [oid]
+    ack_argv = [a for a in calls if "consumer-ack-origin" in a][0]
+    assert ack_argv[ack_argv.index("--chat-id") + 1] == TO
+    assert "#research" not in ack_argv
+    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    try:
+        assert con.execute(
+            "select consumer_ack_status from kanban_notify_receipts where task_id='t_plain' and platform='discord' and chat_id=?",
+            (TO,),
+        ).fetchone()[0] == "acked"
+        assert con.execute(
+            "select count(*) from kanban_notify_receipts where task_id='t_plain' and platform='discord' and chat_id=?",
+            (FROM_HASH,),
+        ).fetchone()[0] == 0
+    finally:
+        con.close()
+
+
 def test_deadletter_repair_failure_is_partial(tmp_path):
     db, store, oid, report, calls = _apply_with_repair(tmp_path, runner_kwargs={"fail": True})
     assert report["success"]  # origin migration succeeded
